@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import {execFile} from 'node:child_process';
+import {EventEmitter} from 'node:events';
 import {mkdtemp, readFile, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
@@ -12,6 +13,40 @@ const execFileAsync = promisify(execFile);
 const text = '小理开始调解。';
 const powershell = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 const scriptPath = path.resolve('scripts/synthesize.ps1');
+
+function fakeChild() {
+  const child = new EventEmitter();
+  child.killCalls = 0;
+  child.kill = () => {
+    child.killCalls += 1;
+    return true;
+  };
+  return child;
+}
+
+function scheduledTimers() {
+  const timers = [];
+  return {
+    timers,
+    setTimeout(callback, milliseconds) {
+      timers.push({callback, milliseconds});
+      return {unref() {}};
+    },
+    clearTimeout() {}
+  };
+}
+
+async function flush() {
+  await new Promise((resolve) => queueMicrotask(resolve));
+}
+
+async function waitForFirstTimer(clock) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (clock.timers.length > 0) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error('Windows TTS did not schedule its timeout');
+}
 
 test('Windows TTS synthesizes Chinese as 16 kHz mono PCM without a RIFF service header', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'xiaoli-windows-tts-'));
@@ -40,4 +75,99 @@ test('Windows TTS synthesizes Chinese as 16 kHz mono PCM without a RIFF service 
   } finally {
     await rm(directory, {recursive: true, force: true});
   }
+});
+
+test('Windows TTS waits for a killed child to close before cleaning up a timed-out synthesis', async () => {
+  const child = fakeChild();
+  const clock = scheduledTimers();
+  const cleanup = [];
+  const tts = new WindowsTts({
+    tempDir: tmpdir(),
+    spawn() { return child; },
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    fs: {
+      async mkdtemp() { return 'C:/tmp/xiaoli-tts-test'; },
+      async readFile() { throw new Error('readFile must not run after timeout'); },
+      async rm(candidate) { cleanup.push(candidate); }
+    }
+  });
+
+  const pending = tts.synthesize('timeout');
+  await waitForFirstTimer(clock);
+  clock.timers[0].callback();
+  await flush();
+  assert.equal(child.killCalls, 1);
+  assert.deepEqual(cleanup, []);
+
+  child.emit('close', 1, null);
+  await assert.rejects(pending, /Windows TTS synthesis timed out/);
+  assert.deepEqual(cleanup, [path.join('C:/tmp/xiaoli-tts-test', 'speech.wav'), 'C:/tmp/xiaoli-tts-test']);
+});
+
+test('Windows TTS bounds no-close termination, absorbs late errors, and continues cleanup after a WAV failure', async () => {
+  const child = fakeChild();
+  const clock = scheduledTimers();
+  const cleanup = [];
+  const tts = new WindowsTts({
+    tempDir: tmpdir(),
+    spawn() { return child; },
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    fs: {
+      async mkdtemp() { return 'C:/tmp/xiaoli-tts-test'; },
+      async readFile() { throw new Error('readFile must not run after timeout'); },
+      async rm(candidate) {
+        cleanup.push(candidate);
+        if (candidate.endsWith('speech.wav')) throw Object.assign(new Error('locked'), {code: 'EIO'});
+      }
+    }
+  });
+
+  const pending = tts.synthesize('timeout');
+  await waitForFirstTimer(clock);
+  clock.timers[0].callback();
+  assert.doesNotThrow(() => child.emit('error', new Error('late kill error')));
+  assert.ok(Number.isFinite(clock.timers[1].milliseconds));
+  assert.ok(clock.timers[1].milliseconds > 0);
+  clock.timers[1].callback();
+  await assert.rejects(pending, /Windows TTS synthesis timed out/);
+  assert.deepEqual(cleanup, [path.join('C:/tmp/xiaoli-tts-test', 'speech.wav'), 'C:/tmp/xiaoli-tts-test']);
+  assert.doesNotThrow(() => child.emit('error', new Error('late error after grace')));
+});
+
+test('Windows TTS retries a locked WAV cleanup without skipping temporary-directory cleanup', async () => {
+  const child = fakeChild();
+  const clock = scheduledTimers();
+  const cleanup = [];
+  let wavAttempts = 0;
+  const tts = new WindowsTts({
+    tempDir: tmpdir(),
+    spawn() { return child; },
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    fs: {
+      async mkdtemp() { return 'C:/tmp/xiaoli-tts-test'; },
+      async readFile() { throw new Error('readFile must not run after timeout'); },
+      async rm(candidate) {
+        cleanup.push(candidate);
+        if (candidate.endsWith('speech.wav') && ++wavAttempts === 1) {
+          throw Object.assign(new Error('locked'), {code: 'EBUSY'});
+        }
+      }
+    }
+  });
+
+  const pending = tts.synthesize('timeout');
+  await waitForFirstTimer(clock);
+  clock.timers[0].callback();
+  clock.timers[1].callback();
+  await flush();
+  clock.timers[2].callback();
+  await assert.rejects(pending, /Windows TTS synthesis timed out/);
+  assert.deepEqual(cleanup, [
+    path.join('C:/tmp/xiaoli-tts-test', 'speech.wav'),
+    'C:/tmp/xiaoli-tts-test',
+    path.join('C:/tmp/xiaoli-tts-test', 'speech.wav')
+  ]);
 });
