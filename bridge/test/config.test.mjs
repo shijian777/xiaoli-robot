@@ -32,7 +32,7 @@ test('loadConfig rejects an invalid Agent Stack URL', () => {
 });
 
 test('loadConfig rejects a port outside the valid range', () => {
-  for (const BRIDGE_PORT of ['0', '65536', '8.5', 'not-a-port']) {
+  for (const BRIDGE_PORT of ['0', '65536', '8.5', 'not-a-port', '0x10', '1e3', '+12', ' 8788 ']) {
     assert.throws(() => loadConfig({...valid, BRIDGE_PORT}), /BRIDGE_PORT/);
   }
 });

@@ -407,6 +407,22 @@ test('WhisperService preserves UTF-8 when transcript JSON splits a Chinese chara
   assert.equal(await service.transcribe('C:/bridge/tmp/segment.wav'), '离线结果');
 });
 
+test('WhisperService rejects blank lines around its one-line JSON output', async () => {
+  const child = fakeChild();
+  const service = new WhisperService({
+    scriptPath: 'C:/bridge/scripts/transcribe.py',
+    spawn() {
+      queueMicrotask(() => {
+        child.stdout.emit('data', Buffer.from('\n{"transcript":"离线结果"}\n\n'));
+        child.emit('close', 0, null);
+      });
+      return child;
+    }
+  });
+
+  await assert.rejects(() => service.transcribe('C:/bridge/tmp/segment.wav'), /one JSON line/i);
+});
+
 test('WhisperService rejects an empty transcript from its child process', async () => {
   const child = new EventEmitter();
   child.stdout = new EventEmitter();

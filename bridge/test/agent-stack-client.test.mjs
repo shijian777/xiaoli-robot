@@ -250,3 +250,72 @@ test('aborts a long Retry-After delay promptly and leaves no live retry timer', 
     assert.equal(attempts, 1);
   });
 });
+
+test('interprets an HTTP-date Retry-After header as a bounded delay', async () => {
+  let firstResponseSent;
+  const firstResponse = new Promise((resolve) => { firstResponseSent = resolve; });
+  const timers = trackedTimers();
+
+  await withServer((request, response) => {
+    if (request.url === '/api/console/projects') {
+      response.writeHead(503, {'retry-after': new Date(Date.now() + 5_000).toUTCString()}).end();
+      firstResponseSent();
+      return;
+    }
+    response.writeHead(404).end();
+  }, async (baseUrl) => {
+    const controller = new AbortController();
+    const api = new AgentStackClient({
+      baseUrl,
+      uak: credential,
+      projectId: 'project_test',
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout
+    });
+    const pending = api.listProjects({signal: controller.signal});
+    void pending.catch(() => {});
+    await firstResponse;
+    const retryTimer = await timers.scheduledPromise;
+
+    assert.ok(retryTimer.milliseconds > 0);
+    assert.ok(retryTimer.milliseconds <= 5_000);
+    controller.abort();
+    await assert.rejects(pending, {name: 'AbortError'});
+    assert.equal(timers.active.size, 0);
+  });
+});
+
+test('ignores malformed and negative Retry-After values without delaying discovery', async () => {
+  let attempts = 0;
+  let firstResponseSent;
+  const firstResponse = new Promise((resolve) => { firstResponseSent = resolve; });
+  const timers = trackedTimers();
+
+  await withServer((request, response) => {
+    if (request.url === '/api/console/projects') {
+      attempts += 1;
+      response.writeHead(503, {'retry-after': attempts === 1 ? 'not-a-delay' : '-10'}).end();
+      firstResponseSent();
+      return;
+    }
+    response.writeHead(404).end();
+  }, async (baseUrl) => {
+    const controller = new AbortController();
+    const api = new AgentStackClient({
+      baseUrl,
+      uak: credential,
+      projectId: 'project_test',
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout
+    });
+    const pending = api.listProjects({signal: controller.signal});
+    void pending.catch(() => {});
+    await firstResponse;
+    const retryTimer = await timers.scheduledPromise;
+
+    assert.equal(retryTimer.milliseconds, 0);
+    controller.abort();
+    await assert.rejects(pending, {name: 'AbortError'});
+    assert.equal(timers.active.size, 0);
+  });
+});

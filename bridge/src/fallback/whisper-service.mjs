@@ -122,13 +122,16 @@ function abortError() {
 }
 
 function parseTranscript(stdout) {
-  const lines = stdout.trim().split(/\r?\n/);
-  if (lines.length !== 1 || lines[0] === '') {
+  // The fallback CLI contract is exactly one JSON record, optionally followed
+  // by its single line terminator. Do not trim the whole stream: that would
+  // silently accept blank lines or other accidental output around the record.
+  const line = /^(.*?)(?:\r?\n)?$/.exec(stdout)?.[1];
+  if (line === undefined || line.trim() === '') {
     throw new Error('Whisper transcription must emit one JSON line');
   }
   let result;
   try {
-    result = JSON.parse(lines[0]);
+    result = JSON.parse(line);
   } catch {
     throw new Error('Whisper transcription must emit valid JSON');
   }

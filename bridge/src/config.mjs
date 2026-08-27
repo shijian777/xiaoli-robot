@@ -21,6 +21,9 @@ function requiredValue(env, name) {
 }
 
 function parsePort(rawPort) {
+  if (typeof rawPort !== 'string' || !/^\d+$/.test(rawPort)) {
+    throw new Error(`BRIDGE_PORT must be an integer from 1 to 65535`);
+  }
   const port = Number(rawPort);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`BRIDGE_PORT must be an integer from 1 to 65535`);

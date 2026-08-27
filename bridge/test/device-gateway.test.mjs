@@ -675,12 +675,16 @@ test('fake device preserves an early transcript event while waiting for the next
       if (!isBinary) {
         const message = JSON.parse(data.toString('utf8'));
         if (message.type === 'hello') {
+          ws.send(JSON.stringify({v: 1, type: 'hello.ack', messageId: message.messageId, deviceId: 'other-device', protocol: 1}));
           ws.send(JSON.stringify({v: 1, type: 'hello.ack', messageId: message.messageId, deviceId: message.deviceId, protocol: 1}));
         } else if (message.type === 'case.start') {
+          ws.send(JSON.stringify({v: 1, type: 'ack', messageId: message.messageId, caseId: 'other-case', accepted: true}));
           ws.send(JSON.stringify({v: 1, type: 'ack', messageId: message.messageId, caseId: message.caseId, accepted: true}));
         } else if (message.type === 'mediate.request') {
           clearTimeout(failsafe);
+          ws.send(JSON.stringify({v: 1, type: 'ack', messageId: message.messageId, caseId: 'other-case', accepted: true}));
           ws.send(JSON.stringify({v: 1, type: 'ack', messageId: message.messageId, caseId: message.caseId, accepted: true}));
+          ws.send(JSON.stringify({v: 1, type: 'audio.start', caseId: 'other-case', audio, bytes: voice.length}));
           ws.send(JSON.stringify({v: 1, type: 'audio.start', caseId: message.caseId, audio, bytes: voice.length}));
           ws.send(encodeBinaryFrame({kind: FrameKind.STREAM_CHUNK, streamType: 0, flags: 0, sequence: 0, payload: voice}));
           ws.send(JSON.stringify({v: 1, type: 'audio.end', caseId: message.caseId, bytes: voice.length, lastSequence: 0, complete: true}));
@@ -690,10 +694,13 @@ test('fake device preserves an early transcript event while waiting for the next
       const frame = decodeBinaryFrame(data);
       if (frame.kind === FrameKind.STREAM_START) {
         const message = JSON.parse(frame.payload.toString('utf8'));
+        ws.send(JSON.stringify({v: 1, type: 'ack', messageId: message.messageId, caseId: 'other-case', segmentId: message.segmentId, accepted: true}));
         ws.send(JSON.stringify({v: 1, type: 'ack', messageId: message.messageId, caseId: message.caseId, segmentId: message.segmentId, accepted: true}));
       } else if (frame.kind === FrameKind.STREAM_END) {
         const message = JSON.parse(frame.payload.toString('utf8'));
+        ws.send(JSON.stringify({v: 1, type: 'ack', messageId: message.messageId, caseId: message.caseId, segmentId: 'other-segment', bytes: message.bytes, durable: true}));
         ws.send(JSON.stringify({v: 1, type: 'ack', messageId: message.messageId, caseId: message.caseId, segmentId: message.segmentId, bytes: message.bytes, durable: true}));
+        ws.send(JSON.stringify({v: 1, type: 'transcript.saved', caseId: 'other-case', segmentId: message.segmentId, speaker: message.segmentId.startsWith('a-') ? 'A' : 'B'}));
         ws.send(JSON.stringify({v: 1, type: 'transcript.saved', caseId: message.caseId, segmentId: message.segmentId, speaker: message.segmentId.startsWith('a-') ? 'A' : 'B'}));
         if (message.segmentId.startsWith('b-')) failsafe = setTimeout(() => ws.close(1011, 'mediate request not received'), 100);
       }

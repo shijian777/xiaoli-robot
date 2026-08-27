@@ -20,6 +20,12 @@ export async function runFakeDevice({
   const messages = createInbox(ws);
   const runId = `${Date.now()}-${process.pid}`;
   const caseId = `fake-case-${runId}`;
+  const helloMessageId = `hello-${runId}`;
+  const caseMessageId = `case-start-${runId}`;
+  const segmentIds = {
+    A: `a-${runId}`,
+    B: `b-${runId}`
+  };
   const deadline = setTimeout(() => ws.terminate(), 120_000);
   deadline.unref?.();
 
@@ -31,42 +37,45 @@ export async function runFakeDevice({
     sendJson(ws, {
       v: 1,
       type: 'hello',
-      messageId: `hello-${runId}`,
+      messageId: helloMessageId,
       deviceId: 'xiaoli-fake-device',
       firmwareVersion: 'fake-1.0.0',
       token,
       capabilities: ['recording', 'voice']
     });
-    await waitForJson(messages, (message) => message.type === 'hello.ack');
+    await waitForJson(messages, (message) => message.type === 'hello.ack' &&
+      message.messageId === helloMessageId && message.deviceId === 'xiaoli-fake-device');
 
-    const caseMessageId = `case-start-${runId}`;
     sendJson(ws, {v: 1, type: 'case.start', messageId: caseMessageId, caseId});
-    await waitForJson(messages, (message) => message.type === 'ack' && message.messageId === caseMessageId);
+    await waitForJson(messages, (message) => message.type === 'ack' &&
+      message.messageId === caseMessageId && message.caseId === caseId);
 
     await sendSegment(ws, messages, {
       runId,
       caseId,
-      segmentId: `a-${runId}`,
+      segmentId: segmentIds.A,
       speaker: 'A',
       pcm: deterministicPcm(330)
     });
     await sendSegment(ws, messages, {
       runId,
       caseId,
-      segmentId: `b-${runId}`,
+      segmentId: segmentIds.B,
       speaker: 'B',
       pcm: deterministicPcm(550)
     });
 
     const saved = new Set();
     while (saved.size < 2) {
-      const message = await waitForJson(messages, (candidate) => candidate.type === 'transcript.saved');
+      const message = await waitForJson(messages, (candidate) => candidate.type === 'transcript.saved' &&
+        candidate.caseId === caseId && segmentIds[candidate.speaker] === candidate.segmentId);
       saved.add(message.speaker);
     }
 
     const mediateMessageId = `mediate-${runId}`;
     sendJson(ws, {v: 1, type: 'mediate.request', messageId: mediateMessageId, caseId});
-    await waitForJson(messages, (message) => message.type === 'ack' && message.messageId === mediateMessageId);
+    await waitForJson(messages, (message) => message.type === 'ack' &&
+      message.messageId === mediateMessageId && message.caseId === caseId);
 
     const chunks = [];
     let audioStarted = false;
@@ -80,11 +89,11 @@ export async function runFakeDevice({
       }
       const message = incoming.value;
       if (message.type === 'error') throw new Error(`Bridge error: ${message.code}`);
-      if (message.type === 'audio.start') {
+      if (message.type === 'audio.start' && message.caseId === caseId) {
         audioStarted = true;
         continue;
       }
-      if (message.type === 'audio.end') break;
+      if (message.type === 'audio.end' && message.caseId === caseId) break;
     }
 
     const pcm = Buffer.concat(chunks);
@@ -115,7 +124,8 @@ async function sendSegment(ws, messages, {runId, caseId, segmentId, speaker, pcm
     audio: AUDIO
   };
   ws.send(frame(FrameKind.STREAM_START, 0, Buffer.from(JSON.stringify(start))));
-  await waitForJson(messages, (message) => message.type === 'ack' && message.messageId === startMessageId);
+  await waitForJson(messages, (message) => message.type === 'ack' && message.messageId === startMessageId &&
+    message.caseId === caseId && message.segmentId === segmentId);
 
   let sequence = 0;
   for (let offset = 0; offset < pcm.length; offset += 2048) {
@@ -134,7 +144,8 @@ async function sendSegment(ws, messages, {runId, caseId, segmentId, speaker, pcm
     complete: true
   };
   ws.send(frame(FrameKind.STREAM_END, sequence - 1, Buffer.from(JSON.stringify(end)), 1));
-  const ack = await waitForJson(messages, (message) => message.type === 'ack' && message.messageId === endMessageId);
+  const ack = await waitForJson(messages, (message) => message.type === 'ack' && message.messageId === endMessageId &&
+    message.caseId === caseId && message.segmentId === segmentId);
   if (!ack.durable) throw new Error('Bridge did not durably acknowledge the fake recording');
 }
 
