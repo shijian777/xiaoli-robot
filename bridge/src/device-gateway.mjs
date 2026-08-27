@@ -33,12 +33,15 @@ class DeviceGateway {
   #heartbeatMs;
   #backpressureBytes;
   #backpressureGraceMs;
+  #fs;
   #server;
   #wss;
   #devices = new Map();
   #connections = new Set();
   #activeWork = new Set();
   #ownedTempFiles = new Set();
+  #abortController = new AbortController();
+  #shutdownPromise;
   #listening = false;
   #stopping = false;
 
@@ -54,7 +57,8 @@ class DeviceGateway {
     helloTimeoutMs = DEFAULT_HELLO_TIMEOUT_MS,
     heartbeatMs = DEFAULT_HEARTBEAT_MS,
     backpressureBytes = DEFAULT_BACKPRESSURE_BYTES,
-    backpressureGraceMs = DEFAULT_BACKPRESSURE_GRACE_MS
+    backpressureGraceMs = DEFAULT_BACKPRESSURE_GRACE_MS,
+    fileSystem = fs
   } = {}) {
     assertNonEmptyString(deviceToken, 'deviceToken');
     assertNonEmptyString(tempDir, 'tempDir');
@@ -67,6 +71,9 @@ class DeviceGateway {
     assertPositiveFinite(heartbeatMs, 'heartbeatMs');
     assertPositiveFinite(backpressureBytes, 'backpressureBytes');
     assertPositiveFinite(backpressureGraceMs, 'backpressureGraceMs');
+    for (const method of ['mkdir', 'open', 'rename', 'rm']) {
+      if (typeof fileSystem?.[method] !== 'function') throw new TypeError(`fileSystem must provide ${method}()`);
+    }
 
     this.#deviceToken = deviceToken;
     this.#tempDir = path.resolve(tempDir);
@@ -80,12 +87,13 @@ class DeviceGateway {
     this.#heartbeatMs = heartbeatMs;
     this.#backpressureBytes = backpressureBytes;
     this.#backpressureGraceMs = backpressureGraceMs;
+    this.#fs = fileSystem;
   }
 
   async listen({host = '127.0.0.1', port = 0} = {}) {
     if (this.#listening) throw new Error('device gateway is already listening');
     if (this.#stopping) throw new Error('device gateway is stopping');
-    await fs.mkdir(this.#tempDir, {recursive: true});
+    await this.#fs.mkdir(this.#tempDir, {recursive: true});
 
     this.#server = createServer((request, response) => {
       response.writeHead(404, {'content-type': 'text/plain; charset=utf-8'});
@@ -136,26 +144,38 @@ class DeviceGateway {
       while (this.#activeWork.size > 0) {
         await Promise.allSettled([...this.#activeWork]);
       }
+      return true;
     })();
     if (timeoutMs === undefined) return idle;
     return Promise.race([
       idle,
       new Promise((resolve) => {
-        const timer = setTimeout(resolve, timeoutMs);
+        const timer = setTimeout(() => resolve(false), timeoutMs);
         timer.unref?.();
       })
     ]);
   }
 
-  async shutdown({graceMs = 5_000} = {}) {
-    if (this.#stopping) return;
+  shutdown({graceMs = 5_000, cancelGraceMs = 250, closeGraceMs = 250} = {}) {
+    if (this.#shutdownPromise) return this.#shutdownPromise;
+    for (const [name, value] of Object.entries({graceMs, cancelGraceMs, closeGraceMs})) {
+      if (!Number.isFinite(value) || value < 0) throw new RangeError(`${name} must not be negative`);
+    }
     this.#stopping = true;
     this.#listening = false;
+    this.#shutdownPromise = this.#performShutdown({graceMs, cancelGraceMs, closeGraceMs});
+    return this.#shutdownPromise;
+  }
 
+  async #performShutdown({graceMs, cancelGraceMs, closeGraceMs}) {
     const serverClosed = this.#server
       ? new Promise((resolve) => this.#server.close(() => resolve()))
       : Promise.resolve();
-    await this.waitForIdle({timeoutMs: graceMs});
+    const drained = await this.waitForIdle({timeoutMs: graceMs});
+    if (!drained) {
+      this.#abortController.abort(new Error('Bridge shutting down'));
+      await this.waitForIdle({timeoutMs: cancelGraceMs});
+    }
 
     for (const connection of [...this.#connections]) {
       if (connection.ws.readyState === WebSocket.OPEN || connection.ws.readyState === WebSocket.CONNECTING) {
@@ -164,7 +184,7 @@ class DeviceGateway {
     }
     await Promise.race([
       Promise.allSettled([...this.#connections].map(({closed}) => closed)),
-      new Promise((resolve) => setTimeout(resolve, 250))
+      new Promise((resolve) => setTimeout(resolve, closeGraceMs))
     ]);
     for (const connection of [...this.#connections]) connection.ws.terminate();
 
@@ -172,7 +192,7 @@ class DeviceGateway {
       ? new Promise((resolve) => this.#wss.close(() => resolve()))
       : Promise.resolve();
     await Promise.allSettled([serverClosed, websocketClosed]);
-    await Promise.allSettled([...this.#ownedTempFiles].map((candidate) => fs.rm(candidate, {force: true})));
+    await Promise.allSettled([...this.#ownedTempFiles].map((candidate) => this.#fs.rm(candidate, {force: true})));
     this.#ownedTempFiles.clear();
   }
 
@@ -216,9 +236,11 @@ class DeviceGateway {
       connection.missedPongs = 0;
     });
     ws.on('message', (data, isBinary) => {
-      connection.inbound = connection.inbound
+      const inbound = connection.inbound
         .then(() => this.#route(connection, Buffer.from(data), isBinary))
         .catch((error) => this.#handleUnexpected(connection, error));
+      connection.inbound = inbound;
+      this.#trackWork(inbound);
     });
     ws.on('error', () => {});
     ws.once('close', () => {
@@ -235,6 +257,7 @@ class DeviceGateway {
   }
 
   async #route(connection, data, isBinary) {
+    if (this.#stopping) return;
     if (!connection.authenticated) {
       if (isBinary) {
         connection.ws.close(4001, 'hello required');
@@ -264,6 +287,7 @@ class DeviceGateway {
       device = {
         deviceId: hello.deviceId,
         acks: new Map(),
+        messageFingerprints: new Map(),
         segmentAcks: new Map(),
         segmentProgress: new Map(),
         activeRecording: null,
@@ -273,31 +297,40 @@ class DeviceGateway {
       };
       this.#devices.set(hello.deviceId, device);
     }
+    const fingerprint = messageFingerprint(hello);
+    const existing = device.acks.get(hello.messageId);
+    if (existing && device.messageFingerprints.get(hello.messageId) !== fingerprint) {
+      connection.ws.close(4002, 'message id conflict');
+      return;
+    }
     connection.authenticated = true;
     connection.device = device;
     device.sockets.add(connection);
-    const ack = device.acks.get(hello.messageId) ?? {
+    const ack = existing ?? {
       v: 1,
       type: 'hello.ack',
       messageId: hello.messageId,
       deviceId: hello.deviceId,
       protocol: 1
     };
-    device.acks.set(hello.messageId, ack);
+    this.#storeAck(device, hello, ack);
     this.#sendJson(connection, ack);
   }
 
   async #routeControl(connection, message) {
-    if (!message || !validateDeviceMessage(message) || message.type === 'hello') {
+    if (!message || !validateDeviceMessage(message)) {
       this.#sendError(connection, 'invalid_message', false, 'Message did not match the device protocol');
       return;
     }
-    const replay = connection.device.acks.get(message.messageId);
-    if (replay) {
-      this.#sendJson(connection, replay);
+    if (message.type === 'hello') {
+      if (!this.#replayMessage(connection, message)) {
+        this.#sendError(connection, 'invalid_message', false, 'Hello is valid only as the first connection message');
+      }
       return;
     }
-    if (message.type === 'case.start') this.#startCase(connection, message);
+    if (message.type === 'case.start') {
+      if (!this.#replayMessage(connection, message)) this.#startCase(connection, message);
+    }
     else if (message.type === 'mediate.request') this.#requestMediation(connection, message);
     else this.#sendError(connection, 'invalid_message', false, 'Speech controls must use binary stream frames');
   }
@@ -306,7 +339,7 @@ class DeviceGateway {
     try {
       this.#cases.startCase(connection.device.deviceId, message.caseId);
       const ack = {v: 1, type: 'ack', messageId: message.messageId, caseId: message.caseId, accepted: true};
-      connection.device.acks.set(message.messageId, ack);
+      this.#storeAck(connection.device, message, ack);
       this.#sendJson(connection, ack);
       this.#broadcastState(connection.device, 'waiting', message.caseId);
     } catch {
@@ -339,11 +372,8 @@ class DeviceGateway {
       return;
     }
     const device = connection.device;
-    const messageReplay = device.acks.get(message.messageId);
-    if (messageReplay) {
-      this.#sendJson(connection, messageReplay);
-      return;
-    }
+    if (!this.#ownedCase(connection, message.caseId)) return;
+    if (this.#replayMessage(connection, message)) return;
     if (device.activeRecording) {
       this.#sendError(connection, 'audio_stream_active', true, 'Only one recording stream may be active');
       return;
@@ -351,7 +381,7 @@ class DeviceGateway {
     const completedAck = device.segmentAcks.get(message.segmentId);
     if (completedAck) {
       device.activeRecording = {owner: connection, replayAck: completedAck, meta: message};
-      device.acks.set(message.messageId, completedAck);
+      this.#storeAck(device, message, completedAck);
       this.#sendJson(connection, completedAck);
       return;
     }
@@ -373,7 +403,7 @@ class DeviceGateway {
         segmentId: message.segmentId,
         accepted: true
       };
-      device.acks.set(message.messageId, ack);
+      this.#storeAck(device, message, ack);
       this.#sendJson(connection, ack);
       this.#broadcastState(device, 'recording', message.caseId, message.segmentId);
     } catch {
@@ -413,11 +443,13 @@ class DeviceGateway {
       return;
     }
     const device = connection.device;
+    if (!this.#ownedCase(connection, message.caseId)) return;
+    if (this.#replayMessage(connection, message)) return;
     const recording = device.activeRecording;
     if (!recording || recording.owner !== connection) {
-      const replay = device.segmentAcks.get(message.segmentId) ?? device.acks.get(message.messageId);
+      const replay = device.segmentAcks.get(message.segmentId);
       if (replay) {
-        device.acks.set(message.messageId, replay);
+        this.#storeAck(device, message, replay);
         this.#sendJson(connection, replay);
       } else {
         this.#sendError(connection, 'audio_stream_missing', true, 'No recording stream is active');
@@ -425,7 +457,11 @@ class DeviceGateway {
       return;
     }
     if (recording.replayAck) {
-      device.acks.set(message.messageId, recording.replayAck);
+      if (message.caseId !== recording.meta.caseId || message.segmentId !== recording.meta.segmentId) {
+        this.#sendError(connection, 'segment_conflict', false, 'Replay completion did not match the active segment');
+        return;
+      }
+      this.#storeAck(device, message, recording.replayAck);
       this.#sendJson(connection, recording.replayAck);
       device.activeRecording = null;
       return;
@@ -448,13 +484,26 @@ class DeviceGateway {
     let completed;
     let wavPath;
     try {
+      if (this.#stopping) return;
       completed = this.#cases.endSegment(meta.segmentId);
-      wavPath = await this.#writeDurableWav(completed.pcm, completed.audio);
+      wavPath = await this.#writeDurableWav(completed.pcm, completed.audio, this.#abortController.signal);
     } catch (error) {
+      if (this.#stopping || this.#abortController.signal.aborted) {
+        device.activeRecording = null;
+        device.segmentProgress.delete(meta.segmentId);
+        return;
+      }
       this.#cases.failSegment(meta.segmentId, 'WAV assembly failed');
       device.activeRecording = null;
       this.#sendError(connection, 'audio_write_failed', true, 'Recording could not be stored');
       this.#logger.error?.('Gateway WAV write failed', {segmentId: meta.segmentId, errorCode: error?.code ?? 'UNKNOWN'});
+      return;
+    }
+    if (this.#stopping || this.#abortController.signal.aborted) {
+      await this.#fs.rm(wavPath, {force: true}).catch(() => {});
+      this.#ownedTempFiles.delete(wavPath);
+      device.activeRecording = null;
+      device.segmentProgress.delete(meta.segmentId);
       return;
     }
 
@@ -467,13 +516,16 @@ class DeviceGateway {
       bytes: progress.receivedBytes,
       durable: true
     };
-    device.acks.set(message.messageId, ack);
+    this.#storeAck(device, message, ack);
     device.segmentAcks.set(meta.segmentId, ack);
     device.segmentProgress.delete(meta.segmentId);
     device.activeRecording = null;
     this.#sendJson(connection, ack);
     this.#broadcastState(device, 'transcribing', meta.caseId, meta.segmentId);
-    this.#enqueue(device, () => this.#transcribe(device, completed, wavPath));
+    if (!this.#enqueue(device, (signal) => this.#transcribe(device, completed, wavPath, signal))) {
+      await this.#fs.rm(wavPath, {force: true}).catch(() => {});
+      this.#ownedTempFiles.delete(wavPath);
+    }
   }
 
   #failRecording(connection, segmentId, code, message) {
@@ -488,7 +540,8 @@ class DeviceGateway {
     this.#broadcastState(connection.device, 'error', undefined, segmentId);
   }
 
-  async #writeDurableWav(pcm, audio) {
+  async #writeDurableWav(pcm, audio, signal) {
+    this.#assertRunning(signal);
     const wav = pcmToWav(pcm, audio);
     const parsed = parsePcmWav(wav);
     if (!parsed.pcm.equals(pcm)) throw new Error('assembled WAV validation failed');
@@ -498,30 +551,41 @@ class DeviceGateway {
     this.#ownedTempFiles.add(temporaryPath);
     let handle;
     try {
-      handle = await fs.open(temporaryPath, 'wx', 0o600);
-      await handle.writeFile(wav);
+      handle = await this.#fs.open(temporaryPath, 'wx', 0o600);
+      this.#assertRunning(signal);
+      await handle.writeFile(wav, {signal});
+      this.#assertRunning(signal);
       await handle.sync();
       await handle.close();
       handle = undefined;
-      await fs.rename(temporaryPath, finalPath);
+      this.#assertRunning(signal);
+      await this.#fs.rename(temporaryPath, finalPath);
       this.#ownedTempFiles.delete(temporaryPath);
       this.#ownedTempFiles.add(finalPath);
+      if (this.#stopping || signal?.aborted) {
+        await this.#fs.rm(finalPath, {force: true}).catch(() => {});
+        this.#ownedTempFiles.delete(finalPath);
+        throw abortError();
+      }
       return finalPath;
     } catch (error) {
       await handle?.close();
-      await fs.rm(temporaryPath, {force: true});
+      await this.#fs.rm(temporaryPath, {force: true});
       this.#ownedTempFiles.delete(temporaryPath);
       throw error;
     }
   }
 
-  async #transcribe(device, segment, wavPath) {
+  async #transcribe(device, segment, wavPath, signal) {
     try {
+      this.#assertRunning(signal);
       this.#cases.beginTranscription(segment.segmentId);
       const transcript = await this.#asr.transcribe(wavPath, {
         caseId: segment.caseId,
-        segmentId: segment.segmentId
+        segmentId: segment.segmentId,
+        signal
       });
+      this.#assertRunning(signal);
       this.#cases.saveTranscript(segment.segmentId, transcript);
       this.#broadcastJson(device, {
         v: 1,
@@ -532,26 +596,30 @@ class DeviceGateway {
       });
       this.#broadcastState(device, 'waiting', segment.caseId, segment.segmentId);
     } catch (error) {
+      if (this.#stopping || signal?.aborted) return;
       try {
         this.#cases.failSegment(segment.segmentId, 'Transcription failed');
       } catch {}
       this.#broadcastError(device, 'transcription_failed', true, 'Recording transcription failed', segment.caseId, segment.segmentId);
       this.#logger.error?.('Gateway transcription failed', {caseId: segment.caseId, segmentId: segment.segmentId, errorName: error?.name ?? 'Error'});
     } finally {
-      await fs.rm(wavPath, {force: true}).catch(() => {});
+      await this.#fs.rm(wavPath, {force: true}).catch(() => {});
       this.#ownedTempFiles.delete(wavPath);
     }
   }
 
   #requestMediation(connection, message) {
     const device = connection.device;
+    if (!this.#ownedCase(connection, message.caseId)) return;
+    if (this.#replayMessage(connection, message)) return;
     const ack = {v: 1, type: 'ack', messageId: message.messageId, caseId: message.caseId, accepted: true};
-    device.acks.set(message.messageId, ack);
+    this.#storeAck(device, message, ack);
     this.#sendJson(connection, ack);
-    this.#enqueue(device, () => this.#mediate(device, message.caseId));
+    this.#enqueue(device, (signal) => this.#mediate(device, message.caseId, signal));
   }
 
-  async #mediate(device, caseId) {
+  async #mediate(device, caseId, signal) {
+    if (this.#stopping || signal?.aborted) return;
     let snapshot;
     try {
       snapshot = this.#cases.snapshot(caseId);
@@ -559,19 +627,26 @@ class DeviceGateway {
       this.#broadcastError(device, 'case_not_found', false, 'Case does not exist', caseId);
       return;
     }
-    if (snapshot.deviceId !== device.deviceId || !snapshot.canMediate) {
+    if (snapshot.deviceId !== device.deviceId) {
+      this.#broadcastError(device, 'case_forbidden', false, 'Case belongs to another device', caseId);
+      return;
+    }
+    if (!snapshot.canMediate) {
       this.#broadcastError(device, 'mediation_not_ready', true, 'Both A and B need saved transcripts', caseId);
       return;
     }
 
     this.#broadcastState(device, 'mediating', caseId);
     try {
-      const sessionId = await this.#mediatorSession(device, caseId);
-      const result = await this.#mediator.mediate(snapshot, sessionId);
+      const sessionId = await this.#mediatorSession(device, caseId, signal);
+      this.#assertRunning(signal);
+      const result = await this.#mediator.mediate(snapshot, sessionId, {signal});
+      this.#assertRunning(signal);
       if (!validateMediatorResult(result)) {
         throw new Error('mediation result failed canonical validation');
       }
-      const pcm = await this.#tts.synthesize(result.spokenText);
+      const pcm = await this.#tts.synthesize(result.spokenText, {signal});
+      this.#assertRunning(signal);
       if (!Buffer.isBuffer(pcm) || pcm.length % 2 !== 0) throw new Error('TTS returned invalid PCM');
       const chunks = Math.ceil(pcm.length / MAX_TTS_CHUNK_BYTES);
       if (chunks > 0x10000) throw new Error('TTS PCM exceeds the stream sequence space');
@@ -603,15 +678,16 @@ class DeviceGateway {
       });
       this.#broadcastState(device, 'waiting', caseId);
     } catch (error) {
+      if (this.#stopping || signal?.aborted) return;
       this.#broadcastError(device, 'mediation_failed', true, 'Mediation or speech synthesis failed', caseId);
       this.#logger.error?.('Gateway mediation failed', {caseId, errorName: error?.name ?? 'Error'});
     }
   }
 
-  async #mediatorSession(device, caseId) {
+  async #mediatorSession(device, caseId, signal) {
     let pending = device.mediatorSessions.get(caseId);
     if (!pending) {
-      pending = Promise.resolve(this.#createMediatorSession(caseId));
+      pending = Promise.resolve(this.#createMediatorSession(caseId, {signal}));
       device.mediatorSessions.set(caseId, pending);
     }
     try {
@@ -625,11 +701,59 @@ class DeviceGateway {
   }
 
   #enqueue(device, operation) {
-    const work = device.queue.catch(() => {}).then(operation);
+    if (this.#stopping || this.#abortController.signal.aborted) return null;
+    const signal = this.#abortController.signal;
+    const work = device.queue.catch(() => {}).then(() => {
+      if (this.#stopping || signal.aborted) return undefined;
+      return operation(signal);
+    });
     device.queue = work;
-    this.#activeWork.add(work);
-    void work.finally(() => this.#activeWork.delete(work));
+    this.#trackWork(work);
     return work;
+  }
+
+  #trackWork(work) {
+    this.#activeWork.add(work);
+    void work.then(
+      () => this.#activeWork.delete(work),
+      () => this.#activeWork.delete(work)
+    );
+    return work;
+  }
+
+  #assertRunning(signal) {
+    if (this.#stopping || signal?.aborted) throw abortError();
+  }
+
+  #ownedCase(connection, caseId) {
+    let snapshot;
+    try {
+      snapshot = this.#cases.snapshot(caseId);
+    } catch {
+      this.#sendError(connection, 'case_not_found', false, 'Case does not exist', caseId);
+      return false;
+    }
+    if (snapshot.deviceId !== connection.device.deviceId) {
+      this.#sendError(connection, 'case_forbidden', false, 'Case belongs to another device', caseId);
+      return false;
+    }
+    return true;
+  }
+
+  #storeAck(device, message, ack) {
+    device.acks.set(message.messageId, ack);
+    device.messageFingerprints.set(message.messageId, messageFingerprint(message));
+  }
+
+  #replayMessage(connection, message) {
+    const ack = connection.device.acks.get(message.messageId);
+    if (!ack) return false;
+    if (connection.device.messageFingerprints.get(message.messageId) !== messageFingerprint(message)) {
+      this.#sendError(connection, 'message_id_conflict', false, 'messageId was reused with different content');
+      return true;
+    }
+    this.#sendJson(connection, ack);
+    return true;
   }
 
   #sendError(connection, code, retryable, message, caseId, segmentId) {
@@ -645,6 +769,7 @@ class DeviceGateway {
   }
 
   #sendJson(connection, message) {
+    if (this.#stopping) return;
     if (connection.ws.readyState !== WebSocket.OPEN) return;
     connection.ws.send(JSON.stringify(message));
     this.#applyBackpressure(connection);
@@ -655,6 +780,7 @@ class DeviceGateway {
   }
 
   #broadcastBinary(device, payload) {
+    if (this.#stopping) return;
     for (const connection of device.sockets) {
       if (connection.ws.readyState !== WebSocket.OPEN) continue;
       connection.ws.send(payload, {binary: true});
@@ -713,6 +839,18 @@ function sameSegmentMeta(left, right) {
     left.audio.sampleRate === right.audio.sampleRate && left.audio.bits === right.audio.bits && left.audio.channels === right.audio.channels;
 }
 
+function messageFingerprint(message) {
+  return JSON.stringify(sortJson(message));
+}
+
+function sortJson(value) {
+  if (Array.isArray(value)) return value.map(sortJson);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, sortJson(value[key])]));
+  }
+  return value;
+}
+
 function errorMessage(code, retryable, message, caseId, segmentId) {
   return compact({v: 1, type: 'error', code, retryable, message, caseId, segmentId});
 }
@@ -727,4 +865,10 @@ function assertNonEmptyString(value, name) {
 
 function assertPositiveFinite(value, name) {
   if (!Number.isFinite(value) || value <= 0) throw new RangeError(`${name} must be positive`);
+}
+
+function abortError() {
+  const error = new Error('Bridge operation aborted');
+  error.name = 'AbortError';
+  return error;
 }

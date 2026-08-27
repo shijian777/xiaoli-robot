@@ -41,7 +41,7 @@ export async function startBridge({
     asrService: asr,
     mediatorService: mediator,
     ttsService: tts,
-    createMediatorSession: () => agentClient.createSession(config.mediatorAgentId),
+    createMediatorSession: (_caseId, {signal} = {}) => agentClient.createSession(config.mediatorAgentId, {signal}),
     logger,
     ...gatewayOptions
   });
@@ -114,11 +114,18 @@ function destroyBonjour(bonjour) {
 async function main() {
   const runtime = await startBridge();
   let stopping = false;
-  process.once('SIGINT', async () => {
+  process.once('SIGINT', () => {
     if (stopping) return;
     stopping = true;
-    await runtime.shutdown();
-    process.exitCode = 0;
+    const forcedExit = setTimeout(() => process.exit(1), 6_000);
+    forcedExit.unref?.();
+    void runtime.shutdown().then(
+      () => {
+        clearTimeout(forcedExit);
+        process.exit(0);
+      },
+      () => process.exit(1)
+    );
   });
 }
 

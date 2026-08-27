@@ -225,6 +225,36 @@ test('AsrService rejects a symlink in its temp directory without opening or dele
   });
 });
 
+test('AsrService propagates one cancellation signal through Session creation and the audio Turn', async () => {
+  await withTempDirectory(async (tempDir) => {
+    const wavPath = path.join(tempDir, 'cancel.wav');
+    await writeFile(wavPath, Buffer.from('RIFF'));
+    const controller = new AbortController();
+    const service = new AsrService({
+      asrAgentId: 'asr-agent',
+      tempDir,
+      client: {
+        async createSession(agentId, options) {
+          assert.equal(agentId, 'asr-agent');
+          assert.equal(options.signal, controller.signal);
+          return 'asr-session';
+        },
+        async runAudioTurn(sessionId, _wav, name, options) {
+          assert.equal(sessionId, 'asr-session');
+          assert.equal(name, 'segment-1.wav');
+          assert.equal(options.signal, controller.signal);
+          return {assistantMessage: JSON.stringify({transcript: '可取消转写', unclear: false})};
+        }
+      }
+    });
+
+    assert.equal(await service.transcribe(wavPath, {
+      caseId: 'case-1', segmentId: 'segment-1', signal: controller.signal
+    }), '可取消转写');
+    await assert.rejects(() => readFile(wavPath), {code: 'ENOENT'});
+  });
+});
+
 test('MediatorService sends approved case JSON and rejects incomplete mediation output', async () => {
   let prompt;
   const service = new MediatorService({client: {
@@ -260,6 +290,18 @@ test('MediatorService returns a canonical valid mediation result', async () => {
   }});
 
   assert.deepEqual(await service.mediate(caseSnapshot, 'mediator-session'), mediation);
+});
+
+test('MediatorService propagates the cancellation signal to its text Turn', async () => {
+  const controller = new AbortController();
+  const service = new MediatorService({client: {
+    async runTextTurn(_sessionId, _prompt, options) {
+      assert.equal(options.signal, controller.signal);
+      return {assistantMessage: JSON.stringify(mediation)};
+    }
+  }});
+
+  assert.deepEqual(await service.mediate(caseSnapshot, 'mediator-session', {signal: controller.signal}), mediation);
 });
 
 test('WhisperService spawns the deterministic CLI without a shell and parses its one-line transcript', async () => {
@@ -383,4 +425,19 @@ test('WhisperService rejects an empty transcript from its child process', async 
   });
 
   await assert.rejects(() => service.transcribe('C:/bridge/tmp/segment.wav'), /empty transcript/i);
+});
+
+test('WhisperService kills its child and rejects when the caller aborts', async () => {
+  const child = fakeChild();
+  const controller = new AbortController();
+  const service = new WhisperService({
+    scriptPath: 'C:/bridge/scripts/transcribe.py',
+    spawn() { return child; }
+  });
+
+  const pending = service.transcribe('C:/bridge/tmp/segment.wav', {signal: controller.signal});
+  controller.abort();
+  child.emit('close', 1, null);
+  await assert.rejects(pending, {name: 'AbortError'});
+  assert.equal(child.killCalls, 1);
 });

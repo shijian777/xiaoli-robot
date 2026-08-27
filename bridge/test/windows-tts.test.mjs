@@ -187,3 +187,35 @@ test('Windows TTS retries a locked WAV cleanup without skipping temporary-direct
     path.join('C:/tmp/xiaoli-tts-test', 'speech.wav')
   ]);
 });
+
+test('Windows TTS terminates its child when the caller aborts synthesis', async () => {
+  const child = fakeChild();
+  const taskkill = fakeChild();
+  const spawned = [];
+  const cleanup = [];
+  const controller = new AbortController();
+  const tts = new WindowsTts({
+    spawn(command, args, options) {
+      spawned.push({command, args, options});
+      return command === 'taskkill' ? taskkill : child;
+    },
+    fs: {
+      async mkdtemp() { return 'C:/tmp/xiaoli-tts-cancel'; },
+      async readFile() { throw new Error('cancelled synthesis must not read output'); },
+      async rm(candidate) { cleanup.push(candidate); }
+    }
+  });
+
+  const pending = tts.synthesize('cancel me', {signal: controller.signal});
+  await flush();
+  controller.abort();
+  child.emit('close', 1, null);
+  await assert.rejects(pending, {name: 'AbortError'});
+  assert.equal(child.killCalls, 1);
+  assert.deepEqual(spawned[1], {
+    command: 'taskkill',
+    args: ['/PID', '4321', '/T', '/F'],
+    options: {shell: false, windowsHide: true}
+  });
+  assert.deepEqual(cleanup, [path.join('C:/tmp/xiaoli-tts-cancel', 'speech.wav'), 'C:/tmp/xiaoli-tts-cancel']);
+});

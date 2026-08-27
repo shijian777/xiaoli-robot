@@ -26,8 +26,9 @@ export class WhisperService {
     this.#clearTimeout = cancelTimeout;
   }
 
-  async transcribe(wavPath) {
+  async transcribe(wavPath, {signal} = {}) {
     if (typeof wavPath !== 'string' || wavPath.trim() === '') throw new TypeError('wavPath must be a non-empty string');
+    signal?.throwIfAborted();
     return new Promise((resolve, reject) => {
       let child;
       let stdout = '';
@@ -42,6 +43,7 @@ export class WhisperService {
         if (timeout !== undefined) this.#clearTimeout(timeout);
         child?.stdout?.removeListener('data', onStdout);
         child?.removeListener('close', onClose);
+        signal?.removeEventListener('abort', onAbort);
         callback();
       };
 
@@ -66,6 +68,11 @@ export class WhisperService {
 
       const onError = () => {
         if (!settled) finish(() => reject(new Error('Whisper transcription process failed')));
+      };
+
+      const onAbort = () => {
+        stopChild();
+        finish(() => reject(abortError()));
       };
 
       const onClose = (code) => {
@@ -94,6 +101,11 @@ export class WhisperService {
       child.stdout.on('data', onStdout);
       child.once('error', onError);
       child.once('close', onClose);
+      signal?.addEventListener('abort', onAbort, {once: true});
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
       timeout = this.#setTimeout(() => {
         stopChild();
         finish(() => reject(new Error('Whisper transcription timed out')));
@@ -101,6 +113,12 @@ export class WhisperService {
       timeout.unref?.();
     });
   }
+}
+
+function abortError() {
+  const error = new Error('Whisper transcription aborted');
+  error.name = 'AbortError';
+  return error;
 }
 
 function parseTranscript(stdout) {

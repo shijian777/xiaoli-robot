@@ -45,22 +45,23 @@ export class AsrService {
     this.#whisper = whisper;
   }
 
-  async transcribe(wavPath, {caseId, segmentId} = {}) {
+  async transcribe(wavPath, {caseId, segmentId, signal} = {}) {
     assertIdentifier(caseId, 'caseId');
     assertIdentifier(segmentId, 'segmentId');
+    signal?.throwIfAborted();
     const bridgeWav = await openBridgeWav(wavPath, this.#tempDir);
 
     try {
       const wav = await bridgeWav.handle.readFile();
-      const sessionId = await this.#sessionFor(caseId);
+      const sessionId = await this.#sessionFor(caseId, signal);
       try {
-        const turn = await this.#client.runAudioTurn(sessionId, wav, `${segmentId}.wav`);
+        const turn = await this.#client.runAudioTurn(sessionId, wav, `${segmentId}.wav`, {signal});
         return extractTranscript(turn?.assistantMessage);
       } catch (error) {
         if (error instanceof AsrUnavailableError && this.#whisper) {
           const fallbackWav = await stageFallbackWav(wav, bridgeWav);
           try {
-            return await this.#whisper.transcribe(fallbackWav.path);
+            return await this.#whisper.transcribe(fallbackWav.path, {signal});
           } finally {
             await removeFallbackWav(fallbackWav);
           }
@@ -76,10 +77,10 @@ export class AsrService {
     }
   }
 
-  async #sessionFor(caseId) {
+  async #sessionFor(caseId, signal) {
     let session = this.#sessions.get(caseId);
     if (!session) {
-      session = Promise.resolve(this.#client.createSession(this.#asrAgentId));
+      session = Promise.resolve(this.#client.createSession(this.#asrAgentId, {signal}));
       this.#sessions.set(caseId, session);
     }
     try {

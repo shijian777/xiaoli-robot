@@ -71,11 +71,12 @@ export class AgentStackClient {
     return body.agents ?? body;
   }
 
-  async createSession(agentId) {
+  async createSession(agentId, {signal} = {}) {
     const response = await this.#request('/api/sessions', {
       method: 'POST',
       headers: {'content-type': 'application/json'},
-      body: JSON.stringify({agentId})
+      body: JSON.stringify({agentId}),
+      signal
     });
     const body = await this.#jsonResponse(response);
     const sessionId = body.sessionId ?? body.id ?? body.session?.id;
@@ -83,23 +84,24 @@ export class AgentStackClient {
     return sessionId;
   }
 
-  async runTextTurn(sessionId, text) {
+  async runTextTurn(sessionId, text, {signal} = {}) {
     return this.#runTurn(sessionId, {
       headers: {'content-type': 'application/json'},
       body: JSON.stringify({input: {type: 'text', text}})
-    }, false);
+    }, false, signal);
   }
 
-  async runAudioTurn(sessionId, wav, name) {
+  async runAudioTurn(sessionId, wav, name, {signal} = {}) {
     const body = new FormData();
     body.append('file', new Blob([wav], {type: 'audio/wav'}), name);
-    return this.#runTurn(sessionId, {body}, true);
+    return this.#runTurn(sessionId, {body}, true, signal);
   }
 
-  async #runTurn(sessionId, options, audio) {
+  async #runTurn(sessionId, options, audio, signal) {
     const response = await this.#request(`/api/sessions/${encodeURIComponent(sessionId)}/turns`, {
       method: 'POST',
-      ...options
+      ...options,
+      signal
     });
     if (response.status === 409) throw new ActiveTurnConflictError();
     if (audio && response.status === 501) throw new AsrUnavailableError();
@@ -135,6 +137,8 @@ export class AgentStackClient {
 
   async #request(path, options, retryable = false) {
     for (let attempt = 0; ; attempt += 1) {
+      const timeoutSignal = AbortSignal.timeout(TIMEOUT_MS);
+      const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
       const response = await fetch(`${this.#baseUrl}${path}`, {
         ...options,
         headers: {
@@ -142,7 +146,7 @@ export class AgentStackClient {
           'x-agent9-project-id': this.#projectId,
           ...options.headers
         },
-        signal: AbortSignal.timeout(TIMEOUT_MS)
+        signal
       });
       const shouldRetry = retryable && attempt === 0 && (response.status === 429 || response.status >= 500);
       if (!shouldRetry) return response;

@@ -156,3 +156,23 @@ test('rejects a turn without exactly one successful assistant terminal event and
     });
   });
 });
+
+test('aborts an in-flight Agent Stack Turn through the caller signal', async () => {
+  let requestStarted;
+  const started = new Promise((resolve) => { requestStarted = resolve; });
+  await withServer((request, response) => {
+    if (request.url === '/api/sessions/session-1/turns') {
+      requestStarted();
+      setTimeout(() => sendTurnEvents(response, [
+        {type: 'assistant_message', message: 'too late'},
+        {type: 'turn_finished', payload: {status: 'succeeded'}}
+      ]), 50);
+    }
+  }, async (baseUrl) => {
+    const controller = new AbortController();
+    const pending = client(baseUrl).runTextTurn('session-1', 'cancel me', {signal: controller.signal});
+    await started;
+    controller.abort();
+    await assert.rejects(pending, {name: 'AbortError'});
+  });
+});

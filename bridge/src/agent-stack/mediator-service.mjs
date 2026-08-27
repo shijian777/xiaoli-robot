@@ -21,14 +21,15 @@ export class MediatorService {
     this.#client = client;
   }
 
-  async mediate(caseSnapshot, sessionId) {
+  async mediate(caseSnapshot, sessionId, {signal} = {}) {
     if (!caseSnapshot || typeof caseSnapshot !== 'object' || Array.isArray(caseSnapshot)) {
       throw new TypeError('caseSnapshot must be an object');
     }
     if (typeof sessionId !== 'string' || sessionId.trim() === '') {
       throw new TypeError('sessionId must be a non-empty string');
     }
-    const turn = await this.#client.runTextTurn(sessionId, buildPrompt(caseSnapshot));
+    signal?.throwIfAborted();
+    const turn = await this.#client.runTextTurn(sessionId, buildPrompt(caseSnapshot), {signal});
     return parseMediationResult(turn?.assistantMessage);
   }
 }

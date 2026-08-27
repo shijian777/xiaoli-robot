@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
-import {mkdtemp, readFile, rm} from 'node:fs/promises';
+import * as realFs from 'node:fs/promises';
+import {mkdtemp, readdir, readFile, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -17,6 +18,26 @@ const token = 'local-test-device-token';
 
 function control(type, messageId, fields = {}) {
   return {v: 1, type, messageId, ...fields};
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return {promise, resolve, reject};
+}
+
+function settleWithin(promise, milliseconds = 1_000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      const timer = setTimeout(() => reject(new Error('operation did not settle within its bound')), milliseconds);
+      timer.unref?.();
+    })
+  ]);
 }
 
 function streamFrame(kind, sequence, payload, flags = 0) {
@@ -176,6 +197,185 @@ test('returns the original ACK for a duplicate messageId and applies it once', a
     assert.equal(starts, 1);
     await closeClient(ws);
   }, {caseManager: new CountingCases()});
+});
+
+test('returns the original hello.ack only for an exact authenticated hello retry', async () => {
+  await withGateway(async ({url}) => {
+    const ws = await openClient(url);
+    const channel = inbox(ws);
+    const hello = control('hello', 'hello-retry-1', {
+      deviceId: 'device-1',
+      firmwareVersion: '1.0.0',
+      token,
+      capabilities: ['recording', 'voice']
+    });
+    ws.send(JSON.stringify(hello));
+    const first = await nextJson(channel, 'hello.ack');
+    ws.send(JSON.stringify(hello));
+    assert.deepEqual(await nextJson(channel), first);
+
+    ws.send(JSON.stringify({...hello, firmwareVersion: '2.0.0'}));
+    const conflict = await nextJson(channel);
+    assert.equal(conflict.type, 'error');
+    assert.equal(conflict.code, 'message_id_conflict');
+    await closeClient(ws);
+  });
+});
+
+test('rejects cross-device speech and mediation before segment, file, ASR, or mediator effects', async () => {
+  let mediatorCalls = 0;
+  await withGateway(async ({url, tempDir, cases, transcripts}) => {
+    const owner = await openClient(url);
+    const ownerChannel = inbox(owner);
+    await authenticate(owner, ownerChannel, token, 'device-owner');
+    owner.send(JSON.stringify(control('case.start', 'owner-case-start', {caseId: 'owner-case'})));
+    await nextJson(ownerChannel, 'ack');
+
+    const attacker = await openClient(url);
+    const attackerChannel = inbox(attacker);
+    await authenticate(attacker, attackerChannel, token, 'device-attacker');
+    attacker.send(startFrame({messageId: 'attacker-start', caseId: 'owner-case', segmentId: 'attack-a', speaker: 'A'}));
+    const rejectedStart = await nextJson(attackerChannel);
+    assert.equal(rejectedStart.type, 'error');
+    assert.equal(rejectedStart.code, 'case_forbidden');
+    attacker.send(endFrame({messageId: 'attacker-end', caseId: 'owner-case', segmentId: 'attack-a', bytes: 2, lastSequence: 0}));
+    assert.equal((await nextJson(attackerChannel, 'error')).code, 'case_forbidden');
+    attacker.send(JSON.stringify(control('mediate.request', 'attacker-mediate', {caseId: 'owner-case'})));
+    assert.equal((await nextJson(attackerChannel, 'error')).code, 'case_forbidden');
+
+    assert.deepEqual(cases.snapshot('owner-case').speakers, {A: [], B: []});
+    assert.deepEqual(await readdir(tempDir), []);
+    assert.deepEqual(transcripts, []);
+    assert.equal(mediatorCalls, 0);
+    await closeClient(attacker);
+    await closeClient(owner);
+  }, {
+    mediatorService: {async mediate() { mediatorCalls += 1; throw new Error('must not mediate another device case'); }}
+  });
+});
+
+test('shutdown waits for in-flight STREAM_END routing and blocks its post-stop WAV and ASR continuation', async () => {
+  const renameStarted = deferred();
+  const releaseRename = deferred();
+  let asrCalls = 0;
+  const fileSystem = {
+    ...realFs,
+    async rename(...args) {
+      renameStarted.resolve();
+      await releaseRename.promise;
+      return realFs.rename(...args);
+    }
+  };
+  await withGateway(async ({gateway, url, tempDir}) => {
+    const ws = await openClient(url);
+    const channel = inbox(ws);
+    await authenticate(ws, channel);
+    ws.send(JSON.stringify(control('case.start', 'shutdown-case-start', {caseId: 'shutdown-case'})));
+    await nextJson(channel, 'ack');
+    ws.send(startFrame({messageId: 'shutdown-speech-start', caseId: 'shutdown-case', segmentId: 'shutdown-a', speaker: 'A'}));
+    await nextJson(channel, 'ack');
+    ws.send(streamFrame(FrameKind.STREAM_CHUNK, 0, Buffer.from([1, 0, 2, 0])));
+    ws.send(endFrame({messageId: 'shutdown-speech-end', caseId: 'shutdown-case', segmentId: 'shutdown-a', bytes: 4, lastSequence: 0}));
+
+    await settleWithin(renameStarted.promise);
+    const closed = new Promise((resolve) => ws.once('close', (code) => resolve(code)));
+    let shutdownSettled = false;
+    const shutdown = gateway.shutdown({graceMs: 50, cancelGraceMs: 25}).then(() => { shutdownSettled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(shutdownSettled, false);
+    await settleWithin(shutdown);
+    assert.equal(await closed, 1001);
+    assert.deepEqual(await readdir(tempDir), []);
+    releaseRename.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(asrCalls, 0);
+    assert.deepEqual(await readdir(tempDir), []);
+  }, {
+    asrService: {async transcribe() { asrCalls += 1; return 'must not transcribe'; }},
+    gatewayOptions: {fileSystem}
+  });
+});
+
+test('shutdown aborts never-resolving ASR, closes clients, and removes its durable WAV within a bound', async () => {
+  const asrStarted = deferred();
+  let aborts = 0;
+  const asrService = {
+    async transcribe(_wavPath, {signal} = {}) {
+      signal?.addEventListener('abort', () => { aborts += 1; }, {once: true});
+      asrStarted.resolve();
+      return new Promise(() => {});
+    }
+  };
+  await withGateway(async ({gateway, url, tempDir}) => {
+    const ws = await openClient(url);
+    const channel = inbox(ws);
+    await authenticate(ws, channel);
+    ws.send(JSON.stringify(control('case.start', 'asr-shutdown-case-start', {caseId: 'asr-shutdown-case'})));
+    await nextJson(channel, 'ack');
+    ws.send(startFrame({messageId: 'asr-shutdown-start', caseId: 'asr-shutdown-case', segmentId: 'asr-never', speaker: 'A'}));
+    await nextJson(channel, 'ack');
+    ws.send(streamFrame(FrameKind.STREAM_CHUNK, 0, Buffer.from([1, 0, 2, 0])));
+    ws.send(endFrame({messageId: 'asr-shutdown-end', caseId: 'asr-shutdown-case', segmentId: 'asr-never', bytes: 4, lastSequence: 0}));
+    await nextJson(channel, 'ack');
+    await settleWithin(asrStarted.promise);
+
+    const closed = new Promise((resolve) => ws.once('close', (code) => resolve(code)));
+    const startedAt = Date.now();
+    await settleWithin(gateway.shutdown({graceMs: 25, cancelGraceMs: 25}), 750);
+    assert.ok(Date.now() - startedAt < 750);
+    assert.equal(aborts, 1);
+    assert.equal(await closed, 1001);
+    assert.deepEqual(await readdir(tempDir), []);
+  }, {asrService});
+});
+
+test('shutdown aborts never-resolving TTS and completes without post-stop playback', async () => {
+  const ttsStarted = deferred();
+  let aborts = 0;
+  const mediation = {
+    conflictSummary: '双方对安排有分歧。',
+    aPosition: 'A 希望提前计划。',
+    bPosition: 'B 希望保留弹性。',
+    aCanImprove: 'A 可以说明优先级。',
+    bCanImprove: 'B 可以主动确认时间。',
+    commonGround: '双方都希望顺利完成。',
+    suggestions: ['共同列出时间表。'],
+    spokenText: '请共同列出时间表。'
+  };
+  const ttsService = {
+    async synthesize(_text, {signal} = {}) {
+      signal?.addEventListener('abort', () => { aborts += 1; }, {once: true});
+      ttsStarted.resolve();
+      return new Promise(() => {});
+    }
+  };
+  await withGateway(async ({gateway, url, tempDir}) => {
+    const ws = await openClient(url);
+    const channel = inbox(ws);
+    await authenticate(ws, channel);
+    ws.send(JSON.stringify(control('case.start', 'tts-shutdown-case-start', {caseId: 'tts-shutdown-case'})));
+    await nextJson(channel, 'ack');
+    for (const [segmentId, speaker] of [['a-tts', 'A'], ['b-tts', 'B']]) {
+      ws.send(startFrame({messageId: `start-${segmentId}`, caseId: 'tts-shutdown-case', segmentId, speaker}));
+      await nextJson(channel, 'ack');
+      ws.send(streamFrame(FrameKind.STREAM_CHUNK, 0, Buffer.from([1, 0, 2, 0])));
+      ws.send(endFrame({messageId: `end-${segmentId}`, caseId: 'tts-shutdown-case', segmentId, bytes: 4, lastSequence: 0}));
+      await nextJson(channel, 'ack');
+      await nextJson(channel, 'transcript.saved');
+    }
+    ws.send(JSON.stringify(control('mediate.request', 'tts-shutdown-mediate', {caseId: 'tts-shutdown-case'})));
+    await nextJson(channel, 'ack');
+    await settleWithin(ttsStarted.promise);
+
+    const closed = new Promise((resolve) => ws.once('close', (code) => resolve(code)));
+    await settleWithin(gateway.shutdown({graceMs: 25, cancelGraceMs: 25}), 750);
+    assert.equal(aborts, 1);
+    assert.equal(await closed, 1001);
+    assert.deepEqual(await readdir(tempDir), []);
+  }, {
+    mediatorService: {async mediate() { return mediation; }},
+    ttsService
+  });
 });
 
 test('assembles one speech stream, durably ACKs it, and saves one transcript', async () => {

@@ -48,8 +48,9 @@ export class WindowsTts {
     this.#clearTimeout = cancelTimeout;
   }
 
-  async synthesize(text) {
+  async synthesize(text, {signal} = {}) {
     if (typeof text !== 'string' || text.trim() === '') throw new TypeError('text must be a non-empty string');
+    signal?.throwIfAborted();
 
     const directory = await this.#fs.mkdtemp(path.join(this.#tempDir, 'xiaoli-tts-'));
     const wavPath = path.join(directory, 'speech.wav');
@@ -57,7 +58,8 @@ export class WindowsTts {
     let cleanupDeferred = false;
     const cleanup = () => cleanupPromise ??= this.#cleanup(directory, wavPath);
     try {
-      await this.#runSynthesis(text, wavPath, cleanup);
+      signal?.throwIfAborted();
+      await this.#runSynthesis(text, wavPath, cleanup, signal);
       return parsePcmWav(await this.#fs.readFile(wavPath)).pcm;
     } catch (error) {
       cleanupDeferred = error instanceof DeferredCleanupTimeoutError;
@@ -93,13 +95,14 @@ export class WindowsTts {
     });
   }
 
-  #runSynthesis(text, wavPath, cleanupAfterClose) {
+  #runSynthesis(text, wavPath, cleanupAfterClose, signal) {
     return new Promise((resolve, reject) => {
       let child;
       let timer;
       let terminationTimer;
       let settled = false;
       let timingOut = false;
+      let cancelled = false;
 
       const finish = (callback) => {
         if (settled) return;
@@ -108,6 +111,7 @@ export class WindowsTts {
         if (terminationTimer !== undefined) this.#clearTimeout(terminationTimer);
         if (!timingOut) child?.removeListener('error', onError);
         child?.removeListener('close', onClose);
+        signal?.removeEventListener('abort', onAbort);
         callback();
       };
 
@@ -123,9 +127,18 @@ export class WindowsTts {
         if (!timingOut) finish(() => reject(new Error('Windows TTS process could not start')));
       };
       const onClose = (code) => {
-        if (timingOut) finish(() => reject(new Error('Windows TTS synthesis timed out')));
+        if (cancelled) finish(() => reject(abortError()));
+        else if (timingOut) finish(() => reject(new Error('Windows TTS synthesis timed out')));
         else if (code === 0) finish(resolve);
         else finish(() => reject(new Error('Windows TTS process failed')));
+      };
+      const onAbort = () => {
+        if (settled || timingOut) return;
+        cancelled = true;
+        timingOut = true;
+        child.on('error', () => {});
+        stopChild();
+        this.#forceTerminate(child?.pid);
       };
       const onDeferredClose = () => {
         void cleanupAfterClose().catch(() => {});
@@ -148,6 +161,8 @@ export class WindowsTts {
 
       child.once('error', onError);
       child.once('close', onClose);
+      signal?.addEventListener('abort', onAbort, {once: true});
+      if (signal?.aborted) onAbort();
       timer = this.#setTimeout(() => {
         if (settled || timingOut) return;
         timingOut = true;
@@ -185,6 +200,12 @@ class DeferredCleanupTimeoutError extends Error {
   constructor() {
     super('Windows TTS synthesis timed out');
   }
+}
+
+function abortError() {
+  const error = new Error('Windows TTS synthesis aborted');
+  error.name = 'AbortError';
+  return error;
 }
 
 function isLikelyWindowsFileLock(error) {
