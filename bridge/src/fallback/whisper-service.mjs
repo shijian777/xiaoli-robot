@@ -1,5 +1,6 @@
 import {spawn as nodeSpawn} from 'node:child_process';
 import path from 'node:path';
+import {StringDecoder} from 'node:string_decoder';
 import {fileURLToPath} from 'node:url';
 
 const TIMEOUT_MS = 180_000;
@@ -8,19 +9,21 @@ const defaultScriptPath = path.resolve(path.dirname(fileURLToPath(import.meta.ur
 
 export class WhisperService {
   #pythonBin;
-  #whisperModel;
   #scriptPath;
   #spawn;
+  #setTimeout;
+  #clearTimeout;
 
-  constructor({pythonBin = 'python', whisperModel = 'small', scriptPath = defaultScriptPath, spawn = nodeSpawn} = {}) {
+  constructor({pythonBin = 'python', scriptPath = defaultScriptPath, spawn = nodeSpawn, setTimeout: scheduleTimeout = setTimeout, clearTimeout: cancelTimeout = clearTimeout} = {}) {
     if (typeof pythonBin !== 'string' || pythonBin.trim() === '') throw new TypeError('pythonBin must be a non-empty string');
-    if (typeof whisperModel !== 'string' || whisperModel.trim() === '') throw new TypeError('whisperModel must be a non-empty string');
     if (typeof scriptPath !== 'string' || scriptPath.trim() === '') throw new TypeError('scriptPath must be a non-empty string');
     if (typeof spawn !== 'function') throw new TypeError('spawn must be a function');
+    if (typeof scheduleTimeout !== 'function' || typeof cancelTimeout !== 'function') throw new TypeError('timer functions must be functions');
     this.#pythonBin = pythonBin;
-    this.#whisperModel = whisperModel;
     this.#scriptPath = scriptPath;
     this.#spawn = spawn;
+    this.#setTimeout = scheduleTimeout;
+    this.#clearTimeout = cancelTimeout;
   }
 
   async transcribe(wavPath) {
@@ -28,23 +31,59 @@ export class WhisperService {
     return new Promise((resolve, reject) => {
       let child;
       let stdout = '';
+      const decoder = new StringDecoder('utf8');
       let stdoutBytes = 0;
       let settled = false;
-      let timedOut = false;
-      let exceededStdout = false;
       let timeout;
 
       const finish = (callback) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timeout);
+        if (timeout !== undefined) this.#clearTimeout(timeout);
+        child?.stdout?.removeListener('data', onStdout);
+        child?.removeListener('close', onClose);
         callback();
+      };
+
+      const stopChild = () => {
+        try {
+          child.kill();
+        } catch {
+          // The caller still receives the bound error even if process cleanup fails.
+        }
+      };
+
+      const onStdout = (chunk) => {
+        if (settled) return;
+        stdoutBytes += Buffer.byteLength(chunk);
+        if (stdoutBytes > MAX_STDOUT_BYTES) {
+          stopChild();
+          finish(() => reject(new Error('Whisper transcription output exceeded 1 MiB')));
+          return;
+        }
+        stdout += decoder.write(chunk);
+      };
+
+      const onError = () => {
+        if (!settled) finish(() => reject(new Error('Whisper transcription process failed')));
+      };
+
+      const onClose = (code) => {
+        if (settled) return;
+        if (code !== 0) return finish(() => reject(new Error('Whisper transcription process failed')));
+        try {
+          stdout += decoder.end();
+          const transcript = parseTranscript(stdout);
+          finish(() => resolve(transcript));
+        } catch (error) {
+          finish(() => reject(error));
+        }
       };
 
       try {
         child = this.#spawn(this.#pythonBin, [
           this.#scriptPath,
-          '--model', this.#whisperModel,
+          '--model', 'small',
           '--input', wavPath
         ], {shell: false});
       } catch {
@@ -52,34 +91,14 @@ export class WhisperService {
         return;
       }
 
-      timeout = setTimeout(() => {
-        timedOut = true;
-        child.kill();
+      child.stdout.on('data', onStdout);
+      child.once('error', onError);
+      child.once('close', onClose);
+      timeout = this.#setTimeout(() => {
+        stopChild();
+        finish(() => reject(new Error('Whisper transcription timed out')));
       }, TIMEOUT_MS);
       timeout.unref?.();
-
-      child.stdout.on('data', (chunk) => {
-        if (settled || exceededStdout) return;
-        stdoutBytes += Buffer.byteLength(chunk);
-        if (stdoutBytes > MAX_STDOUT_BYTES) {
-          exceededStdout = true;
-          child.kill();
-          return;
-        }
-        stdout += chunk.toString('utf8');
-      });
-      child.once('error', () => finish(() => reject(new Error('Whisper transcription process failed'))));
-      child.once('close', (code) => {
-        if (timedOut) return finish(() => reject(new Error('Whisper transcription timed out')));
-        if (exceededStdout) return finish(() => reject(new Error('Whisper transcription output exceeded 1 MiB')));
-        if (code !== 0) return finish(() => reject(new Error('Whisper transcription process failed')));
-        try {
-          const transcript = parseTranscript(stdout);
-          finish(() => resolve(transcript));
-        } catch (error) {
-          finish(() => reject(error));
-        }
-      });
     });
   }
 }

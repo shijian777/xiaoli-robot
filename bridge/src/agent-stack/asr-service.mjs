@@ -1,4 +1,5 @@
 import * as fs from 'node:fs/promises';
+import {constants as fsConstants} from 'node:fs';
 import path from 'node:path';
 import Ajv from 'ajv';
 import {AsrUnavailableError} from './client.mjs';
@@ -47,22 +48,26 @@ export class AsrService {
   async transcribe(wavPath, {caseId, segmentId} = {}) {
     assertIdentifier(caseId, 'caseId');
     assertIdentifier(segmentId, 'segmentId');
-    const bridgeWavPath = await assertBridgeWavPath(wavPath, this.#tempDir);
+    const bridgeWav = await openBridgeWav(wavPath, this.#tempDir);
 
     try {
-      const wav = await fs.readFile(bridgeWavPath);
+      const wav = await bridgeWav.handle.readFile();
       const sessionId = await this.#sessionFor(caseId);
       try {
         const turn = await this.#client.runAudioTurn(sessionId, wav, `${segmentId}.wav`);
         return extractTranscript(turn?.assistantMessage);
       } catch (error) {
         if (error instanceof AsrUnavailableError && this.#whisper) {
-          return this.#whisper.transcribe(bridgeWavPath);
+          return this.#whisper.transcribe(bridgeWav.path);
         }
         throw error;
       }
     } finally {
-      await fs.rm(bridgeWavPath, {force: true});
+      try {
+        await bridgeWav.handle.close();
+      } finally {
+        await removeBridgeWav(bridgeWav);
+      }
     }
   }
 
@@ -87,7 +92,7 @@ function assertIdentifier(value, name) {
   }
 }
 
-async function assertBridgeWavPath(wavPath, tempDir) {
+async function openBridgeWav(wavPath, tempDir) {
   if (typeof wavPath !== 'string' || wavPath.trim() === '') {
     throw new TypeError('wavPath must be a non-empty string');
   }
@@ -104,12 +109,47 @@ async function assertBridgeWavPath(wavPath, tempDir) {
   if (wavStats.isSymbolicLink() || !wavStats.isFile() || !isContainedBy(realTempDir, realWavPath)) {
     throw new Error('ASR accepts only a Bridge-created WAV path under tempDir');
   }
-  return requestedPath;
+
+  const noFollow = typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0;
+  let handle;
+  try {
+    handle = await fs.open(requestedPath, fsConstants.O_RDONLY | noFollow);
+    const openedStats = await handle.stat();
+    const openedPathStats = await fs.lstat(requestedPath);
+    if (!openedStats.isFile() || openedPathStats.isSymbolicLink()) {
+      throw new Error('ASR accepts only a Bridge-created WAV path under tempDir');
+    }
+    return {handle, path: requestedPath, tempDir, realTempDir};
+  } catch (error) {
+    await handle?.close();
+    throw error;
+  }
+}
+
+async function removeBridgeWav({path: wavPath, tempDir, realTempDir}) {
+  if (!isContainedBy(tempDir, wavPath)) {
+    throw new Error('ASR cleanup refused a path outside tempDir');
+  }
+  let realParent;
+  try {
+    realParent = await fs.realpath(path.dirname(wavPath));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  if (!isContainedByOrEqual(realTempDir, realParent)) {
+    throw new Error('ASR cleanup refused a path outside tempDir');
+  }
+  await fs.rm(wavPath, {force: true});
 }
 
 function isContainedBy(parent, candidate) {
   const relative = path.relative(parent, candidate);
   return relative !== '' && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative);
+}
+
+function isContainedByOrEqual(parent, candidate) {
+  return parent === candidate || isContainedBy(parent, candidate);
 }
 
 function extractTranscript(message) {

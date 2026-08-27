@@ -1,5 +1,5 @@
 import {EventEmitter} from 'node:events';
-import {mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
+import {mkdtemp, readFile, rm, symlink, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -37,6 +37,35 @@ async function withTempDirectory(run) {
   } finally {
     await rm(directory, {recursive: true, force: true});
   }
+}
+
+async function captureRejectionWithin(promise, milliseconds = 50) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise.then(
+        () => new Error('operation resolved unexpectedly'),
+        (error) => error
+      ),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(new Error('operation did not settle at its bound')), milliseconds);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function fakeChild() {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.killCalls = 0;
+  child.kill = () => {
+    child.killCalls += 1;
+    return true;
+  };
+  return child;
 }
 
 function agentClient({message = JSON.stringify({transcript: '  本地音频转写  ', unclear: false}), error} = {}) {
@@ -140,6 +169,32 @@ test('AsrService refuses a WAV outside its bridge temp directory without opening
   });
 });
 
+test('AsrService rejects a symlink in its temp directory without opening or deleting its target', async (t) => {
+  await withTempDirectory(async (tempDir) => {
+    const outside = path.join(path.dirname(tempDir), 'outside-symlink.wav');
+    const link = path.join(tempDir, 'linked.wav');
+    await writeFile(outside, Buffer.from('RIFF'));
+    try {
+      try {
+        await symlink(outside, link, 'file');
+      } catch (error) {
+        if (error?.code === 'EPERM') {
+          t.skip('creating symlinks is not permitted on this Windows host');
+          return;
+        }
+        throw error;
+      }
+      const service = new AsrService({client: agentClient(), asrAgentId: 'asr-agent', tempDir});
+      await assert.rejects(() => service.transcribe(link, {caseId: 'case-1', segmentId: 'segment-1'}), /tempDir|Bridge-created/i);
+      assert.deepEqual(await readFile(outside), Buffer.from('RIFF'));
+      assert.deepEqual(await readFile(link), Buffer.from('RIFF'));
+    } finally {
+      await rm(link, {force: true});
+      await rm(outside, {force: true});
+    }
+  });
+});
+
 test('MediatorService sends approved case JSON and rejects incomplete mediation output', async () => {
   let prompt;
   const service = new MediatorService({client: {
@@ -203,6 +258,81 @@ test('WhisperService spawns the deterministic CLI without a shell and parses its
     args: ['C:/bridge/scripts/transcribe.py', '--model', 'small', '--input', 'C:/bridge/tmp/segment.wav'],
     options: {shell: false}
   }]);
+});
+
+test('WhisperService pins every fallback invocation to the small model', async () => {
+  const child = fakeChild();
+  const calls = [];
+  const service = new WhisperService({
+    pythonBin: 'python-test',
+    whisperModel: 'large-v3',
+    scriptPath: 'C:/bridge/scripts/transcribe.py',
+    spawn(command, args) {
+      calls.push({command, args});
+      queueMicrotask(() => {
+        child.stdout.emit('data', Buffer.from('{"transcript":"离线结果"}\n'));
+        child.emit('close', 0, null);
+      });
+      return child;
+    }
+  });
+
+  assert.equal(await service.transcribe('C:/bridge/tmp/segment.wav'), '离线结果');
+  assert.deepEqual(calls[0].args.slice(0, 3), ['C:/bridge/scripts/transcribe.py', '--model', 'small']);
+});
+
+test('WhisperService settles at its timeout even when a killed child never closes', async () => {
+  const child = fakeChild();
+  const scheduled = [];
+  const service = new WhisperService({
+    scriptPath: 'C:/bridge/scripts/transcribe.py',
+    spawn() { return child; },
+    setTimeout(callback, milliseconds) {
+      scheduled.push(milliseconds);
+      queueMicrotask(callback);
+      return {unref() {}};
+    },
+    clearTimeout() {}
+  });
+
+  const error = await captureRejectionWithin(service.transcribe('C:/bridge/tmp/segment.wav'));
+  assert.match(error.message, /timed out/i);
+  assert.deepEqual(scheduled, [180_000]);
+  assert.equal(child.killCalls, 1);
+});
+
+test('WhisperService settles on excess stdout even when a killed child never closes', async () => {
+  const child = fakeChild();
+  const service = new WhisperService({
+    scriptPath: 'C:/bridge/scripts/transcribe.py',
+    spawn() {
+      queueMicrotask(() => child.stdout.emit('data', Buffer.alloc(1024 * 1024 + 1)));
+      return child;
+    }
+  });
+
+  const error = await captureRejectionWithin(service.transcribe('C:/bridge/tmp/segment.wav'));
+  assert.match(error.message, /exceeded 1 MiB/i);
+  assert.equal(child.killCalls, 1);
+});
+
+test('WhisperService preserves UTF-8 when transcript JSON splits a Chinese character across chunks', async () => {
+  const child = fakeChild();
+  const output = Buffer.from('{"transcript":"离线结果"}\n');
+  const splitAt = Buffer.byteLength('{"transcript":"') + 1;
+  const service = new WhisperService({
+    scriptPath: 'C:/bridge/scripts/transcribe.py',
+    spawn() {
+      queueMicrotask(() => {
+        child.stdout.emit('data', output.subarray(0, splitAt));
+        child.stdout.emit('data', output.subarray(splitAt));
+        child.emit('close', 0, null);
+      });
+      return child;
+    }
+  });
+
+  assert.equal(await service.transcribe('C:/bridge/tmp/segment.wav'), '离线结果');
 });
 
 test('WhisperService rejects an empty transcript from its child process', async () => {
