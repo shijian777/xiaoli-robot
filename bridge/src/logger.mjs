@@ -1,12 +1,14 @@
-const SECRET_KEY = /key|token|password|authorization/i;
+const SECRET_KEY = /key|token|password|authorization|uak/i;
 const REDACTED = '[REDACTED]';
 
-function redact(value, seen = new WeakMap()) {
+function redact(value, seen = new WeakMap(), redactStrings = false) {
+  if (typeof value === 'string') return redactStrings ? REDACTED : value;
+
   if (Array.isArray(value)) {
     if (seen.has(value)) return seen.get(value);
     const result = [];
     seen.set(value, result);
-    for (const item of value) result.push(redact(item, seen));
+    for (const item of value) result.push(redact(item, seen, redactStrings));
     return result;
   }
 
@@ -40,7 +42,10 @@ export function createLogger(sink = defaultSink) {
     throw new TypeError('logger sink must be a function');
   }
 
-  const write = (level, args) => sink({level, args: args.map((value) => redact(value))});
+  const write = (level, args) => sink({
+    level,
+    args: args.map((value) => redact(value, new WeakMap(), typeof value === 'string'))
+  });
   return {
     info: (...args) => write('info', args),
     warn: (...args) => write('warn', args),
