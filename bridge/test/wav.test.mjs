@@ -43,3 +43,25 @@ test('rejects WAV containers that are not the approved PCM format', () => {
 
   assert.throws(() => parsePcmWav(wav), /PCM|format/);
 });
+
+test('parses the standard 18-byte PCM fmt chunk produced by Windows System.Speech', () => {
+  const pcm = Buffer.from([0x01, 0x00, 0x02, 0x00]);
+  const wav = Buffer.alloc(46 + pcm.length);
+  wav.write('RIFF', 0, 4, 'ascii');
+  wav.writeUInt32LE(wav.length - 8, 4);
+  wav.write('WAVE', 8, 4, 'ascii');
+  wav.write('fmt ', 12, 4, 'ascii');
+  wav.writeUInt32LE(18, 16);
+  wav.writeUInt16LE(1, 20);
+  wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(16000, 24);
+  wav.writeUInt32LE(32000, 28);
+  wav.writeUInt16LE(2, 32);
+  wav.writeUInt16LE(16, 34);
+  wav.writeUInt16LE(0, 36);
+  wav.write('data', 38, 4, 'ascii');
+  wav.writeUInt32LE(pcm.length, 42);
+  pcm.copy(wav, 46);
+
+  assert.deepEqual(parsePcmWav(wav), {...approvedAudio, pcm});
+});

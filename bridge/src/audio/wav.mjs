@@ -63,7 +63,7 @@ export function parsePcmWav(wav) {
       if (audio) {
         throw new Error('duplicate WAV fmt chunk');
       }
-      if (size !== 16) {
+      if (size !== 16 && (size !== 18 || wav.readUInt16LE(dataOffset + 16) !== 0)) {
         throw new Error('unsupported WAV fmt chunk');
       }
       const formatCode = wav.readUInt16LE(dataOffset);
