@@ -40,6 +40,14 @@ test('rejects a missing audio sequence before accepting later chunks', () => {
   assert.throws(() => cases.appendChunk('seg-1', 2, Buffer.from([3, 4])), /missing audio sequence 1/);
 });
 
+test('rejects an odd-length PCM chunk before it enters a segment', () => {
+  const cases = new CaseManager();
+  cases.startCase('device-1', 'case-1');
+  cases.startSegment(segment('case-1', 'seg-1', 'A'));
+
+  assert.throws(() => cases.appendChunk('seg-1', 0, Buffer.from([1])), /even|16-bit|PCM/);
+});
+
 test('rejects a reused segment identity with conflicting metadata', () => {
   const cases = new CaseManager();
   cases.startCase('device-1', 'case-1');

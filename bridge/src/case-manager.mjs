@@ -59,6 +59,7 @@ export class CaseManager {
     if (!Buffer.isBuffer(pcm)) {
       throw new TypeError('audio chunk must be a Buffer');
     }
+    assertEvenPcm(pcm);
 
     const existing = segment.chunks.get(sequence);
     if (existing) {
@@ -207,7 +208,15 @@ function assemblePcm(chunks) {
     }
     pcm.push(chunk);
   }
-  return Buffer.concat(pcm);
+  const assembled = Buffer.concat(pcm);
+  assertEvenPcm(assembled);
+  return assembled;
+}
+
+function assertEvenPcm(pcm) {
+  if (pcm.length % 2 !== 0) {
+    throw new RangeError('PCM byte length must be even for 16-bit audio');
+  }
 }
 
 function completedSegment(segment) {
