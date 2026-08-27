@@ -78,6 +78,10 @@ test('validates type-specific device messages', () => {
     v: 1, type: 'hello', messageId: 'hello-1', deviceId: 'device-1',
     firmwareVersion: '1.0.0', token: 'device-token', capabilities: ['audio']
   }), true);
+  assert.equal(validateDeviceMessage({
+    v: 1, type: 'hello', messageId: 'hello-1', deviceId: 'device-1',
+    firmware: '1.0.0', token: 'device-token', capabilities: ['audio']
+  }), false);
   assert.equal(validateDeviceMessage({v: 1, type: 'case.start', messageId: 'case-1', caseId: 'case-1'}), true);
   assert.equal(validateDeviceMessage({v: 1, type: 'mediate.request', messageId: 'request-1', caseId: 'case-1'}), true);
   assert.equal(validateDeviceMessage({

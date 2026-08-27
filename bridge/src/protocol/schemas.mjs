@@ -16,15 +16,10 @@ const deviceMessageSchemas = [
       type: {const: 'hello'},
       deviceId: identifier,
       firmwareVersion: identifier,
-      firmware: identifier,
       token: identifier,
       capabilities: {anyOf: [{type: 'array'}, {type: 'object'}]}
     },
-    required: ['v', 'type', 'messageId', 'deviceId', 'token', 'capabilities'],
-    anyOf: [
-      {properties: {firmwareVersion: {}}, required: ['firmwareVersion']},
-      {properties: {firmware: {}}, required: ['firmware']}
-    ],
+    required: ['v', 'type', 'messageId', 'deviceId', 'firmwareVersion', 'token', 'capabilities'],
     additionalProperties: false
   },
   {
