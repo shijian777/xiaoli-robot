@@ -127,10 +127,10 @@ export class AgentStackClient {
       if (event.type === 'turn_finished') finished = event;
     }
 
-    if (assistantMessageCount !== 1 || typeof assistantMessage !== 'string' || finished?.status !== 'succeeded') {
+    if (assistantMessageCount !== 1 || typeof assistantMessage !== 'string' || finished?.payload?.status !== 'succeeded') {
       throw new TurnFailedError(turnError);
     }
-    return {assistantMessage, events, status: finished.status};
+    return {assistantMessage, events, status: finished.payload.status};
   }
 
   async #request(path, options, retryable = false) {

@@ -9,7 +9,7 @@ test('reads fragmented NDJSON events, skips heartbeat lines, and accepts a final
       for (const chunk of [
         '{"type":"assistant_',
         'message","message":"first"}\n\n {\"type\":\"turn_',
-        'started\"}\n{"type":"turn_finished","status":"succeeded"}'
+        'started\"}\n{"type":"turn_finished","payload":{"status":"succeeded"}}'
       ]) controller.enqueue(encoder.encode(chunk));
       controller.close();
     }
@@ -21,6 +21,24 @@ test('reads fragmented NDJSON events, skips heartbeat lines, and accepts a final
   assert.deepEqual(events, [
     {type: 'assistant_message', message: 'first'},
     {type: 'turn_started'},
-    {type: 'turn_finished', status: 'succeeded'}
+    {type: 'turn_finished', payload: {status: 'succeeded'}}
   ]);
+});
+
+test('replaces malformed NDJSON parse details with a static error', async () => {
+  const credential = 'uak-in-malformed-ndjson';
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(`{"token":"${credential}"\n`));
+      controller.close();
+    }
+  });
+
+  await assert.rejects(async () => {
+    for await (const _event of readTurnEvents(stream));
+  }, (error) => {
+    assert.equal(error.message, 'Malformed NDJSON turn event');
+    assert.doesNotMatch(error.message, new RegExp(credential));
+    return true;
+  });
 });

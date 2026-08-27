@@ -56,7 +56,7 @@ test('sends authenticated project-scoped discovery, session, text, and WAV multi
     if (request.method === 'POST' && request.url === '/api/sessions/session-1/turns') {
       return sendTurnEvents(response, [
         {type: 'assistant_message', message: 'hello'},
-        {type: 'turn_finished', status: 'succeeded'}
+        {type: 'turn_finished', payload: {status: 'succeeded'}}
       ]);
     }
     response.writeHead(404).end();
@@ -69,7 +69,7 @@ test('sends authenticated project-scoped discovery, session, text, and WAV multi
       assistantMessage: 'hello',
       events: [
         {type: 'assistant_message', message: 'hello'},
-        {type: 'turn_finished', status: 'succeeded'}
+        {type: 'turn_finished', payload: {status: 'succeeded'}}
       ],
       status: 'succeeded'
     });
@@ -143,7 +143,7 @@ test('rejects a turn without exactly one successful assistant terminal event and
     if (request.url === '/api/sessions/session-1/turns') {
       return sendTurnEvents(response, [
         {type: 'turn_error', code: 'MODEL_DOWN', message: `upstream rejected ${credential}`},
-        {type: 'turn_finished', status: 'failed'}
+        {type: 'turn_finished', payload: {status: 'failed'}}
       ]);
     }
     response.writeHead(404).end();
