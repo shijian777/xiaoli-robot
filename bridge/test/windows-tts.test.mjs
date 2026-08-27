@@ -188,7 +188,7 @@ test('Windows TTS retries a locked WAV cleanup without skipping temporary-direct
   ]);
 });
 
-test('Windows TTS terminates its child when the caller aborts synthesis', async () => {
+test('Windows TTS stops its child and settles when it closes during caller-abort grace', async () => {
   const child = fakeChild();
   const taskkill = fakeChild();
   const spawned = [];
@@ -212,10 +212,83 @@ test('Windows TTS terminates its child when the caller aborts synthesis', async 
   child.emit('close', 1, null);
   await assert.rejects(pending, {name: 'AbortError'});
   assert.equal(child.killCalls, 1);
+  assert.equal(spawned.length, 1);
+  assert.deepEqual(cleanup, [path.join('C:/tmp/xiaoli-tts-cancel', 'speech.wav'), 'C:/tmp/xiaoli-tts-cancel']);
+});
+
+test('Windows TTS settles caller abort after bounded no-close termination without premature cleanup', async () => {
+  const child = fakeChild();
+  const taskkill = fakeChild();
+  const clock = scheduledTimers();
+  const spawned = [];
+  const cleanup = [];
+  const controller = new AbortController();
+  const tts = new WindowsTts({
+    spawn(command, args, options) {
+      spawned.push({command, args, options});
+      return command === 'taskkill' ? taskkill : child;
+    },
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    fs: {
+      async mkdtemp() { return 'C:/tmp/xiaoli-tts-cancel-no-close'; },
+      async readFile() { throw new Error('cancelled synthesis must not read output'); },
+      async rm(candidate) { cleanup.push(candidate); }
+    }
+  });
+
+  const pending = tts.synthesize('cancel without close', {signal: controller.signal});
+  await waitForFirstTimer(clock);
+  controller.abort();
+  assert.equal(child.killCalls, 1);
+  assert.deepEqual(cleanup, []);
+  assert.ok(clock.timers[1].milliseconds > 0);
+  clock.timers[1].callback();
   assert.deepEqual(spawned[1], {
     command: 'taskkill',
     args: ['/PID', '4321', '/T', '/F'],
     options: {shell: false, windowsHide: true}
   });
-  assert.deepEqual(cleanup, [path.join('C:/tmp/xiaoli-tts-cancel', 'speech.wav'), 'C:/tmp/xiaoli-tts-cancel']);
+  assert.deepEqual(cleanup, []);
+  assert.ok(clock.timers[2].milliseconds > 0);
+  clock.timers[2].callback();
+
+  await assert.rejects(pending, {name: 'AbortError'});
+  assert.deepEqual(cleanup, []);
+});
+
+test('Windows TTS performs deferred caller-abort cleanup exactly once after a late close', async () => {
+  const child = fakeChild();
+  const taskkill = fakeChild();
+  const clock = scheduledTimers();
+  const cleanup = [];
+  const controller = new AbortController();
+  const tts = new WindowsTts({
+    spawn(command) { return command === 'taskkill' ? taskkill : child; },
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    fs: {
+      async mkdtemp() { return 'C:/tmp/xiaoli-tts-cancel-late-close'; },
+      async readFile() { throw new Error('cancelled synthesis must not read output'); },
+      async rm(candidate) { cleanup.push(candidate); }
+    }
+  });
+
+  const pending = tts.synthesize('cancel then close late', {signal: controller.signal});
+  await waitForFirstTimer(clock);
+  controller.abort();
+  clock.timers[1].callback();
+  clock.timers[2].callback();
+  await assert.rejects(pending, {name: 'AbortError'});
+  assert.deepEqual(cleanup, []);
+
+  child.emit('close', 1, null);
+  await flush();
+  assert.deepEqual(cleanup, [
+    path.join('C:/tmp/xiaoli-tts-cancel-late-close', 'speech.wav'),
+    'C:/tmp/xiaoli-tts-cancel-late-close'
+  ]);
+  child.emit('close', 1, null);
+  await flush();
+  assert.equal(cleanup.length, 2);
 });

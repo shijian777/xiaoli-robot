@@ -62,7 +62,7 @@ export class WindowsTts {
       await this.#runSynthesis(text, wavPath, cleanup, signal);
       return parsePcmWav(await this.#fs.readFile(wavPath)).pcm;
     } catch (error) {
-      cleanupDeferred = error instanceof DeferredCleanupTimeoutError;
+      cleanupDeferred = error instanceof DeferredCleanupTimeoutError || error instanceof DeferredCleanupAbortError;
       throw error;
     } finally {
       if (!cleanupDeferred) await cleanup();
@@ -135,13 +135,27 @@ export class WindowsTts {
       const onAbort = () => {
         if (settled || timingOut) return;
         cancelled = true;
-        timingOut = true;
-        child.on('error', () => {});
-        stopChild();
-        this.#forceTerminate(child?.pid);
+        beginTermination();
       };
       const onDeferredClose = () => {
         void cleanupAfterClose().catch(() => {});
+      };
+      const beginTermination = () => {
+        if (settled || timingOut) return;
+        timingOut = true;
+        child.on('error', () => {});
+        stopChild();
+        terminationTimer = this.#setTimeout(() => {
+          if (settled) return;
+          this.#forceTerminate(child?.pid);
+          terminationTimer = this.#setTimeout(() => {
+            if (settled) return;
+            child?.once('close', onDeferredClose);
+            finish(() => reject(cancelled ? new DeferredCleanupAbortError() : new DeferredCleanupTimeoutError()));
+          }, FORCE_TERMINATION_GRACE_MS);
+          terminationTimer.unref?.();
+        }, TERMINATION_GRACE_MS);
+        terminationTimer.unref?.();
       };
 
       try {
@@ -164,21 +178,7 @@ export class WindowsTts {
       signal?.addEventListener('abort', onAbort, {once: true});
       if (signal?.aborted) onAbort();
       timer = this.#setTimeout(() => {
-        if (settled || timingOut) return;
-        timingOut = true;
-        child.on('error', () => {});
-        stopChild();
-        terminationTimer = this.#setTimeout(() => {
-          if (settled) return;
-          this.#forceTerminate(child?.pid);
-          terminationTimer = this.#setTimeout(() => {
-            if (settled) return;
-            child?.once('close', onDeferredClose);
-            finish(() => reject(new DeferredCleanupTimeoutError()));
-          }, FORCE_TERMINATION_GRACE_MS);
-          terminationTimer.unref?.();
-        }, TERMINATION_GRACE_MS);
-        terminationTimer.unref?.();
+        beginTermination();
       }, TIMEOUT_MS);
       timer.unref?.();
     });
@@ -202,10 +202,14 @@ class DeferredCleanupTimeoutError extends Error {
   }
 }
 
+class DeferredCleanupAbortError extends DOMException {
+  constructor() {
+    super('Windows TTS synthesis aborted', 'AbortError');
+  }
+}
+
 function abortError() {
-  const error = new Error('Windows TTS synthesis aborted');
-  error.name = 'AbortError';
-  return error;
+  return new DOMException('Windows TTS synthesis aborted', 'AbortError');
 }
 
 function isLikelyWindowsFileLock(error) {

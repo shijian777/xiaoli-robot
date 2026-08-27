@@ -33,8 +33,32 @@ function retryAfterMilliseconds(value) {
   return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
 }
 
-function sleep(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+function sleep(milliseconds, signal, scheduleTimeout, cancelTimeout) {
+  return new Promise((resolve, reject) => {
+    let timer;
+    const cleanup = () => {
+      if (timer !== undefined) cancelTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(abortError());
+    };
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    signal?.addEventListener('abort', onAbort, {once: true});
+    timer = scheduleTimeout(() => {
+      cleanup();
+      resolve();
+    }, milliseconds);
+    timer.unref?.();
+  });
+}
+
+function abortError() {
+  return new DOMException('This operation was aborted', 'AbortError');
 }
 
 function eventMessage(event) {
@@ -52,21 +76,26 @@ export class AgentStackClient {
   #baseUrl;
   #uak;
   #projectId;
+  #setTimeout;
+  #clearTimeout;
 
-  constructor({baseUrl, uak, projectId}) {
+  constructor({baseUrl, uak, projectId, setTimeout: scheduleTimeout = setTimeout, clearTimeout: cancelTimeout = clearTimeout}) {
+    if (typeof scheduleTimeout !== 'function' || typeof cancelTimeout !== 'function') throw new TypeError('timer functions must be functions');
     this.#baseUrl = String(baseUrl).replace(/\/+$/, '');
     this.#uak = String(uak);
     this.#projectId = String(projectId);
+    this.#setTimeout = scheduleTimeout;
+    this.#clearTimeout = cancelTimeout;
   }
 
-  async listProjects() {
-    const response = await this.#request('/api/console/projects', {method: 'GET'}, true);
+  async listProjects({signal} = {}) {
+    const response = await this.#request('/api/console/projects', {method: 'GET', signal}, true);
     const body = await this.#jsonResponse(response);
     return body.projects ?? body;
   }
 
-  async listAgents() {
-    const response = await this.#request('/api/agents', {method: 'GET'}, true);
+  async listAgents({signal} = {}) {
+    const response = await this.#request('/api/agents', {method: 'GET', signal}, true);
     const body = await this.#jsonResponse(response);
     return body.agents ?? body;
   }
@@ -151,7 +180,7 @@ export class AgentStackClient {
       const shouldRetry = retryable && attempt === 0 && (response.status === 429 || response.status >= 500);
       if (!shouldRetry) return response;
       await response.body?.cancel();
-      await sleep(retryAfterMilliseconds(response.headers.get('retry-after')));
+      await sleep(retryAfterMilliseconds(response.headers.get('retry-after')), options.signal, this.#setTimeout, this.#clearTimeout);
     }
   }
 

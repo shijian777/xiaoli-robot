@@ -29,6 +29,32 @@ function client(baseUrl) {
   return new AgentStackClient({baseUrl, uak: credential, projectId: 'project_test'});
 }
 
+function trackedTimers() {
+  const active = new Set();
+  let scheduled;
+  const scheduledPromise = new Promise((resolve) => { scheduled = resolve; });
+  let clearCalls = 0;
+  return {
+    active,
+    scheduledPromise,
+    get clearCalls() { return clearCalls; },
+    setTimeout(callback, milliseconds) {
+      const timer = {callback, milliseconds, unref() {}};
+      active.add(timer);
+      scheduled(timer);
+      return timer;
+    },
+    clearTimeout(timer) {
+      clearCalls += 1;
+      active.delete(timer);
+    }
+  };
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
 function sendJson(response, body, status = 200) {
   response.writeHead(status, {'content-type': 'application/json'});
   response.end(JSON.stringify(body));
@@ -174,5 +200,53 @@ test('aborts an in-flight Agent Stack Turn through the caller signal', async () 
     await started;
     controller.abort();
     await assert.rejects(pending, {name: 'AbortError'});
+  });
+});
+
+test('aborts a long Retry-After delay promptly and leaves no live retry timer', async () => {
+  let attempts = 0;
+  let firstResponseSent;
+  const firstResponse = new Promise((resolve) => { firstResponseSent = resolve; });
+  const timers = trackedTimers();
+
+  await withServer((request, response) => {
+    if (request.url === '/api/console/projects') {
+      attempts += 1;
+      response.writeHead(503, {'retry-after': '1'}).end();
+      firstResponseSent();
+      return;
+    }
+    response.writeHead(404).end();
+  }, async (baseUrl) => {
+    const controller = new AbortController();
+    const api = new AgentStackClient({
+      baseUrl,
+      uak: credential,
+      projectId: 'project_test',
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout
+    });
+    const pending = api.listProjects({signal: controller.signal});
+    void pending.catch(() => {});
+    await firstResponse;
+
+    const retryTimer = await Promise.race([
+      timers.scheduledPromise,
+      delay(50).then(() => null)
+    ]);
+    controller.abort();
+    const outcome = await Promise.race([
+      pending.then(
+        () => ({status: 'resolved'}),
+        (error) => ({status: 'rejected', name: error.name})
+      ),
+      delay(50).then(() => ({status: 'pending'}))
+    ]);
+
+    assert.equal(retryTimer?.milliseconds, 1000);
+    assert.deepEqual(outcome, {status: 'rejected', name: 'AbortError'});
+    assert.equal(timers.active.size, 0);
+    assert.equal(timers.clearCalls, 1);
+    assert.equal(attempts, 1);
   });
 });
