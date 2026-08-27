@@ -120,13 +120,16 @@ test('AsrService calls Whisper exactly once only when Agent Stack ASR is unavail
     const wavPath = path.join(tempDir, 'fallback.wav');
     await writeFile(wavPath, Buffer.from('RIFF'));
     let fallbackCalls = 0;
+    let fallbackPath;
     const service = new AsrService({
       client: agentClient({error: new AsrUnavailableError()}),
       asrAgentId: 'asr-agent',
       tempDir,
       whisper: {async transcribe(candidatePath) {
         fallbackCalls += 1;
-        assert.equal(candidatePath, wavPath);
+        fallbackPath = candidatePath;
+        assert.notEqual(candidatePath, wavPath);
+        assert.deepEqual(await readFile(candidatePath), Buffer.from('RIFF'));
         return '离线转写';
       }}
     });
@@ -134,6 +137,33 @@ test('AsrService calls Whisper exactly once only when Agent Stack ASR is unavail
     assert.equal(await service.transcribe(wavPath, {caseId: 'case-1', segmentId: 'segment-1'}), '离线转写');
     assert.equal(fallbackCalls, 1);
     await assert.rejects(() => readFile(wavPath), {code: 'ENOENT'});
+    await assert.rejects(() => readFile(fallbackPath), {code: 'ENOENT'});
+  });
+});
+
+test('AsrService stages validated WAV bytes for Whisper when the original path changes', async () => {
+  await withTempDirectory(async (tempDir) => {
+    const wavPath = path.join(tempDir, 'fallback-race.wav');
+    const validatedWav = Buffer.from('validated WAV bytes');
+    await writeFile(wavPath, validatedWav);
+    let fallbackPath;
+    const service = new AsrService({
+      client: agentClient({error: new AsrUnavailableError()}),
+      asrAgentId: 'asr-agent',
+      tempDir,
+      whisper: {async transcribe(candidatePath) {
+        fallbackPath = candidatePath;
+        assert.notEqual(candidatePath, wavPath);
+        await writeFile(wavPath, Buffer.from('replaced WAV bytes'));
+        assert.deepEqual(await readFile(candidatePath), validatedWav);
+        return '离线转写';
+      }}
+    });
+
+    assert.equal(await service.transcribe(wavPath, {caseId: 'case-1', segmentId: 'segment-1'}), '离线转写');
+    await assert.rejects(() => readFile(wavPath), {code: 'ENOENT'});
+    await assert.rejects(() => readFile(fallbackPath), {code: 'ENOENT'});
+    await assert.rejects(() => readFile(path.dirname(fallbackPath)), {code: 'ENOENT'});
   });
 });
 

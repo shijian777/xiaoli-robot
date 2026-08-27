@@ -58,7 +58,12 @@ export class AsrService {
         return extractTranscript(turn?.assistantMessage);
       } catch (error) {
         if (error instanceof AsrUnavailableError && this.#whisper) {
-          return this.#whisper.transcribe(bridgeWav.path);
+          const fallbackWav = await stageFallbackWav(wav, bridgeWav);
+          try {
+            return await this.#whisper.transcribe(fallbackWav.path);
+          } finally {
+            await removeFallbackWav(fallbackWav);
+          }
         }
         throw error;
       }
@@ -141,6 +146,76 @@ async function removeBridgeWav({path: wavPath, tempDir, realTempDir}) {
     throw new Error('ASR cleanup refused a path outside tempDir');
   }
   await fs.rm(wavPath, {force: true});
+}
+
+async function stageFallbackWav(wav, bridgeWav) {
+  await assertUnchangedTempDir(bridgeWav.tempDir, bridgeWav.realTempDir);
+  const directory = await fs.mkdtemp(path.join(bridgeWav.tempDir, 'asr-fallback-'));
+  let handle;
+  try {
+    await fs.chmod(directory, 0o700);
+    const realDirectory = await fs.realpath(directory);
+    const directoryStats = await fs.lstat(directory);
+    if (directoryStats.isSymbolicLink() || !directoryStats.isDirectory() || !isContainedBy(bridgeWav.realTempDir, realDirectory)) {
+      throw new Error('ASR fallback staging directory is outside tempDir');
+    }
+
+    const fallbackPath = path.join(directory, 'input.wav');
+    handle = await fs.open(fallbackPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    await handle.writeFile(wav);
+    await handle.close();
+    handle = undefined;
+    return {
+      path: fallbackPath,
+      directory,
+      tempDir: bridgeWav.tempDir,
+      realTempDir: bridgeWav.realTempDir
+    };
+  } catch (error) {
+    await handle?.close();
+    await removeFallbackDirectory({directory, tempDir: bridgeWav.tempDir, realTempDir: bridgeWav.realTempDir});
+    throw error;
+  }
+}
+
+async function removeFallbackWav(fallbackWav) {
+  try {
+    await assertPrivateFallbackDirectory(fallbackWav);
+    await fs.rm(fallbackWav.path, {force: true});
+  } finally {
+    await removeFallbackDirectory(fallbackWav);
+  }
+}
+
+async function removeFallbackDirectory(fallbackWav) {
+  try {
+    await assertPrivateFallbackDirectory(fallbackWav);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  try {
+    await fs.rmdir(fallbackWav.directory);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+}
+
+async function assertPrivateFallbackDirectory({directory, tempDir, realTempDir}) {
+  if (!isContainedBy(tempDir, directory)) {
+    throw new Error('ASR fallback cleanup refused a path outside tempDir');
+  }
+  await assertUnchangedTempDir(tempDir, realTempDir);
+  const [realDirectory, directoryStats] = await Promise.all([fs.realpath(directory), fs.lstat(directory)]);
+  if (directoryStats.isSymbolicLink() || !directoryStats.isDirectory() || !isContainedBy(realTempDir, realDirectory)) {
+    throw new Error('ASR fallback cleanup refused a path outside tempDir');
+  }
+}
+
+async function assertUnchangedTempDir(tempDir, realTempDir) {
+  if (await fs.realpath(tempDir) !== realTempDir) {
+    throw new Error('ASR fallback staging refused a changed tempDir');
+  }
 }
 
 function isContainedBy(parent, candidate) {
