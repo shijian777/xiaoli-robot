@@ -16,6 +16,7 @@ const scriptPath = path.resolve('scripts/synthesize.ps1');
 
 function fakeChild() {
   const child = new EventEmitter();
+  child.pid = 4321;
   child.killCalls = 0;
   child.kill = () => {
     child.killCalls += 1;
@@ -105,22 +106,24 @@ test('Windows TTS waits for a killed child to close before cleaning up a timed-o
   assert.deepEqual(cleanup, [path.join('C:/tmp/xiaoli-tts-test', 'speech.wav'), 'C:/tmp/xiaoli-tts-test']);
 });
 
-test('Windows TTS bounds no-close termination, absorbs late errors, and continues cleanup after a WAV failure', async () => {
+test('Windows TTS force-terminates a no-close child, settles the timeout, and cleans exactly once after a later close', async () => {
   const child = fakeChild();
+  const taskkill = fakeChild();
   const clock = scheduledTimers();
   const cleanup = [];
+  const spawned = [];
   const tts = new WindowsTts({
     tempDir: tmpdir(),
-    spawn() { return child; },
+    spawn(command, args, options) {
+      spawned.push({command, args, options});
+      return command === 'taskkill' ? taskkill : child;
+    },
     setTimeout: clock.setTimeout,
     clearTimeout: clock.clearTimeout,
     fs: {
       async mkdtemp() { return 'C:/tmp/xiaoli-tts-test'; },
       async readFile() { throw new Error('readFile must not run after timeout'); },
-      async rm(candidate) {
-        cleanup.push(candidate);
-        if (candidate.endsWith('speech.wav')) throw Object.assign(new Error('locked'), {code: 'EIO'});
-      }
+      async rm(candidate) { cleanup.push(candidate); }
     }
   });
 
@@ -131,9 +134,22 @@ test('Windows TTS bounds no-close termination, absorbs late errors, and continue
   assert.ok(Number.isFinite(clock.timers[1].milliseconds));
   assert.ok(clock.timers[1].milliseconds > 0);
   clock.timers[1].callback();
+  assert.deepEqual(spawned[1], {
+    command: 'taskkill',
+    args: ['/PID', '4321', '/T', '/F'],
+    options: {shell: false, windowsHide: true}
+  });
+  assert.deepEqual(cleanup, []);
+  clock.timers[2].callback();
   await assert.rejects(pending, /Windows TTS synthesis timed out/);
-  assert.deepEqual(cleanup, [path.join('C:/tmp/xiaoli-tts-test', 'speech.wav'), 'C:/tmp/xiaoli-tts-test']);
+  assert.deepEqual(cleanup, []);
   assert.doesNotThrow(() => child.emit('error', new Error('late error after grace')));
+  child.emit('close', 1, null);
+  await flush();
+  assert.deepEqual(cleanup, [path.join('C:/tmp/xiaoli-tts-test', 'speech.wav'), 'C:/tmp/xiaoli-tts-test']);
+  child.emit('close', 1, null);
+  await flush();
+  assert.deepEqual(cleanup, [path.join('C:/tmp/xiaoli-tts-test', 'speech.wav'), 'C:/tmp/xiaoli-tts-test']);
 });
 
 test('Windows TTS retries a locked WAV cleanup without skipping temporary-directory cleanup', async () => {
@@ -161,7 +177,7 @@ test('Windows TTS retries a locked WAV cleanup without skipping temporary-direct
   const pending = tts.synthesize('timeout');
   await waitForFirstTimer(clock);
   clock.timers[0].callback();
-  clock.timers[1].callback();
+  child.emit('close', 1, null);
   await flush();
   clock.timers[2].callback();
   await assert.rejects(pending, /Windows TTS synthesis timed out/);

@@ -7,6 +7,7 @@ import {parsePcmWav} from '../audio/wav.mjs';
 
 const TIMEOUT_MS = 90_000;
 const TERMINATION_GRACE_MS = 1_000;
+const FORCE_TERMINATION_GRACE_MS = 1_000;
 const CLEANUP_RETRY_DELAY_MS = 50;
 const CLEANUP_ATTEMPTS = 3;
 const defaultScriptPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../scripts/synthesize.ps1');
@@ -52,11 +53,17 @@ export class WindowsTts {
 
     const directory = await this.#fs.mkdtemp(path.join(this.#tempDir, 'xiaoli-tts-'));
     const wavPath = path.join(directory, 'speech.wav');
+    let cleanupPromise;
+    let cleanupDeferred = false;
+    const cleanup = () => cleanupPromise ??= this.#cleanup(directory, wavPath);
     try {
-      await this.#runSynthesis(text, wavPath);
+      await this.#runSynthesis(text, wavPath, cleanup);
       return parsePcmWav(await this.#fs.readFile(wavPath)).pcm;
+    } catch (error) {
+      cleanupDeferred = error instanceof DeferredCleanupTimeoutError;
+      throw error;
     } finally {
-      await this.#cleanup(directory, wavPath);
+      if (!cleanupDeferred) await cleanup();
     }
   }
 
@@ -86,7 +93,7 @@ export class WindowsTts {
     });
   }
 
-  #runSynthesis(text, wavPath) {
+  #runSynthesis(text, wavPath, cleanupAfterClose) {
     return new Promise((resolve, reject) => {
       let child;
       let timer;
@@ -120,6 +127,9 @@ export class WindowsTts {
         else if (code === 0) finish(resolve);
         else finish(() => reject(new Error('Windows TTS process failed')));
       };
+      const onDeferredClose = () => {
+        void cleanupAfterClose().catch(() => {});
+      };
 
       try {
         child = this.#spawn(this.#powershellPath, [
@@ -144,12 +154,36 @@ export class WindowsTts {
         child.on('error', () => {});
         stopChild();
         terminationTimer = this.#setTimeout(() => {
-          finish(() => reject(new Error('Windows TTS synthesis timed out')));
+          if (settled) return;
+          this.#forceTerminate(child?.pid);
+          terminationTimer = this.#setTimeout(() => {
+            if (settled) return;
+            child?.once('close', onDeferredClose);
+            finish(() => reject(new DeferredCleanupTimeoutError()));
+          }, FORCE_TERMINATION_GRACE_MS);
+          terminationTimer.unref?.();
         }, TERMINATION_GRACE_MS);
         terminationTimer.unref?.();
       }, TIMEOUT_MS);
       timer.unref?.();
     });
+  }
+
+  #forceTerminate(pid) {
+    if (!Number.isInteger(pid) || pid <= 0) return;
+    try {
+      const terminator = this.#spawn('taskkill', ['/PID', String(pid), '/T', '/F'], {shell: false, windowsHide: true});
+      terminator?.on?.('error', () => {});
+      terminator?.on?.('close', () => {});
+    } catch {
+      // The second close grace still bounds the caller if taskkill cannot start.
+    }
+  }
+}
+
+class DeferredCleanupTimeoutError extends Error {
+  constructor() {
+    super('Windows TTS synthesis timed out');
   }
 }
 
