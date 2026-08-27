@@ -1,0 +1,17 @@
+{
+  "name": "xiaoli-local-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {"node": ">=24.0.0"},
+  "scripts": {
+    "test": "node --test",
+    "start": "node --env-file=.env.local src/server.mjs",
+    "fake-device": "node --env-file=.env.local scripts/fake-device.mjs"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "bonjour-service": "^1.3.0",
+    "ws": "^8.18.3"
+  }
+}
