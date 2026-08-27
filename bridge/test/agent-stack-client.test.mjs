@@ -285,17 +285,24 @@ test('interprets an HTTP-date Retry-After header as a bounded delay', async () =
   });
 });
 
-test('ignores malformed and negative Retry-After values without delaying discovery', async () => {
+async function assertZeroRetryAfter(retryAfter) {
   let attempts = 0;
   let firstResponseSent;
+  let secondRequest;
   const firstResponse = new Promise((resolve) => { firstResponseSent = resolve; });
+  const secondResponse = new Promise((resolve) => { secondRequest = resolve; });
   const timers = trackedTimers();
 
   await withServer((request, response) => {
     if (request.url === '/api/console/projects') {
       attempts += 1;
-      response.writeHead(503, {'retry-after': attempts === 1 ? 'not-a-delay' : '-10'}).end();
-      firstResponseSent();
+      if (attempts === 1) {
+        response.writeHead(503, {'retry-after': retryAfter}).end();
+        firstResponseSent();
+      } else {
+        sendJson(response, {projects: []});
+        secondRequest();
+      }
       return;
     }
     response.writeHead(404).end();
@@ -314,8 +321,18 @@ test('ignores malformed and negative Retry-After values without delaying discove
     const retryTimer = await timers.scheduledPromise;
 
     assert.equal(retryTimer.milliseconds, 0);
-    controller.abort();
-    await assert.rejects(pending, {name: 'AbortError'});
+    retryTimer.callback();
+    await secondResponse;
+    assert.equal(attempts, 2);
+    assert.deepEqual(await pending, []);
     assert.equal(timers.active.size, 0);
   });
+}
+
+test('treats malformed Retry-After as an immediate discovery retry', async () => {
+  await assertZeroRetryAfter('not-a-delay');
+});
+
+test('treats negative Retry-After as an immediate discovery retry', async () => {
+  await assertZeroRetryAfter('-10');
 });
