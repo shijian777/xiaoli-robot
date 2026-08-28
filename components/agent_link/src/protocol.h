@@ -44,6 +44,18 @@ struct Frame {
 bool ParseFrame(const uint8_t* data, size_t len, Frame& out);
 
 /**
+ * @brief Build a command frame.
+ * @param command_id Command ID.
+ * @param sequence Request sequence number.
+ * @param payload Command payload (can be nullptr if len is zero).
+ * @param len Payload length.
+ * @return A byte vector containing the complete command frame, or an empty
+ *         vector when the payload is invalid or exceeds UINT16_MAX bytes.
+ */
+std::vector<uint8_t> BuildCommand(uint8_t command_id, uint8_t sequence,
+                                  const uint8_t* payload, size_t len);
+
+/**
  * @brief Build a response frame (message_type=Response).
  * @param command_id Command ID.
  * @param sequence Sequence number.
@@ -51,7 +63,8 @@ bool ParseFrame(const uint8_t* data, size_t len, Frame& out);
  * @param error_code Error code.
  * @param extra Extra payload (optional).
  * @param extra_len Length of extra payload.
- * @return Vector containing the serialized frame.
+ * @return Vector containing the serialized frame, or an empty vector when the
+ *         extra payload is invalid or the full payload exceeds UINT16_MAX bytes.
  */
 std::vector<uint8_t> BuildResponse(uint8_t command_id, uint8_t sequence,
                                    uint8_t status, uint16_t error_code,
@@ -62,7 +75,8 @@ std::vector<uint8_t> BuildResponse(uint8_t command_id, uint8_t sequence,
  * @param event_id Event ID.
  * @param payload  Event payload (can be nullptr if len == 0).
  * @param len      Payload length.
- * @return A byte vector containing the complete event frame.
+ * @return A byte vector containing the complete event frame, or an empty
+ *         vector when the payload is invalid or exceeds UINT16_MAX bytes.
  */
 std::vector<uint8_t> BuildEvent(uint8_t event_id, const uint8_t* payload, size_t len);
 

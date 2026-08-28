@@ -1,6 +1,7 @@
 // Control‑plane protocol frame encoding/decoding implementation
 #include "protocol.h"
 #include <cstring>
+#include <limits>
 
 namespace agentlink {
 
@@ -36,10 +37,29 @@ static void WriteHeader(std::vector<uint8_t>& f, uint8_t msg_type, uint8_t id,
     f.push_back(static_cast<uint8_t>((payload_len >> 8) & 0xFF));
 }
 
+std::vector<uint8_t> BuildCommand(uint8_t command_id, uint8_t sequence,
+                                  const uint8_t* payload, size_t len) {
+    if (len > std::numeric_limits<uint16_t>::max() ||
+        (len > 0 && payload == nullptr)) {
+        return {};
+    }
+
+    std::vector<uint8_t> f;
+    f.reserve(kHeaderSize + len);
+    WriteHeader(f, kMsgCommand, command_id, sequence, static_cast<uint16_t>(len));
+    if (payload && len > 0) f.insert(f.end(), payload, payload + len);
+    return f;
+}
+
 std::vector<uint8_t> BuildResponse(uint8_t command_id, uint8_t sequence,
                                    uint8_t status, uint16_t error_code,
                                    const uint8_t* extra, size_t extra_len) {
     const size_t ack = 4;  // acked_cmd + status + err(2, LE)
+    if (extra_len > std::numeric_limits<uint16_t>::max() - ack ||
+        (extra_len > 0 && extra == nullptr)) {
+        return {};
+    }
+
     const uint16_t payload_len = static_cast<uint16_t>(ack + extra_len);
     std::vector<uint8_t> f;
     f.reserve(kHeaderSize + payload_len);
@@ -53,6 +73,11 @@ std::vector<uint8_t> BuildResponse(uint8_t command_id, uint8_t sequence,
 }
 
 std::vector<uint8_t> BuildEvent(uint8_t event_id, const uint8_t* payload, size_t len) {
+    if (len > std::numeric_limits<uint16_t>::max() ||
+        (len > 0 && payload == nullptr)) {
+        return {};
+    }
+
     std::vector<uint8_t> f;
     f.reserve(kHeaderSize + len);
     WriteHeader(f, kMsgEvent, event_id, /*sequence=*/0, static_cast<uint16_t>(len));

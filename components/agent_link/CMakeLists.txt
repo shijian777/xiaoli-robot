@@ -5,6 +5,7 @@ idf_component_register(
         "src/transport_wifi.cpp"
         "src/wifi_provision.cpp"
         "src/protocol.cpp"
+        "src/wifi_wire.cpp"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src"
     REQUIRES esp_common
