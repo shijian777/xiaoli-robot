@@ -11,22 +11,39 @@
 //     the portal after a bounded number of failed joins
 #include "agent_link_transport.h"
 #include "agent_link.h"          // agent_wifi_config_t (STA credentials + cloud endpoint)
+#include "protocol.h"
 #include "wifi_provision.h"
+#include "wifi_transport_utils.h"
+#include "wifi_wire.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <cstdio>
+#include <new>
 #include <mutex>
+#include <string>
+#include <vector>
 
+#include "cJSON.h"
+#include "esp_app_desc.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
+#include "esp_websocket_client.h"
+#include "mdns.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "lwip/def.h"
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 namespace {
@@ -45,6 +62,18 @@ constexpr int      kBootFailLimit   = 8;      // stored creds: after 8 failed jo
 constexpr uint32_t kReconnectBaseMs = 2000;   // base station reconnect backoff
 constexpr uint32_t kReconnectMaxMs  = 30000;  // backoff cap
 constexpr uint32_t kProvTeardownMs  = 4000;   // linger on the portal after success so the page can show it, then drop the AP
+constexpr uint32_t kBridgeRetryMaxMs = 30000;
+constexpr uint32_t kHelloAckTimeoutMs = 5000;
+constexpr uint32_t kWorkerPollMs = 100;
+constexpr size_t kRxItemCapacity = 8;
+
+constexpr EventBits_t kWsGotIp = BIT0;
+constexpr EventBits_t kWsConnected = BIT1;
+constexpr EventBits_t kWsAuthenticated = BIT2;
+constexpr EventBits_t kWsRecycle = BIT3;
+constexpr EventBits_t kWsTxReady = BIT4;
+constexpr EventBits_t kWsRxReady = BIT5;
+constexpr EventBits_t kWsStop = BIT6;
 
 enum class Phase { kIdle, kProvisioning, kStaConnecting, kStaConnected };
 
@@ -70,6 +99,46 @@ char       s_pass[65] = {0};
 char       s_endpoint[AL_PROV_ENDPOINT_CAPACITY] = {0};
 char       s_device_token[AL_PROV_DEVICE_TOKEN_CAPACITY] = {0};
 std::mutex s_cred_mtx;
+
+struct TxItem {
+    bool text = false;
+    xiaoli::wifi::TxClass tx_class = xiaoli::wifi::TxClass::kReserved;
+    std::vector<uint8_t> payload;
+};
+
+using RxItem = xiaoli::wifi::CompleteMessage;
+
+QueueHandle_t s_tx_queue = nullptr;
+QueueHandle_t s_rx_queue = nullptr;
+SemaphoreHandle_t s_tx_lock = nullptr;
+SemaphoreHandle_t s_tx_space = nullptr;
+SemaphoreHandle_t s_worker_done = nullptr;
+EventGroupHandle_t s_ws_events = nullptr;
+TaskHandle_t s_ws_worker = nullptr;
+esp_websocket_client_handle_t s_ws_client = nullptr;
+
+xiaoli::wifi::TxQueuePolicy s_tx_policy;
+xiaoli::wifi::UplinkStreams s_uplink;
+xiaoli::wifi::FragmentAssembler s_fragments;
+xiaoli::wifi::VoiceRxTracker s_voice_rx;
+
+std::atomic<bool> s_got_ip{false};
+std::atomic<bool> s_ws_connected{false};
+std::atomic<bool> s_ws_authenticated{false};
+std::atomic<bool> s_accepting{false};
+std::atomic<bool> s_stopping{false};
+std::atomic<bool> s_ready_announced{false};
+std::atomic<bool> s_destroying_client{false};
+std::atomic<int64_t> s_hello_deadline_us{0};
+
+uint8_t s_rx_control_sequence = 0;
+uint32_t s_boot_nonce = 0;
+uint32_t s_client_generation = 0;
+uint32_t s_bridge_retry_ms = kReconnectBaseMs;
+bool s_mdns_owned = false;
+std::string s_mac12;
+std::string s_device_id;
+std::string s_hello_message_id;
 
 esp_timer_handle_t s_reconnect_timer = nullptr;
 esp_timer_handle_t s_teardown_timer  = nullptr;
@@ -195,6 +264,506 @@ void TeardownProvCb(void*) {
     ESP_LOGI(TAG, "provisioning portal closed; SoftAP down");
 }
 
+class TxLockGuard {
+public:
+    TxLockGuard() : locked_(s_tx_lock && xSemaphoreTake(s_tx_lock, portMAX_DELAY) == pdTRUE) {}
+    ~TxLockGuard() { if (locked_) xSemaphoreGive(s_tx_lock); }
+    bool locked() const { return locked_; }
+private:
+    bool locked_;
+};
+
+void SignalWs(EventBits_t bits) {
+    if (s_ws_events != nullptr) xEventGroupSetBits(s_ws_events, bits);
+}
+
+void CloseAdmissionAndResetStreams() {
+    s_accepting.store(false);
+    if (s_tx_lock == nullptr) return;
+    TxLockGuard lock;
+    if (!lock.locked()) return;
+    s_uplink.ResetAll();
+}
+
+void MarkConnectionUnusable() {
+    s_accepting.store(false);
+    s_ws_authenticated.store(false);
+    s_ws_connected.store(false);
+    s_hello_deadline_us.store(0);
+    if (!s_stopping.load() && !s_destroying_client.load()) SignalWs(kWsRecycle);
+}
+
+void DrainTxQueue() {
+    if (s_tx_queue == nullptr) return;
+    TxItem* item = nullptr;
+    while (xQueueReceive(s_tx_queue, &item, 0) == pdTRUE) {
+        if (item != nullptr) {
+            {
+                TxLockGuard lock;
+                if (lock.locked()) s_tx_policy.Release(item->tx_class, item->payload.size());
+            }
+            delete item;
+        }
+    }
+    {
+        TxLockGuard lock;
+        if (lock.locked()) {
+            s_tx_policy.Reset();
+            s_uplink.ResetAll();
+        }
+    }
+    if (s_tx_space != nullptr) xSemaphoreGive(s_tx_space);
+}
+
+void DrainRxQueue() {
+    if (s_rx_queue == nullptr) return;
+    RxItem* item = nullptr;
+    while (xQueueReceive(s_rx_queue, &item, 0) == pdTRUE) delete item;
+}
+
+void PublishDisconnected() {
+    if (s_ready_announced.exchange(false) && s_on_conn != nullptr) s_on_conn(false);
+}
+
+bool IsHelloAckMessage(const uint8_t* data, size_t len) {
+    if (data == nullptr || len == 0) return false;
+    cJSON* root = cJSON_ParseWithLength(reinterpret_cast<const char*>(data), len);
+    cJSON* type = root ? cJSON_GetObjectItemCaseSensitive(root, "type") : nullptr;
+    const bool is_ack = cJSON_IsString(type) && type->valuestring != nullptr &&
+                        strcmp(type->valuestring, "hello.ack") == 0;
+    cJSON_Delete(root);
+    return is_ack;
+}
+
+void TrackAudioMarker(const uint8_t* data, size_t len) {
+    cJSON* root = cJSON_ParseWithLength(reinterpret_cast<const char*>(data), len);
+    cJSON* type = root ? cJSON_GetObjectItemCaseSensitive(root, "type") : nullptr;
+    if (cJSON_IsString(type) && type->valuestring != nullptr) {
+        if (strcmp(type->valuestring, "audio.start") == 0) s_voice_rx.OnAudioStart();
+        else if (strcmp(type->valuestring, "audio.end") == 0) s_voice_rx.OnAudioEnd();
+    }
+    cJSON_Delete(root);
+}
+
+void DispatchText(const uint8_t* data, size_t len) {
+    if (IsHelloAckMessage(data, len)) {
+        if (!s_ws_authenticated.load() &&
+            xiaoli::wifi::IsMatchingHelloAck(data, len, s_hello_message_id, s_device_id)) {
+            s_ws_authenticated.store(true);
+            s_hello_deadline_us.store(0);
+            s_accepting.store(true);
+            SignalWs(kWsAuthenticated);
+        }
+        return;
+    }
+    if (!s_ws_authenticated.load()) return;
+    TrackAudioMarker(data, len);
+    std::vector<uint8_t> command = agentlink::BuildCommand(
+        0x7e, s_rx_control_sequence, data, len);
+    if (command.empty()) return;
+    ++s_rx_control_sequence;
+    if (s_on_recv != nullptr) s_on_recv(command.data(), command.size());
+}
+
+void DispatchBinary(const uint8_t* data, size_t len) {
+    if (!s_ws_authenticated.load()) return;
+    xiaoli::WireFrame frame{};
+    if (!xiaoli::DecodeWireFrame(data, len, frame)) {
+        s_voice_rx.Reset();
+        return;
+    }
+    if (frame.kind == xiaoli::WireKind::kControl) {
+        if (s_on_recv != nullptr) s_on_recv(frame.payload, frame.payload_len);
+        return;
+    }
+    if (frame.kind == xiaoli::WireKind::kStreamChunk) {
+        if (!s_voice_rx.AcceptChunk(static_cast<agent_stream_t>(frame.stream_type),
+                                    frame.flags, frame.sequence, frame.payload_len)) {
+            s_voice_rx.Reset();
+            return;
+        }
+        if (s_on_stream != nullptr) {
+            s_on_stream(AGENT_STREAM_VOICE, frame.payload, frame.payload_len);
+        }
+        return;
+    }
+    if (frame.kind == xiaoli::WireKind::kStreamEnd) {
+        if (!s_voice_rx.AcceptEnd(frame.sequence, (frame.flags & 1) != 0) ||
+            frame.stream_type != AGENT_STREAM_VOICE || (frame.flags & ~1U) != 0) {
+            s_voice_rx.Reset();
+            return;
+        }
+        const uint8_t status[] = {0, 0, 0, 0, 3};
+        const std::vector<uint8_t> command = agentlink::BuildCommand(
+            0x05, static_cast<uint8_t>(frame.sequence), status, sizeof(status));
+        if (!command.empty() && s_on_recv != nullptr) s_on_recv(command.data(), command.size());
+        return;
+    }
+    s_voice_rx.Reset();
+}
+
+void OnWsData(const esp_websocket_event_data_t& event) {
+    if (event.data_len < 0 || event.payload_len < 0 || event.payload_offset < 0) {
+        s_fragments.Reset();
+        return;
+    }
+    if (event.op_code == 0x8 || event.op_code == 0x9 || event.op_code == 0xa) return;
+    xiaoli::wifi::CompleteMessage complete;
+    const auto result = s_fragments.Append(
+        event.op_code, event.fin, static_cast<size_t>(event.payload_len),
+        static_cast<size_t>(event.payload_offset),
+        reinterpret_cast<const uint8_t*>(event.data_ptr),
+        static_cast<size_t>(event.data_len), complete);
+    if (result != xiaoli::wifi::FragmentResult::kComplete) return;
+    RxItem* item = new (std::nothrow) RxItem{
+        complete.text, std::move(complete.payload)};
+    if (item == nullptr || xQueueSend(s_rx_queue, &item, 0) != pdTRUE) {
+        delete item;
+        MarkConnectionUnusable();
+        return;
+    }
+    SignalWs(kWsRxReady);
+}
+
+void WebSocketEvent(void*, esp_event_base_t, int32_t id, void* data) {
+    auto* event = static_cast<esp_websocket_event_data_t*>(data);
+    if (event == nullptr || s_stopping.load() || s_destroying_client.load()) return;
+    switch (id) {
+    case WEBSOCKET_EVENT_CONNECTED:
+        s_ws_connected.store(true);
+        s_ws_authenticated.store(false);
+        s_accepting.store(false);
+        SignalWs(kWsConnected);
+        break;
+    case WEBSOCKET_EVENT_DATA:
+        OnWsData(*event);
+        break;
+    case WEBSOCKET_EVENT_DISCONNECTED:
+    case WEBSOCKET_EVENT_CLOSED:
+    case WEBSOCKET_EVENT_ERROR:
+        MarkConnectionUnusable();
+        break;
+    default:
+        break;
+    }
+}
+
+esp_err_t MdnsResolve(const char* host, uint32_t timeout_ms, uint32_t* ipv4_be, void*) {
+    if (host == nullptr || ipv4_be == nullptr) return ESP_ERR_INVALID_ARG;
+    esp_ip4_addr_t address{};
+    esp_err_t result = mdns_query_a(host, timeout_ms, &address);
+    if (result == ESP_OK) *ipv4_be = lwip_ntohl(address.addr);
+    return result;
+}
+
+bool EndpointUsesMdns(const std::string& endpoint) {
+    const size_t authority = endpoint.find("ws://");
+    const size_t path = endpoint.find('/', authority == std::string::npos ? 0 : authority + 5);
+    const size_t host_end = endpoint.find(':', authority == std::string::npos ? 0 : authority + 5);
+    const size_t end = host_end != std::string::npos && host_end < path ? host_end : path;
+    if (authority != 0 || end == std::string::npos || end < 11) return false;
+    return endpoint.compare(end - 6, 6, ".local") == 0;
+}
+
+esp_err_t EnsureMdns() {
+    if (s_mdns_owned) return ESP_OK;
+    char hostname[64] = {};
+    const esp_err_t prior = mdns_hostname_get(hostname);
+    if (prior == ESP_OK) return ESP_OK;
+    if (prior != ESP_ERR_INVALID_STATE) return prior;
+    const esp_err_t result = mdns_init();
+    if (result == ESP_OK) s_mdns_owned = true;
+    return result;
+}
+
+esp_err_t ResolveConfiguredEndpoint(std::string& resolved) {
+    std::string endpoint;
+    {
+        std::lock_guard<std::mutex> lock(s_cred_mtx);
+        endpoint = s_endpoint;
+    }
+    if (EndpointUsesMdns(endpoint)) {
+        esp_err_t result = EnsureMdns();
+        if (result != ESP_OK) return result;
+    }
+    return xiaoli::wifi::ResolveEndpoint(endpoint.c_str(), &MdnsResolve, nullptr, resolved);
+}
+
+bool BuildIdentity() {
+    uint8_t mac[6] = {};
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) return false;
+    char mac12[13] = {};
+    snprintf(mac12, sizeof(mac12), "%02x%02x%02x%02x%02x%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    s_mac12 = mac12;
+    s_device_id = "xiaoli-" + s_mac12;
+    return true;
+}
+
+esp_err_t SendHello() {
+    std::string token;
+    {
+        std::lock_guard<std::mutex> lock(s_cred_mtx);
+        token = s_device_token;
+    }
+    char nonce[9] = {};
+    snprintf(nonce, sizeof(nonce), "%08lx", static_cast<unsigned long>(s_boot_nonce));
+    xiaoli::wifi::HelloIdentity identity{
+        s_mac12, nonce, s_client_generation, esp_app_get_description()->version, token};
+    std::string json;
+    std::string message_id;
+    std::string device_id;
+    const bool built = xiaoli::wifi::BuildHelloJson(
+        identity, json, message_id, device_id);
+    std::fill(token.begin(), token.end(), '\0');
+    if (!built || device_id != s_device_id ||
+        (!s_hello_message_id.empty() && message_id != s_hello_message_id)) {
+        std::fill(json.begin(), json.end(), '\0');
+        return ESP_FAIL;
+    }
+    s_hello_message_id = message_id;
+    const int sent = esp_websocket_client_send_text(
+        s_ws_client, json.data(), static_cast<int>(json.size()), pdMS_TO_TICKS(10000));
+    const bool complete = sent == static_cast<int>(json.size());
+    std::fill(json.begin(), json.end(), '\0');
+    if (!complete) return ESP_FAIL;
+    s_hello_deadline_us.store(esp_timer_get_time() +
+                              static_cast<int64_t>(kHelloAckTimeoutMs) * 1000);
+    return ESP_OK;
+}
+
+esp_err_t CreateWebSocketClient() {
+    std::string uri;
+    esp_err_t result = ResolveConfiguredEndpoint(uri);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Bridge resolution failed: %s", esp_err_to_name(result));
+        return result;
+    }
+    ++s_client_generation;
+    s_hello_message_id.clear();
+    esp_websocket_client_config_t config = {};
+    config.uri = uri.c_str();
+    config.network_timeout_ms = 10000;
+    config.reconnect_timeout_ms = 2000;
+    config.disable_auto_reconnect = false;
+    config.enable_close_reconnect = true;
+    config.task_stack = 8192;
+    config.buffer_size = 4096;
+    config.ping_interval_sec = 10;
+    config.pingpong_timeout_sec = 20;
+    s_ws_client = esp_websocket_client_init(&config);
+    if (s_ws_client == nullptr) return ESP_ERR_NO_MEM;
+    result = esp_websocket_register_events(
+        s_ws_client, WEBSOCKET_EVENT_ANY, &WebSocketEvent, nullptr);
+    if (result == ESP_OK) result = esp_websocket_client_start(s_ws_client);
+    if (result != ESP_OK) {
+        s_destroying_client.store(true);
+        esp_websocket_client_destroy(s_ws_client);
+        s_ws_client = nullptr;
+        s_destroying_client.store(false);
+    } else {
+        ESP_LOGI(TAG, "Bridge WebSocket client started");
+    }
+    return result;
+}
+
+void DestroyWebSocketClient() {
+    if (s_ws_client == nullptr) return;
+    s_destroying_client.store(true);
+    (void)esp_websocket_client_stop(s_ws_client);
+    (void)esp_websocket_client_destroy(s_ws_client);
+    s_ws_client = nullptr;
+    s_destroying_client.store(false);
+    s_ws_connected.store(false);
+    s_ws_authenticated.store(false);
+    s_accepting.store(false);
+    s_hello_deadline_us.store(0);
+    s_fragments.Reset();
+    s_voice_rx.Reset();
+    if (s_ws_events != nullptr) {
+        xEventGroupClearBits(s_ws_events,
+                             kWsConnected | kWsAuthenticated | kWsRecycle |
+                             kWsTxReady | kWsRxReady);
+    }
+}
+
+void DrainReceive() {
+    RxItem* item = nullptr;
+    while (xQueueReceive(s_rx_queue, &item, 0) == pdTRUE) {
+        if (item != nullptr) {
+            if (item->text) DispatchText(item->payload.data(), item->payload.size());
+            else DispatchBinary(item->payload.data(), item->payload.size());
+            delete item;
+        }
+    }
+}
+
+void DrainTransmit() {
+    while (s_ws_authenticated.load() && s_ws_client != nullptr) {
+        TxItem* item = nullptr;
+        if (xQueueReceive(s_tx_queue, &item, 0) != pdTRUE) return;
+        if (item == nullptr) continue;
+        int sent = -1;
+        if (item->text) {
+            sent = esp_websocket_client_send_text(
+                s_ws_client, reinterpret_cast<const char*>(item->payload.data()),
+                static_cast<int>(item->payload.size()), pdMS_TO_TICKS(10000));
+        } else {
+            sent = esp_websocket_client_send_bin(
+                s_ws_client, reinterpret_cast<const char*>(item->payload.data()),
+                static_cast<int>(item->payload.size()), pdMS_TO_TICKS(10000));
+        }
+        const bool sent_all = sent == static_cast<int>(item->payload.size());
+        {
+            TxLockGuard lock;
+            if (lock.locked()) s_tx_policy.Release(item->tx_class, item->payload.size());
+        }
+        delete item;
+        if (s_tx_space != nullptr) xSemaphoreGive(s_tx_space);
+        if (!sent_all) {
+            MarkConnectionUnusable();
+            return;
+        }
+    }
+}
+
+bool WaitRetry(uint32_t delay_ms) {
+    const EventBits_t bits = xEventGroupWaitBits(
+        s_ws_events, kWsStop | kWsGotIp, pdTRUE, pdFALSE, pdMS_TO_TICKS(delay_ms));
+    return (bits & kWsStop) == 0 && !s_stopping.load();
+}
+
+void WebSocketWorker(void*) {
+    while (!s_stopping.load()) {
+        const EventBits_t bits = xEventGroupWaitBits(
+            s_ws_events, kWsGotIp | kWsConnected | kWsAuthenticated |
+                         kWsRecycle | kWsTxReady | kWsRxReady | kWsStop,
+            pdTRUE, pdFALSE, pdMS_TO_TICKS(kWorkerPollMs));
+        if ((bits & kWsStop) != 0 || s_stopping.load()) break;
+
+        if ((bits & kWsRecycle) != 0) {
+            CloseAdmissionAndResetStreams();
+            PublishDisconnected();
+            DestroyWebSocketClient();
+            DrainTxQueue();
+            DrainRxQueue();
+            if (s_got_ip.load()) {
+                const uint32_t delay = s_bridge_retry_ms;
+                s_bridge_retry_ms = std::min(s_bridge_retry_ms * 2, kBridgeRetryMaxMs);
+                if (!WaitRetry(delay)) break;
+            }
+        }
+
+        if (s_ws_client == nullptr && s_got_ip.load()) {
+            esp_err_t result = CreateWebSocketClient();
+            if (result != ESP_OK) {
+                const uint32_t delay = s_bridge_retry_ms;
+                s_bridge_retry_ms = std::min(s_bridge_retry_ms * 2, kBridgeRetryMaxMs);
+                if (!WaitRetry(delay)) break;
+                continue;
+            }
+        }
+
+        if ((bits & kWsConnected) != 0 && s_ws_connected.load()) {
+            if (SendHello() != ESP_OK) MarkConnectionUnusable();
+        }
+
+        if ((bits & kWsAuthenticated) != 0 && s_ws_authenticated.load() &&
+            s_got_ip.load() && s_ws_connected.load()) {
+            s_accepting.store(true);
+            s_bridge_retry_ms = kReconnectBaseMs;
+            if (!s_ready_announced.exchange(true) && s_on_conn != nullptr) s_on_conn(true);
+        }
+
+        if ((bits & kWsTxReady) != 0) DrainTransmit();
+        if ((bits & kWsRxReady) != 0) DrainReceive();
+
+        const int64_t deadline = s_hello_deadline_us.load();
+        if (deadline != 0 && esp_timer_get_time() >= deadline &&
+            !s_ws_authenticated.load()) {
+            ESP_LOGW(TAG, "Bridge hello acknowledgment timed out");
+            MarkConnectionUnusable();
+        }
+    }
+    CloseAdmissionAndResetStreams();
+    PublishDisconnected();
+    DestroyWebSocketClient();
+    DrainTxQueue();
+    DrainRxQueue();
+    s_ws_worker = nullptr;
+    if (s_worker_done != nullptr) xSemaphoreGive(s_worker_done);
+    vTaskDelete(nullptr);
+}
+
+bool TryQueueLocked(TxItem* item) {
+    if (item == nullptr || !s_accepting.load() || !s_ws_authenticated.load() ||
+        !s_tx_policy.Admit(item->tx_class, item->payload.size())) {
+        return false;
+    }
+    if (xQueueSend(s_tx_queue, &item, 0) != pdTRUE) {
+        s_tx_policy.Release(item->tx_class, item->payload.size());
+        return false;
+    }
+    SignalWs(kWsTxReady);
+    return true;
+}
+
+esp_err_t QueueReserved(xiaoli::wifi::OutboundMessage&& message) {
+    TxItem* item = new (std::nothrow) TxItem{
+        message.text, xiaoli::wifi::TxClass::kReserved, std::move(message.payload)};
+    if (item == nullptr) return ESP_ERR_NO_MEM;
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t wait_ticks = pdMS_TO_TICKS(xiaoli::wifi::kReservedAdmissionWaitMs);
+    while (true) {
+        {
+            TxLockGuard lock;
+            if (!lock.locked() || !s_accepting.load()) {
+                delete item;
+                return ESP_ERR_INVALID_STATE;
+            }
+            if (TryQueueLocked(item)) return ESP_OK;
+        }
+        const TickType_t elapsed = xTaskGetTickCount() - start;
+        if (elapsed >= wait_ticks) {
+            delete item;
+            return ESP_ERR_TIMEOUT;
+        }
+        (void)xSemaphoreTake(s_tx_space, wait_ticks - elapsed);
+    }
+}
+
+bool InitializeWebSocketWorker() {
+    if (s_ws_worker != nullptr) return true;
+    s_tx_queue = xQueueCreate(xiaoli::wifi::kTxItemCapacity, sizeof(TxItem*));
+    s_rx_queue = xQueueCreate(kRxItemCapacity, sizeof(RxItem*));
+    s_tx_lock = xSemaphoreCreateMutex();
+    s_tx_space = xSemaphoreCreateBinary();
+    s_worker_done = xSemaphoreCreateBinary();
+    s_ws_events = xEventGroupCreate();
+    if (s_tx_queue == nullptr || s_rx_queue == nullptr || s_tx_lock == nullptr ||
+        s_tx_space == nullptr ||
+        s_worker_done == nullptr || s_ws_events == nullptr) {
+        return false;
+    }
+    s_stopping.store(false);
+    s_boot_nonce = esp_random();
+    s_client_generation = 0;
+    s_bridge_retry_ms = kReconnectBaseMs;
+    s_rx_control_sequence = 0;
+    if (!BuildIdentity()) return false;
+    return xTaskCreate(&WebSocketWorker, "al_ws_lifecycle", 8192, nullptr, 5,
+                       &s_ws_worker) == pdPASS;
+}
+
+void DeleteWebSocketWorkerResources() {
+    if (s_tx_queue) { vQueueDelete(s_tx_queue); s_tx_queue = nullptr; }
+    if (s_rx_queue) { vQueueDelete(s_rx_queue); s_rx_queue = nullptr; }
+    if (s_tx_lock) { vSemaphoreDelete(s_tx_lock); s_tx_lock = nullptr; }
+    if (s_tx_space) { vSemaphoreDelete(s_tx_space); s_tx_space = nullptr; }
+    if (s_worker_done) { vSemaphoreDelete(s_worker_done); s_worker_done = nullptr; }
+    if (s_ws_events) { vEventGroupDelete(s_ws_events); s_ws_events = nullptr; }
+}
+
 // Station reached the network
 void OnGotIp(const esp_netif_ip_info_t& ip) {
     char ip_str[16];
@@ -214,9 +783,13 @@ void OnGotIp(const esp_netif_ip_info_t& ip) {
         ESP_LOGI(TAG, "WiFi connected: ip=%s", ip_str);
     }
     s_phase = Phase::kStaConnected;
+    s_got_ip.store(true);
+    SignalWs(kWsGotIp);
 }
 
 void OnStaDisconnected(uint8_t reason) {
+    s_got_ip.store(false);
+    MarkConnectionUnusable();
     if (s_phase == Phase::kProvisioning) {
         // A join attempt during provisioning failed,retry a couple times, then tell the page.
         if (++s_retry >= kProvFailLimit) {
@@ -361,9 +934,18 @@ void StartProvisioning() {
 
 // agent_transport_t interface
 esp_err_t wifi_start(void* /*impl*/) {
+    if (!InitializeWebSocketWorker()) {
+        DeleteWebSocketWorkerResources();
+        return ESP_ERR_NO_MEM;
+    }
     esp_err_t r = WifiInitOnce();
-    if (r != ESP_OK) return r;
-    (void)s_on_recv; (void)s_on_conn; (void)s_on_stream;  // wired for the cloud plane (P3); unused until then
+    if (r != ESP_OK) {
+        s_stopping.store(true);
+        SignalWs(kWsStop);
+        if (s_worker_done) xSemaphoreTake(s_worker_done, pdMS_TO_TICKS(5000));
+        DeleteWebSocketWorkerResources();
+        return r;
+    }
 
     al_prov_settings_t settings = {};
     if (BuildEffectiveSettings(settings)) {
@@ -377,30 +959,116 @@ esp_err_t wifi_start(void* /*impl*/) {
 }
 
 void wifi_stop(void* /*impl*/) {
+    s_stopping.store(true);
+    s_accepting.store(false);
+    s_got_ip.store(false);
     if (s_reconnect_timer) esp_timer_stop(s_reconnect_timer);
     if (s_teardown_timer)  esp_timer_stop(s_teardown_timer);
+    SignalWs(kWsStop);
+    if (s_worker_done != nullptr) {
+        (void)xSemaphoreTake(s_worker_done, portMAX_DELAY);
+    }
+    if (s_mdns_owned) {
+        mdns_free();
+        s_mdns_owned = false;
+    }
     al_wifi_prov_stop();
     s_want_connect = false;
     if (s_started) { esp_wifi_disconnect(); esp_wifi_stop(); s_started = false; }
     s_phase = Phase::kIdle;
+    DeleteWebSocketWorkerResources();
 }
 
 // Control plane
-esp_err_t wifi_send_ctrl(void* /*impl*/, const uint8_t* /*frame*/, size_t /*len*/) {
-    return ESP_ERR_NOT_SUPPORTED;
+esp_err_t wifi_send_ctrl(void* /*impl*/, const uint8_t* frame, size_t len) {
+    if (!s_accepting.load()) return ESP_ERR_INVALID_STATE;
+    xiaoli::wifi::OutboundMessage message;
+    esp_err_t result = xiaoli::wifi::EncodeControl(frame, len, message);
+    if (result != ESP_OK) return result;
+    return QueueReserved(std::move(message));
 }
-esp_err_t wifi_stream_start(void* /*impl*/, agent_stream_t /*type*/, const uint8_t* /*meta*/, size_t /*meta_len*/) {
-    return ESP_ERR_NOT_SUPPORTED;
+esp_err_t wifi_stream_start(void* /*impl*/, agent_stream_t type,
+                            const uint8_t* meta, size_t meta_len) {
+    if (!s_accepting.load()) return ESP_ERR_INVALID_STATE;
+    const TickType_t started = xTaskGetTickCount();
+    const TickType_t wait_ticks = pdMS_TO_TICKS(xiaoli::wifi::kReservedAdmissionWaitMs);
+    while (true) {
+        TxLockGuard lock;
+        if (!lock.locked() || !s_accepting.load()) return ESP_ERR_INVALID_STATE;
+        std::vector<uint8_t> wire;
+        esp_err_t result = s_uplink.Start(type, meta, meta_len, wire);
+        if (result != ESP_OK) return result;
+        TxItem* item = new (std::nothrow) TxItem{
+            false, xiaoli::wifi::TxClass::kReserved, std::move(wire)};
+        if (item == nullptr) {
+            s_uplink.Reset(type);
+            return ESP_ERR_NO_MEM;
+        }
+        if (TryQueueLocked(item)) return ESP_OK;
+        s_uplink.Reset(type);
+        delete item;
+        xSemaphoreGive(s_tx_lock);
+        const TickType_t elapsed = xTaskGetTickCount() - started;
+        if (elapsed >= wait_ticks) {
+            (void)xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+            return ESP_ERR_TIMEOUT;
+        }
+        (void)xSemaphoreTake(s_tx_space, wait_ticks - elapsed);
+        (void)xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+    }
 }
-esp_err_t wifi_send_stream(void* /*impl*/, agent_stream_t /*type*/, const uint8_t* /*data*/, size_t /*len*/) {
-    return ESP_ERR_NOT_SUPPORTED;
+esp_err_t wifi_send_stream(void* /*impl*/, agent_stream_t type,
+                           const uint8_t* data, size_t len) {
+    if (!s_accepting.load()) return ESP_ERR_INVALID_STATE;
+    TxLockGuard lock;
+    if (!lock.locked() || !s_accepting.load()) return ESP_ERR_INVALID_STATE;
+    std::vector<uint8_t> wire;
+    esp_err_t result = s_uplink.PrepareChunk(type, data, len, wire);
+    if (result != ESP_OK) return result;
+    TxItem* item = new (std::nothrow) TxItem{
+        false, xiaoli::wifi::TxClass::kAudioChunk, std::move(wire)};
+    if (item == nullptr) return ESP_ERR_NO_MEM;
+    if (!TryQueueLocked(item)) {
+        delete item;
+        return s_accepting.load() ? ESP_ERR_TIMEOUT : ESP_ERR_INVALID_STATE;
+    }
+    s_uplink.CommitChunk(type, len);
+    return ESP_OK;
 }
-esp_err_t wifi_stream_end(void* /*impl*/, agent_stream_t /*type*/, bool /*complete*/,
-                          const uint8_t* /*meta*/, size_t /*meta_len*/) {
-    return ESP_ERR_NOT_SUPPORTED;
+esp_err_t wifi_stream_end(void* /*impl*/, agent_stream_t type, bool complete,
+                          const uint8_t* meta, size_t meta_len) {
+    if (!s_accepting.load()) return ESP_ERR_INVALID_STATE;
+    const TickType_t started = xTaskGetTickCount();
+    const TickType_t wait_ticks = pdMS_TO_TICKS(xiaoli::wifi::kReservedAdmissionWaitMs);
+    while (true) {
+        TxLockGuard lock;
+        if (!lock.locked() || !s_accepting.load()) return ESP_ERR_INVALID_STATE;
+        std::vector<uint8_t> wire;
+        esp_err_t result = s_uplink.PrepareEnd(type, complete, meta, meta_len, wire);
+        if (result != ESP_OK) return result;
+        TxItem* item = new (std::nothrow) TxItem{
+            false, xiaoli::wifi::TxClass::kReserved, std::move(wire)};
+        if (item == nullptr) return ESP_ERR_NO_MEM;
+        if (TryQueueLocked(item)) {
+            s_uplink.CommitEnd(type);
+            return ESP_OK;
+        }
+        delete item;
+        xSemaphoreGive(s_tx_lock);
+        const TickType_t elapsed = xTaskGetTickCount() - started;
+        if (elapsed >= wait_ticks) {
+            (void)xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+            return ESP_ERR_TIMEOUT;
+        }
+        (void)xSemaphoreTake(s_tx_space, wait_ticks - elapsed);
+        (void)xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+    }
 }
 
-bool wifi_is_ready(void* /*impl*/) { return false; }
+bool wifi_is_ready(void* /*impl*/) {
+    return s_got_ip.load() && s_ws_connected.load() && s_ws_authenticated.load() &&
+           !s_stopping.load();
+}
 
 agent_transport_t s_wifi = {
     wifi_start, wifi_stop, wifi_send_ctrl,

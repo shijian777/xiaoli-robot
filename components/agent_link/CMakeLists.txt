@@ -6,10 +6,12 @@ idf_component_register(
         "src/wifi_provision.cpp"
         "src/protocol.cpp"
         "src/wifi_wire.cpp"
+        "src/wifi_transport_utils.cpp"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src"
     REQUIRES esp_common
-    PRIV_REQUIRES log bt nvs_flash freertos
+    PRIV_REQUIRES log bt nvs_flash freertos json esp_app_format
                   esp_wifi esp_netif esp_event esp_http_server esp_timer lwip
+                  esp_websocket_client mdns
     EMBED_TXTFILES "portal/portal.html" "portal/connecting.html"
 )

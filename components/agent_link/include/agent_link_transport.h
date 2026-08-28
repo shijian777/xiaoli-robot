@@ -23,7 +23,7 @@ extern "C" {
 /**
  * @brief Data‑plane stream type
  * @note The transport backend selects the appropriate media channel:
- *       BLE uses different L2CAP channels, WiFi uses different WebRTC tracks
+ *       BLE uses GATT/L2CAP; WiFi uses ordered XL frames over WebSocket.
  */
 typedef enum {
     AGENT_STREAM_VOICE = 0,    ///< Voice (microphone uplink / TTS downlink)
@@ -37,7 +37,7 @@ typedef enum {
  * @brief Transport backend operation table
  * @note All functions must be implemented by the backend
  *       Control plane is reliable but low‑bandwidth (GATT, WS, MQTT)
- *       Data plane is high‑throughput (L2CAP, WebRTC)
+ *       Data plane is high‑throughput (L2CAP or bounded WebSocket queues)
  */
 typedef struct agent_transport_s {
     /**
@@ -58,8 +58,8 @@ typedef struct agent_transport_s {
      * @param impl  Backend private context
      * @param frame Frame buffer (header + payload)
      * @param len   Frame length
-     * @return ESP_OK on success, error code otherwise
-     * @note The control channel is reliable and ordered
+     * @return ESP_OK on queue admission; ESP_ERR_TIMEOUT on bounded backpressure
+     * @note The control channel is reliable and FIFO ordered. Callers retain ownership.
      */
     esp_err_t (*send_ctrl)(void* impl, const uint8_t* frame, size_t len);
 
@@ -70,7 +70,7 @@ typedef struct agent_transport_s {
      * @param meta     Optional metadata (e.g., codec, sample rate)
      * @param meta_len Length of meta
      * @return ESP_OK on success, error code otherwise
-     * @note The backend allocates a session ID and resets sequence numbers
+     * @note WiFi copies metadata and resets the per-stream XL sequence to zero.
      */
     esp_err_t (*stream_start)(void* impl, agent_stream_t type, const uint8_t* meta, size_t meta_len);
 
@@ -81,8 +81,9 @@ typedef struct agent_transport_s {
      * @param data Data buffer
      * @param len  Data length
      * @return ESP_OK on success, error code otherwise
-     * @note For BLE voice, this uses GATT Notify 0xFFA1 (event 0x40 VoiceChunk)
-     *       Recording/files use L2CAP CoC; video is WiFi only
+     * @note For BLE voice, this uses GATT Notify 0xFFA1 (event 0x40 VoiceChunk).
+     *       WiFi copies each chunk into a bounded non-blocking FIFO and reports
+     *       ESP_ERR_TIMEOUT rather than silently dropping audio.
      */
     esp_err_t (*send_stream)(void* impl, agent_stream_t type, const uint8_t* data, size_t len);
 
@@ -100,7 +101,7 @@ typedef struct agent_transport_s {
     esp_err_t (*stream_end)(void* impl, agent_stream_t type, bool complete, const uint8_t* meta, size_t meta_len);
 
     /**
-     * @brief Check if the transport is ready (connected and encrypted)
+     * @brief Check if the transport is authenticated and ready
      * @param impl Backend private context
      * @return true if ready, false otherwise
      */
@@ -202,7 +203,7 @@ void agent_transport_wifi_set_name(const char* name);
 
 /**
  * @brief Register callback for incoming control frames.
- * @param cb Function called when a control message is received (WS/DataChannel).
+ * @param cb Function called when a control message is received over WebSocket.
  * @note Called by agent_link_init() to wire the core's OnCtrlFrame.
  */
 void agent_transport_wifi_set_recv(void (*cb)(const uint8_t* data, size_t len));
@@ -216,7 +217,7 @@ void agent_transport_wifi_set_conn(void (*cb)(bool connected));
 
 /**
  * @brief Register callback for incoming data-plane data.
- * @param cb Function called when a data chunk arrives (e.g., WebRTC audio/video).
+ * @param cb Function called when an XL WebSocket data chunk arrives.
  * @note Called by agent_link_init() to wire the core's OnStreamData.
  */
 void agent_transport_wifi_set_stream_recv(void (*cb)(agent_stream_t type, const uint8_t* data, size_t len));
