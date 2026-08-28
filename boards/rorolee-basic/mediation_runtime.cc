@@ -99,6 +99,98 @@ void CallbackAdmissionGate::CloseAndAdvance() {
     epoch_.fetch_add(1, std::memory_order_acq_rel);
 }
 
+void EpochFaultLatch::Signal(uint32_t epoch) {
+    if (epoch == 0) {
+        return;
+    }
+    uint32_t observed = pending_epoch_.load(std::memory_order_acquire);
+    while (observed < epoch &&
+           !pending_epoch_.compare_exchange_weak(
+               observed, epoch, std::memory_order_acq_rel,
+               std::memory_order_acquire)) {
+    }
+}
+
+bool EpochFaultLatch::TakeIfCurrent(uint32_t current_epoch) {
+    const uint32_t pending = pending_epoch_.exchange(
+        0, std::memory_order_acq_rel);
+    return pending != 0 && pending == current_epoch;
+}
+
+bool IsCurrentPlaybackNotice(uint32_t active_session_epoch,
+                             uint32_t notice_session_epoch) {
+    return active_session_epoch != 0 &&
+           active_session_epoch == notice_session_epoch;
+}
+
+uint32_t PlaybackIoEpoch::RequestReset() {
+    uint32_t next = reset_requested_.fetch_add(
+        1, std::memory_order_acq_rel) + 1;
+    if (next == 0) {
+        next = reset_requested_.fetch_add(
+            1, std::memory_order_acq_rel) + 1;
+    }
+    return next;
+}
+
+uint32_t PlaybackIoEpoch::requested_reset() const {
+    return reset_requested_.load(std::memory_order_acquire);
+}
+
+void PlaybackIoEpoch::InvalidateSession() {
+    callback_epoch_.store(0, std::memory_order_release);
+    session_epoch_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void PlaybackIoEpoch::AcknowledgeReset(uint32_t reset_epoch) {
+    reset_acknowledged_.store(reset_epoch, std::memory_order_release);
+}
+
+bool PlaybackIoEpoch::reset_confirmed() const {
+    return reset_acknowledged_.load(std::memory_order_acquire) ==
+           reset_requested_.load(std::memory_order_acquire);
+}
+
+uint32_t PlaybackIoEpoch::BeginSession(uint32_t callback_epoch) {
+    if (callback_epoch == 0 || !reset_confirmed()) {
+        return 0;
+    }
+    uint32_t session = session_epoch_.fetch_add(
+        1, std::memory_order_acq_rel) + 1;
+    if (session == 0) {
+        session = session_epoch_.fetch_add(
+            1, std::memory_order_acq_rel) + 1;
+    }
+    callback_epoch_.store(callback_epoch, std::memory_order_release);
+    return session;
+}
+
+bool PlaybackIoEpoch::AcceptCallback(
+    uint32_t captured_reset_epoch, bool callback_epoch_current) const {
+    return callback_epoch_current && reset_confirmed() &&
+           captured_reset_epoch == requested_reset();
+}
+
+PlaybackWriteLease PlaybackIoEpoch::CaptureWriteLease() const {
+    PlaybackWriteLease lease{};
+    do {
+        lease.session_epoch = session_epoch_.load(std::memory_order_acquire);
+        lease.callback_epoch = callback_epoch_.load(std::memory_order_acquire);
+    } while (lease.session_epoch !=
+             session_epoch_.load(std::memory_order_acquire));
+    return lease;
+}
+
+bool PlaybackIoEpoch::AcceptWrite(
+    const PlaybackWriteLease& lease, bool callback_epoch_current) const {
+    return callback_epoch_current && reset_confirmed() &&
+           lease.session_epoch != 0 && lease.callback_epoch != 0 &&
+           lease.session_epoch ==
+               session_epoch_.load(std::memory_order_acquire) &&
+           lease.callback_epoch ==
+               callback_epoch_.load(std::memory_order_acquire);
+}
+
 bool MediationProbeBudget::Take() {
     if (attempts_ >= kMaxAttempts) {
         return false;
@@ -237,6 +329,45 @@ void ConnectionReplayLedger::Forget(
         sent_ordinal_[slot] == insertion_ordinal) {
         sent_ordinal_[slot] = 0;
     }
+}
+
+bool CompleteFaultDeferral::DeferWhileRecording(
+    SlotId active_slot, SlotId failed_slot, uint64_t insertion_ordinal,
+    bool retryable) {
+    if (active_slot == kInvalidSlot || failed_slot >= kPendingSlotCount ||
+        insertion_ordinal == 0) {
+        return false;
+    }
+    if (pending_) {
+        if (fault_.slot != failed_slot ||
+            fault_.insertion_ordinal != insertion_ordinal) {
+            return false;
+        }
+        // A terminal report dominates a retryable duplicate for the same
+        // retained segment.
+        fault_.retryable = fault_.retryable && retryable;
+        return true;
+    }
+    fault_.slot = failed_slot;
+    fault_.insertion_ordinal = insertion_ordinal;
+    fault_.retryable = retryable;
+    pending_ = true;
+    return true;
+}
+
+bool CompleteFaultDeferral::TakeIfIdle(
+    SlotId active_slot, PendingCompleteFault* fault) {
+    if (!pending_ || active_slot != kInvalidSlot || fault == nullptr) {
+        return false;
+    }
+    *fault = fault_;
+    Reset();
+    return true;
+}
+
+void CompleteFaultDeferral::Reset() {
+    fault_ = {};
+    pending_ = false;
 }
 
 TranscriptTracker::Entry* TranscriptTracker::Find(const char* segment_id) {

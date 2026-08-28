@@ -151,6 +151,7 @@ StoreResult PendingAudioStore::MarkLocallyComplete(SlotId slot_id) {
         return StoreResult::kWrongState;
     }
     slot.state = SlotState::kCompleteUnacked;
+    slot.quarantined = false;
     return StoreResult::kOk;
 }
 
@@ -162,6 +163,7 @@ void PendingAudioStore::Release(Slot& slot) {
     slot.insertion_ordinal = 0;
     slot.meta = {};
     slot.state = SlotState::kFree;
+    slot.quarantined = false;
 }
 
 void PendingAudioStore::AbortIncomplete(SlotId slot_id) {
@@ -174,7 +176,7 @@ void PendingAudioStore::AbortIncomplete(SlotId slot_id) {
     }
 }
 
-bool PendingAudioStore::AbandonComplete(
+bool PendingAudioStore::QuarantineComplete(
     SlotId slot_id, uint64_t insertion_ordinal) {
     if (!initialized_ || slot_id >= kPendingSlotCount ||
         insertion_ordinal == 0) {
@@ -185,7 +187,7 @@ bool PendingAudioStore::AbandonComplete(
         slot.insertion_ordinal != insertion_ordinal) {
         return false;
     }
-    Release(slot);
+    slot.quarantined = true;
     return true;
 }
 
@@ -203,6 +205,7 @@ bool PendingAudioStore::Get(SlotId slot_id, PendingSegmentView* view) const {
     view->bytes = slot.bytes;
     view->insertion_ordinal = slot.insertion_ordinal;
     view->locally_complete = slot.state == SlotState::kCompleteUnacked;
+    view->quarantined = slot.quarantined;
     return true;
 }
 
@@ -214,7 +217,7 @@ bool PendingAudioStore::OldestCompleteUnacked(PendingSegmentView* view) const {
     SlotId oldest_id = kInvalidSlot;
     for (SlotId index = 0; index < kPendingSlotCount; ++index) {
         const Slot& slot = slots_[index];
-        if (slot.state != SlotState::kCompleteUnacked) {
+        if (slot.state != SlotState::kCompleteUnacked || slot.quarantined) {
             continue;
         }
         if (oldest == nullptr ||
@@ -232,6 +235,7 @@ bool PendingAudioStore::OldestCompleteUnacked(PendingSegmentView* view) const {
     view->bytes = oldest->bytes;
     view->insertion_ordinal = oldest->insertion_ordinal;
     view->locally_complete = true;
+    view->quarantined = false;
     return true;
 }
 

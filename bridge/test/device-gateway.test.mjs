@@ -179,6 +179,45 @@ test('rejects the wrong token with 4003 and acknowledges a canonical hello', asy
   });
 });
 
+test('a newer authenticated generation closes the stale device socket', async () => {
+  await withGateway(async ({url}) => {
+    const first = await openClient(url);
+    const firstChannel = inbox(first);
+    await authenticate(first, firstChannel);
+    first.send(JSON.stringify(control(
+      'case.start', 'generation-owner-case-start',
+      {caseId: 'generation-owner-case'})));
+    await nextJson(firstChannel, 'ack');
+    first.send(startFrame({
+      messageId: 'stale-owner-start', caseId: 'generation-owner-case',
+      segmentId: 'stale-owner-a', speaker: 'A'
+    }));
+    await nextJson(firstChannel, 'ack');
+    first.send(streamFrame(FrameKind.STREAM_CHUNK, 0, Buffer.from([1, 0])));
+    const firstClosed = new Promise((resolve) => {
+      first.once('close', (code) => resolve(code));
+    });
+
+    const second = await openClient(url);
+    const secondChannel = inbox(second);
+    await authenticate(second, secondChannel);
+    assert.equal(await settleWithin(firstClosed), 4004);
+
+    second.send(JSON.stringify(control(
+      'case.start', 'generation-owner-case-start',
+      {caseId: 'generation-owner-case'})));
+    assert.equal((await nextJson(secondChannel, 'ack')).accepted, true);
+    second.send(startFrame({
+      messageId: 'replacement-owner-start', caseId: 'generation-owner-case',
+      segmentId: 'replacement-owner-b', speaker: 'B'
+    }));
+    const replacement = await nextJson(secondChannel);
+    assert.equal(replacement.type, 'ack');
+    assert.equal(replacement.messageId, 'replacement-owner-start');
+    await closeClient(second);
+  });
+});
+
 test('requires hello before accepting a binary CONTROL frame', async () => {
   await withGateway(async ({url}) => {
     const ws = await openClient(url);
@@ -848,6 +887,79 @@ test('socket close during durable commit does not orphan or fail the committing 
   }, {gatewayOptions: {fileSystem}});
 });
 
+test('a replay socket closed while waiting for commit cannot poison a third exact replay', async () => {
+  const renameStarted = deferred();
+  const releaseRename = deferred();
+  let failRename = true;
+  const fileSystem = {
+    ...realFs,
+    async rename(...args) {
+      if (failRename) {
+        failRename = false;
+        renameStarted.resolve();
+        await releaseRename.promise;
+        throw Object.assign(new Error('injected commit failure'), {code: 'EIO'});
+      }
+      return realFs.rename(...args);
+    }
+  };
+  await withGateway(async ({gateway, url, cases}) => {
+    const first = await openClient(url);
+    const firstChannel = inbox(first);
+    await authenticate(first, firstChannel);
+    first.send(JSON.stringify(control('case.start', 'commit-three-case-start', {caseId: 'commit-three-case'})));
+    await nextJson(firstChannel, 'ack');
+    const start = startFrame({
+      messageId: 'commit-three-start', caseId: 'commit-three-case',
+      segmentId: 'commit-three-a', speaker: 'A'
+    });
+    const end = endFrame({
+      messageId: 'commit-three-end', caseId: 'commit-three-case',
+      segmentId: 'commit-three-a', bytes: 4, lastSequence: 0
+    });
+    const pcm = Buffer.from([1, 0, 2, 0]);
+    first.send(start);
+    await nextJson(firstChannel, 'ack');
+    first.send(streamFrame(FrameKind.STREAM_CHUNK, 0, pcm));
+    first.send(end);
+    await settleWithin(renameStarted.promise);
+    await closeClient(first);
+
+    const second = await openClient(url);
+    const secondChannel = inbox(second);
+    await authenticate(second, secondChannel);
+    second.send(JSON.stringify(control('case.start', 'commit-three-case-start', {caseId: 'commit-three-case'})));
+    await nextJson(secondChannel, 'ack');
+    second.send(start);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await closeClient(second);
+
+    // Let the commit fail while the only waiter is already closed. Without a
+    // post-await connection check that stale waiter reopens failed progress
+    // and becomes active owner, so the third exact replay is rejected.
+    releaseRename.resolve();
+    await gateway.waitForIdle();
+
+    const third = await openClient(url);
+    const thirdChannel = inbox(third);
+    await authenticate(third, thirdChannel);
+    third.send(JSON.stringify(control('case.start', 'commit-three-case-start', {caseId: 'commit-three-case'})));
+    await nextJson(thirdChannel, 'ack');
+    third.send(start);
+    const replayStart = await nextJson(thirdChannel, 'ack');
+    assert.equal(replayStart.messageId, 'commit-three-start');
+
+    third.send(streamFrame(FrameKind.STREAM_CHUNK, 0, pcm));
+    third.send(end);
+    const durable = await nextJson(thirdChannel, 'ack');
+    assert.equal(durable.messageId, 'commit-three-end');
+    assert.equal(durable.durable, true);
+    await gateway.waitForIdle();
+    assert.equal(cases.snapshot('commit-three-case').speakers.A[0].state, 'saved');
+    await closeClient(third);
+  }, {gatewayOptions: {fileSystem}});
+});
+
 test('a recording orphaned by disconnect is terminal and does not block replacement A and B transcripts', async () => {
   await withGateway(async ({gateway, url, cases}) => {
     const first = await openClient(url);
@@ -1020,7 +1132,7 @@ test('rejects mediation until queued transcription has saved both A and B', asyn
   });
 });
 
-test('reconnect drops the old mediation delivery and plays only the replacement request', async () => {
+test('reconnect detaches a stuck mediation and lets replacement mediation and transcription run', async () => {
   const cases = new CaseManager();
   cases.startCase('device-1', 'generation-case');
   for (const [segmentId, speaker, transcript] of [
@@ -1033,7 +1145,6 @@ test('reconnect drops the old mediation delivery and plays only the replacement 
     cases.saveTranscript(segmentId, transcript);
   }
   const firstStarted = deferred();
-  const releaseFirst = deferred();
   const makeResult = (spokenText) => ({
     conflictSummary: '双方有分歧。',
     aPosition: 'A 的立场。',
@@ -1051,8 +1162,7 @@ test('reconnect drops the old mediation delivery and plays only the replacement 
       mediationCalls += 1;
       if (mediationCalls === 1) {
         firstStarted.resolve();
-        await releaseFirst.promise;
-        return makeResult('旧连接结果');
+        return new Promise(() => {});
       }
       return makeResult('新连接结果');
     }
@@ -1083,7 +1193,6 @@ test('reconnect drops the old mediation delivery and plays only the replacement 
     await nextJson(channel, 'ack');
     second.send(JSON.stringify(control('mediate.request', 'generation-m2', {caseId: 'generation-case'})));
     await nextJson(channel, 'ack');
-    releaseFirst.resolve();
 
     const chunks = [];
     for (;;) {
@@ -1093,6 +1202,21 @@ test('reconnect drops the old mediation delivery and plays only the replacement 
       else if (message.value.type === 'error') assert.fail(message.value.code);
     }
     assert.deepEqual(Buffer.concat(chunks), Buffer.from([2, 0, 3, 0]));
+
+    const extraStart = startFrame({
+      messageId: 'generation-extra-start', caseId: 'generation-case',
+      segmentId: 'generation-extra-a', speaker: 'A'
+    });
+    second.send(extraStart);
+    await nextJson(channel, 'ack');
+    second.send(streamFrame(FrameKind.STREAM_CHUNK, 0, Buffer.from([4, 0])));
+    second.send(endFrame({
+      messageId: 'generation-extra-end', caseId: 'generation-case',
+      segmentId: 'generation-extra-a', bytes: 2, lastSequence: 0
+    }));
+    assert.equal((await nextJson(channel, 'ack')).durable, true);
+    const saved = await nextJson(channel, 'transcript.saved');
+    assert.equal(saved.segmentId, 'generation-extra-a');
     await gateway.waitForIdle();
     assert.equal(mediationCalls, 2);
     assert.equal(ttsCalls, 1);

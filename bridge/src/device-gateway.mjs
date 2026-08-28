@@ -303,6 +303,12 @@ class DeviceGateway {
       this.#clearBackpressure(connection);
       this.#connections.delete(connection);
       connection.device?.sockets.delete(connection);
+      if (connection.device &&
+          connection.deviceGeneration ===
+            connection.device.connectionGeneration) {
+        this.#supersedeMediation(
+          connection.device, 'Mediation connection closed');
+      }
       if (connection.device?.activeRecording?.owner === connection) {
         const recording = connection.device.activeRecording;
         this.#failAndForgetRecording(
@@ -334,6 +340,11 @@ class DeviceGateway {
       return;
     }
 
+    if (!this.#isCurrentConnection(connection)) {
+      connection.ws.close(4004, 'device connection superseded');
+      return;
+    }
+
     if (isBinary) await this.#routeBinary(connection, data);
     else await this.#routeControl(connection, parseJson(data));
   }
@@ -353,6 +364,8 @@ class DeviceGateway {
         activeRecording: null,
         queue: Promise.resolve(),
         mediatorSessions: new Map(),
+        mediationController: null,
+        mediationWork: null,
         connectionGeneration: 0,
         currentCaseId: null,
         caseAbortController: null,
@@ -368,8 +381,22 @@ class DeviceGateway {
     }
     connection.authenticated = true;
     connection.device = device;
+    this.#supersedeMediation(device, 'Mediation connection superseded');
     device.connectionGeneration += 1;
     connection.deviceGeneration = device.connectionGeneration;
+    for (const stale of [...device.sockets]) {
+      device.sockets.delete(stale);
+      if (device.activeRecording?.owner === stale) {
+        this.#failAndForgetRecording(
+          device, device.activeRecording,
+          'Recording connection was superseded');
+        device.activeRecording = null;
+      }
+      if (stale.ws.readyState === WebSocket.OPEN ||
+          stale.ws.readyState === WebSocket.CONNECTING) {
+        stale.ws.close(4004, 'device connection superseded');
+      }
+    }
     device.sockets.add(connection);
     const ack = existing ?? {
       v: 1,
@@ -423,6 +450,7 @@ class DeviceGateway {
   #evictDeviceCase(device, caseId) {
     if (device.currentCaseId === caseId) {
       device.caseAbortController?.abort(new Error('Case was replaced'));
+      this.#supersedeMediation(device, 'Mediation case was replaced');
       device.currentCaseId = null;
       device.caseAbortController = null;
     }
@@ -485,6 +513,13 @@ class DeviceGateway {
         return;
       }
       await committing.promise;
+      // The promise belongs to the segment, not to this socket. The replay
+      // waiter may have disconnected (or been superseded) while durable I/O
+      // was in progress; never resurrect that stale connection as stream
+      // owner after the await boundary.
+      if (!this.#isCurrentConnection(connection)) {
+        return;
+      }
       const completed = device.segmentAcks.get(message.segmentId);
       if (completed) {
         device.activeRecording = {
@@ -848,32 +883,69 @@ class DeviceGateway {
     this.#storeAck(device, message, ack);
     this.#sendJson(connection, ack);
     const deliveryGeneration = connection.deviceGeneration;
-    this.#enqueue(
-      device,
-      (signal) => this.#mediate(device, message.caseId, signal, deliveryGeneration),
-      message.caseId);
+    this.#startMediation(
+      device, message.caseId, deliveryGeneration);
   }
 
-  async #mediate(device, caseId, signal, deliveryGeneration) {
+  #startMediation(device, caseId, deliveryGeneration) {
+    if (this.#stopping || this.#abortController.signal.aborted) return null;
+    this.#supersedeMediation(device, 'Mediation request superseded');
+    const controller = new AbortController();
+    device.mediationController = controller;
+    const signal = AbortSignal.any([
+      this.#caseSignal(device, caseId), controller.signal
+    ]);
+    const work = Promise.resolve()
+      .then(() => this.#mediate(
+        device, caseId, signal, deliveryGeneration, controller))
+      .finally(() => {
+        if (device.mediationWork === work) {
+          device.mediationWork = null;
+          device.mediationController = null;
+        }
+      });
+    device.mediationWork = work;
+    this.#trackWork(work);
+    return work;
+  }
+
+  #supersedeMediation(device, reason) {
+    device.mediationController?.abort(new Error(reason));
+    if (device.mediationWork) this.#activeWork.delete(device.mediationWork);
+    device.mediationController = null;
+    device.mediationWork = null;
+    // A session promise can itself be the non-cooperative provider call. Do
+    // not let a stale pending session get reused by the replacement lane.
+    device.mediatorSessions.clear();
+  }
+
+  #mediationCurrent(device, deliveryGeneration, controller) {
+    return !this.#stopping && !controller.signal.aborted &&
+      device.connectionGeneration === deliveryGeneration &&
+      device.mediationController === controller;
+  }
+
+  async #mediate(device, caseId, signal, deliveryGeneration, controller) {
     if (this.#stopping || signal?.aborted ||
-        device.connectionGeneration !== deliveryGeneration) return;
+        !this.#mediationCurrent(
+          device, deliveryGeneration, controller)) return;
     let snapshot;
     try {
       snapshot = this.#cases.snapshot(caseId);
     } catch {
-      if (device.connectionGeneration === deliveryGeneration) {
+      if (this.#mediationCurrent(device, deliveryGeneration, controller)) {
         this.#broadcastError(device, 'case_not_found', false, 'Case does not exist', caseId);
       }
       return;
     }
     if (snapshot.deviceId !== device.deviceId) {
-      if (device.connectionGeneration === deliveryGeneration) {
+      if (this.#mediationCurrent(device, deliveryGeneration, controller)) {
         this.#broadcastError(device, 'case_forbidden', false, 'Case belongs to another device', caseId);
       }
       return;
     }
     if (!snapshot.canMediate) {
-      if (device.connectionGeneration === deliveryGeneration) {
+      if (this.#mediationCurrent(device, deliveryGeneration, controller)) {
         this.#broadcastError(device, 'mediation_not_ready', true, 'Both A and B need saved transcripts', caseId);
       }
       return;
@@ -888,10 +960,10 @@ class DeviceGateway {
       if (!validateMediatorResult(result)) {
         throw new Error('mediation result failed canonical validation');
       }
-      if (device.connectionGeneration !== deliveryGeneration) return;
+      if (!this.#mediationCurrent(device, deliveryGeneration, controller)) return;
       const pcm = await this.#tts.synthesize(result.spokenText, {signal});
       this.#assertRunning(signal);
-      if (device.connectionGeneration !== deliveryGeneration) return;
+      if (!this.#mediationCurrent(device, deliveryGeneration, controller)) return;
       if (!Buffer.isBuffer(pcm) || pcm.length === 0 ||
           pcm.length > MAX_TTS_PCM_BYTES || pcm.length % 2 !== 0) {
         throw new Error('TTS returned invalid PCM');
@@ -927,7 +999,8 @@ class DeviceGateway {
       this.#broadcastState(device, 'waiting', caseId);
     } catch (error) {
       if (this.#stopping || signal?.aborted ||
-          device.connectionGeneration !== deliveryGeneration) return;
+          !this.#mediationCurrent(
+            device, deliveryGeneration, controller)) return;
       this.#broadcastError(device, 'mediation_failed', true, 'Mediation or speech synthesis failed', caseId);
       this.#logger.error?.('Gateway mediation failed', {caseId, errorName: error?.name ?? 'Error'});
     }
@@ -992,6 +1065,14 @@ class DeviceGateway {
       return false;
     }
     return true;
+  }
+
+  #isCurrentConnection(connection) {
+    const device = connection.device;
+    return connection.authenticated && device &&
+      connection.ws.readyState === WebSocket.OPEN &&
+      connection.deviceGeneration === device.connectionGeneration &&
+      device.sockets.has(connection);
   }
 
   #storeAck(device, message, ack, binding) {

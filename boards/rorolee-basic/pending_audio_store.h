@@ -50,6 +50,7 @@ struct PendingSegmentView {
     size_t bytes = 0;
     uint64_t insertion_ordinal = 0;
     bool locally_complete = false;
+    bool quarantined = false;
 };
 
 struct AckResult {
@@ -75,7 +76,7 @@ public:
     StoreResult Append(SlotId slot, const uint8_t* pcm, size_t bytes);
     StoreResult MarkLocallyComplete(SlotId slot);
     void AbortIncomplete(SlotId slot);
-    bool AbandonComplete(SlotId slot, uint64_t insertion_ordinal);
+    bool QuarantineComplete(SlotId slot, uint64_t insertion_ordinal);
 
     bool Get(SlotId slot, PendingSegmentView* view) const;
     bool OldestCompleteUnacked(PendingSegmentView* view) const;
@@ -96,6 +97,7 @@ private:
         uint64_t insertion_ordinal = 0;
         PendingSegmentMeta meta{};
         SlotState state = SlotState::kFree;
+        bool quarantined = false;
     };
 
     static bool MetaValid(const PendingSegmentMeta& meta);

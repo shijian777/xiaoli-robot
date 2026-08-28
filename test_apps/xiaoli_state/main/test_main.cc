@@ -1292,10 +1292,99 @@ TEST_CASE("Only the exact durable end ACK releases one pending segment",
     TEST_ASSERT_TRUE(store.OldestCompleteUnacked(&oldest));
     TEST_ASSERT_EQUAL_STRING("b", oldest.meta.segment_id);
 
-    TEST_ASSERT_FALSE(store.AbandonComplete(second, oldest.insertion_ordinal + 1));
-    TEST_ASSERT_TRUE(store.AbandonComplete(second, oldest.insertion_ordinal));
-    TEST_ASSERT_EQUAL_UINT8(0, store.CompleteCount());
+    const uint64_t quarantined_ordinal = oldest.insertion_ordinal;
+    TEST_ASSERT_FALSE(store.QuarantineComplete(
+        second, quarantined_ordinal + 1));
+    TEST_ASSERT_TRUE(store.QuarantineComplete(second, quarantined_ordinal));
+    TEST_ASSERT_EQUAL_UINT8(1, store.CompleteCount());
+    TEST_ASSERT_TRUE(store.HasCompleteUnacked());
+    TEST_ASSERT_FALSE(store.OldestCompleteUnacked(&oldest));
+    xiaoli::PendingSegmentView quarantined{};
+    TEST_ASSERT_TRUE(store.Get(second, &quarantined));
+    TEST_ASSERT_TRUE(quarantined.quarantined);
+    TEST_ASSERT_EQUAL_UINT32(sizeof(pcm), quarantined.bytes);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(pcm, quarantined.pcm, sizeof(pcm));
     TEST_ASSERT_TRUE(store.HasFreeSlot());
+
+    const auto quarantine_ack = store.ApplyDurableAck(Durable(
+        "case", "b", "start-b-end", sizeof(pcm)));
+    TEST_ASSERT_TRUE(quarantine_ack.released);
+    TEST_ASSERT_EQUAL_UINT8(0, store.CompleteCount());
+}
+
+TEST_CASE("A delayed complete fault waits until the other speaker finishes",
+          "[mediation_runtime][pending_audio]") {
+    std::array<uint8_t, 8> a{};
+    std::array<uint8_t, 8> b{};
+    xiaoli::PendingAudioStore store;
+    TEST_ASSERT_TRUE(store.InitWithBuffers(a.data(), b.data(), a.size()));
+    xiaoli::SlotId complete_a = xiaoli::kInvalidSlot;
+    xiaoli::SlotId live_b = xiaoli::kInvalidSlot;
+    const uint8_t a_pcm[] = {1, 2, 3, 4};
+    const uint8_t b_pcm[] = {5, 6};
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.Begin(SegmentMeta(
+            "case", "old-a", "old-a-start", "old-a-end",
+            xiaoli::Speaker::kA, 1), &complete_a)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.Append(complete_a, a_pcm, sizeof(a_pcm))));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.MarkLocallyComplete(complete_a)));
+    xiaoli::PendingSegmentView old_a{};
+    TEST_ASSERT_TRUE(store.Get(complete_a, &old_a));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.Begin(SegmentMeta(
+            "case", "live-b", "live-b-start", "live-b-end",
+            xiaoli::Speaker::kB, 1), &live_b)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.Append(live_b, b_pcm, sizeof(b_pcm))));
+
+    MediationStateMachine machine;
+    machine.Handle(StateEvent(EventType::kBoot, 0));
+    ShortCase(machine, 1, 2);
+    machine.Handle(ButtonEvent(
+        EventType::kButtonPressed, Button::kPersonB, 3));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(MediationState::kRecordingB),
+                           static_cast<uint8_t>(machine.state()));
+
+    xiaoli::CompleteFaultDeferral deferred;
+    TEST_ASSERT_TRUE(deferred.DeferWhileRecording(
+        live_b, complete_a, old_a.insertion_ordinal, false));
+    TEST_ASSERT_TRUE(deferred.pending());
+    xiaoli::PendingCompleteFault fault{};
+    TEST_ASSERT_FALSE(deferred.TakeIfIdle(live_b, &fault));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(MediationState::kRecordingB),
+                           static_cast<uint8_t>(machine.state()));
+    xiaoli::PendingSegmentView still_live{};
+    TEST_ASSERT_TRUE(store.Get(live_b, &still_live));
+    TEST_ASSERT_FALSE(still_live.locally_complete);
+    TEST_ASSERT_EQUAL_UINT32(sizeof(b_pcm), still_live.bytes);
+
+    const auto stopped = machine.Handle(ButtonEvent(
+        EventType::kButtonPressed, Button::kPersonB, 4));
+    AssertAction(stopped, 0, ActionType::kStopRecording, Speaker::kB);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.MarkLocallyComplete(live_b)));
+    TEST_ASSERT_TRUE(deferred.TakeIfIdle(xiaoli::kInvalidSlot, &fault));
+    TEST_ASSERT_EQUAL_UINT8(complete_a, fault.slot);
+    TEST_ASSERT_EQUAL_UINT64(old_a.insertion_ordinal,
+                             fault.insertion_ordinal);
+    TEST_ASSERT_FALSE(fault.retryable);
+    TEST_ASSERT_TRUE(store.QuarantineComplete(
+        fault.slot, fault.insertion_ordinal));
+
+    Event error = CaseEvent(EventType::kRecoverableError,
+                            machine.case_generation(), 5);
+    error.error = ErrorReason::kRecordingIncomplete;
+    const auto error_actions = machine.Handle(error);
+    TEST_ASSERT_EQUAL_UINT8(2, error_actions.count);
+    AssertAction(error_actions, 0, ActionType::kVibrate, Speaker::kNone,
+                 StatusId::kWaiting, xiaoli::kErrorVibrateMs);
+    xiaoli::PendingSegmentView completed_b{};
+    TEST_ASSERT_TRUE(store.Get(live_b, &completed_b));
+    TEST_ASSERT_TRUE(completed_b.locally_complete);
+    TEST_ASSERT_EQUAL_UINT32(sizeof(b_pcm), completed_b.bytes);
+    TEST_ASSERT_EQUAL_UINT8(2, store.CompleteCount());
 }
 
 TEST_CASE("Business IDs are boot-epoch unique and require committed storage",
@@ -1664,6 +1753,47 @@ TEST_CASE("Playback callback may stage PCM before owner parses audio start",
     TEST_ASSERT_TRUE(gate.ReserveChunk(640));
     TEST_ASSERT_FALSE(gate.Bind("case", 320, 16000, 16, 1));
     TEST_ASSERT_TRUE(gate.incomplete());
+}
+
+TEST_CASE("Playback reset invalidates a received block before codec write",
+          "[mediation_runtime]") {
+    xiaoli::PlaybackIoEpoch io;
+    TEST_ASSERT_TRUE(io.reset_confirmed());
+    TEST_ASSERT_NOT_EQUAL(0, io.BeginSession(7));
+    const xiaoli::PlaybackWriteLease old_read = io.CaptureWriteLease();
+    TEST_ASSERT_TRUE(io.AcceptWrite(old_read, true));
+
+    const uint32_t reset = io.RequestReset();
+    // This models owner abort arriving after StreamBufferReceive and before
+    // WritePcm: the old block is rejected even before the play task resets.
+    TEST_ASSERT_FALSE(io.reset_confirmed());
+    TEST_ASSERT_FALSE(io.AcceptWrite(old_read, true));
+    TEST_ASSERT_FALSE(io.AcceptCallback(0, true));
+    io.InvalidateSession();
+    io.AcknowledgeReset(reset);
+    TEST_ASSERT_TRUE(io.reset_confirmed());
+    TEST_ASSERT_FALSE(io.AcceptWrite(old_read, true));
+    TEST_ASSERT_FALSE(io.AcceptCallback(0, true));
+    TEST_ASSERT_TRUE(io.AcceptCallback(reset, true));
+
+    TEST_ASSERT_NOT_EQUAL(0, io.BeginSession(9));
+    const xiaoli::PlaybackWriteLease current = io.CaptureWriteLease();
+    TEST_ASSERT_FALSE(io.AcceptWrite(current, false));
+    TEST_ASSERT_TRUE(io.AcceptWrite(current, true));
+    TEST_ASSERT_FALSE(io.AcceptWrite(old_read, true));
+    TEST_ASSERT_FALSE(xiaoli::IsCurrentPlaybackNotice(
+        current.session_epoch, old_read.session_epoch));
+    TEST_ASSERT_TRUE(xiaoli::IsCurrentPlaybackNotice(
+        current.session_epoch, current.session_epoch));
+
+    xiaoli::EpochFaultLatch faults;
+    faults.Signal(7);
+    TEST_ASSERT_FALSE(faults.TakeIfCurrent(8));
+    faults.Signal(8);
+    TEST_ASSERT_TRUE(faults.TakeIfCurrent(8));
+    faults.Signal(7);
+    faults.Signal(9);
+    TEST_ASSERT_TRUE(faults.TakeIfCurrent(9));
 }
 
 TEST_CASE("Playback start gate fails closed on staged ingress truncation",

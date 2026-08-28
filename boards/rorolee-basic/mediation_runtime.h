@@ -77,6 +77,48 @@ private:
     std::atomic<bool> open_{false};
 };
 
+class EpochFaultLatch {
+public:
+    void Signal(uint32_t epoch);
+    bool TakeIfCurrent(uint32_t current_epoch);
+
+private:
+    std::atomic<uint32_t> pending_epoch_{0};
+};
+
+struct PlaybackWriteLease {
+    uint32_t session_epoch = 0;
+    uint32_t callback_epoch = 0;
+};
+
+bool IsCurrentPlaybackNotice(uint32_t active_session_epoch,
+                             uint32_t notice_session_epoch);
+
+// Coordinates the owner task's abort request with the sole stream-buffer
+// resetter/reader. A read lease becomes invalid immediately when reset is
+// requested, before any already-received PCM may reach the codec.
+class PlaybackIoEpoch {
+public:
+    uint32_t RequestReset();
+    uint32_t requested_reset() const;
+    void InvalidateSession();
+    void AcknowledgeReset(uint32_t reset_epoch);
+    bool reset_confirmed() const;
+
+    uint32_t BeginSession(uint32_t callback_epoch);
+    bool AcceptCallback(uint32_t captured_reset_epoch,
+                        bool callback_epoch_current) const;
+    PlaybackWriteLease CaptureWriteLease() const;
+    bool AcceptWrite(const PlaybackWriteLease& lease,
+                     bool callback_epoch_current) const;
+
+private:
+    std::atomic<uint32_t> reset_requested_{0};
+    std::atomic<uint32_t> reset_acknowledged_{0};
+    std::atomic<uint32_t> session_epoch_{0};
+    std::atomic<uint32_t> callback_epoch_{0};
+};
+
 class MediationProbeBudget {
 public:
     static constexpr uint8_t kMaxAttempts = 3;
@@ -139,6 +181,28 @@ public:
 
 private:
     uint64_t sent_ordinal_[kPendingSlotCount] = {};
+};
+
+struct PendingCompleteFault {
+    SlotId slot = kInvalidSlot;
+    uint64_t insertion_ordinal = 0;
+    bool retryable = false;
+};
+
+// A delayed error for a previously completed segment must not transition the
+// state machine while another speaker is recording: kRecoverableError would
+// ask the board to stop that live stream as though the user had completed it.
+class CompleteFaultDeferral {
+public:
+    bool DeferWhileRecording(SlotId active_slot, SlotId failed_slot,
+                             uint64_t insertion_ordinal, bool retryable);
+    bool TakeIfIdle(SlotId active_slot, PendingCompleteFault* fault);
+    bool pending() const { return pending_; }
+    void Reset();
+
+private:
+    PendingCompleteFault fault_{};
+    bool pending_ = false;
 };
 
 class TranscriptTracker {
