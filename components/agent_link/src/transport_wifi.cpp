@@ -136,6 +136,7 @@ xiaoli::wifi::UplinkStreams s_uplink;
 xiaoli::wifi::FragmentAssembler s_fragments;
 xiaoli::wifi::VoiceRxTracker s_voice_rx;
 xiaoli::wifi::PublicCallBarrier s_public_calls;
+xiaoli::wifi::PublicCallBarrier s_callback_calls;
 
 std::atomic<bool> s_got_ip{false};
 std::atomic<bool> s_ws_connected{false};
@@ -301,6 +302,23 @@ private:
     bool entered_;
 };
 
+class CallbackCallGuard {
+public:
+    CallbackCallGuard() : entered_(s_callback_calls.TryEnter()) {}
+    ~CallbackCallGuard() { if (entered_) s_callback_calls.Exit(); }
+    bool entered() const { return entered_; }
+private:
+    bool entered_;
+};
+
+bool TryLifecycleMutex(void*) {
+    return s_lifecycle_mtx.try_lock();
+}
+
+bool LifecycleStopInProgress(void*) {
+    return s_stopping.load(std::memory_order_acquire);
+}
+
 void SignalWs(EventBits_t bits) {
     if (s_ws_events != nullptr) xEventGroupSetBits(s_ws_events, bits);
 }
@@ -356,6 +374,11 @@ void CallbackWorker(void*) {
             continue;
         }
         if (item->counted) s_callback_queued.fetch_sub(1, std::memory_order_acq_rel);
+        CallbackCallGuard callback;
+        if (!callback.entered()) {
+            delete item;
+            continue;
+        }
         const bool current = item->generation ==
                              s_callback_generation.load(std::memory_order_acquire);
         const bool deliver = current &&
@@ -1054,21 +1077,30 @@ void StartProvisioning() {
 
 // agent_transport_t interface
 esp_err_t wifi_start(void* /*impl*/) {
+    if (xTaskGetCurrentTaskHandle() == s_callback_worker) return ESP_ERR_INVALID_STATE;
     std::lock_guard<std::mutex> lifecycle(s_lifecycle_mtx);
+    if (!s_callback_calls.Open()) return ESP_ERR_INVALID_STATE;
+    if (!s_public_calls.Open()) {
+        s_callback_calls.Close();
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!InitializeWebSocketWorker()) {
+        s_public_calls.Close();
+        s_callback_calls.Close();
+        s_stopping.store(true);
         DeleteWebSocketWorkerResources();
         return ESP_ERR_NO_MEM;
     }
     esp_err_t r = WifiInitOnce();
     if (r != ESP_OK) {
         s_public_calls.Close();
+        s_callback_calls.Close();
         s_stopping.store(true);
         SignalWs(kWsStop);
         if (s_worker_done) xSemaphoreTake(s_worker_done, pdMS_TO_TICKS(5000));
         DeleteWebSocketWorkerResources();
         return r;
     }
-    s_public_calls.Open();
     s_callback_generation.fetch_add(1, std::memory_order_acq_rel);
     s_callbacks_active.store(true, std::memory_order_release);
 
@@ -1084,10 +1116,27 @@ esp_err_t wifi_start(void* /*impl*/) {
 }
 
 void wifi_stop(void* /*impl*/) {
-    std::lock_guard<std::mutex> lifecycle(s_lifecycle_mtx);
+    const bool callback_worker = xTaskGetCurrentTaskHandle() == s_callback_worker;
+    std::unique_lock<std::mutex> lifecycle;
+    if (callback_worker) {
+        while (true) {
+            const auto step = xiaoli::wifi::TryCallbackLifecycleLock(
+                &TryLifecycleMutex, &LifecycleStopInProgress, nullptr);
+            if (step == xiaoli::wifi::CallbackLockStep::kStopInProgress) return;
+            if (step == xiaoli::wifi::CallbackLockStep::kAcquired) {
+                lifecycle = std::unique_lock<std::mutex>(s_lifecycle_mtx, std::adopt_lock);
+                break;
+            }
+            // Block for one tick so a lower-priority lifecycle owner can run and release.
+            vTaskDelay(1);
+        }
+    } else {
+        lifecycle = std::unique_lock<std::mutex>(s_lifecycle_mtx);
+    }
+    if (s_stopping.exchange(true, std::memory_order_acq_rel)) return;
+    s_callback_calls.Close();
     s_public_calls.Close();
     s_callbacks_active.store(false, std::memory_order_release);
-    s_stopping.store(true);
     s_accepting.store(false);
     s_got_ip.store(false);
     if (s_reconnect_timer) esp_timer_stop(s_reconnect_timer);
@@ -1098,6 +1147,11 @@ void wifi_stop(void* /*impl*/) {
     }
     while (s_public_calls.in_flight() != 0) {
         vTaskDelay(1);
+    }
+    if (!callback_worker) {
+        while (s_callback_calls.in_flight() != 0) {
+            vTaskDelay(1);
+        }
     }
     if (s_mdns_owned) {
         mdns_free();

@@ -996,22 +996,71 @@ TEST_CASE("Nonmonotonic state events do not mutate state counters or button armi
     TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(StateEvent(EventType::kTick, 3198)).count);
 }
 
+namespace {
+struct CallbackLockFixture {
+    bool lock_available = false;
+    bool stopping = false;
+    int lock_calls = 0;
+    int stopping_calls = 0;
+};
+
+bool TryCallbackLock(void* raw) {
+    auto* fixture = static_cast<CallbackLockFixture*>(raw);
+    ++fixture->lock_calls;
+    return fixture->lock_available;
+}
+
+bool CallbackStopInProgress(void* raw) {
+    auto* fixture = static_cast<CallbackLockFixture*>(raw);
+    ++fixture->stopping_calls;
+    return fixture->stopping;
+}
+}  // namespace
+
+TEST_CASE("WiFi callback stop lock handshake retries or returns without blocking",
+          "[wifi_transport]") {
+    CallbackLockFixture fixture;
+    TEST_ASSERT_EQUAL(static_cast<int>(xiaoli::wifi::CallbackLockStep::kRetry),
+                      static_cast<int>(xiaoli::wifi::TryCallbackLifecycleLock(
+                          &TryCallbackLock, &CallbackStopInProgress, &fixture)));
+    TEST_ASSERT_EQUAL_INT(1, fixture.lock_calls);
+    TEST_ASSERT_EQUAL_INT(1, fixture.stopping_calls);
+
+    fixture.stopping = true;
+    TEST_ASSERT_EQUAL(static_cast<int>(xiaoli::wifi::CallbackLockStep::kStopInProgress),
+                      static_cast<int>(xiaoli::wifi::TryCallbackLifecycleLock(
+                          &TryCallbackLock, &CallbackStopInProgress, &fixture)));
+
+    fixture.lock_available = true;
+    const int stopping_calls = fixture.stopping_calls;
+    TEST_ASSERT_EQUAL(static_cast<int>(xiaoli::wifi::CallbackLockStep::kAcquired),
+                      static_cast<int>(xiaoli::wifi::TryCallbackLifecycleLock(
+                          &TryCallbackLock, &CallbackStopInProgress, &fixture)));
+    TEST_ASSERT_EQUAL_INT(stopping_calls, fixture.stopping_calls);
+}
+
 TEST_CASE("WiFi public call barrier rejects entrants after stop and drains existing calls",
           "[wifi_transport]") {
     xiaoli::wifi::PublicCallBarrier barrier;
-    barrier.Open();
+    TEST_ASSERT_TRUE(barrier.Open());
     TEST_ASSERT_TRUE(barrier.TryEnter());
     TEST_ASSERT_TRUE(barrier.TryEnter());
     barrier.Close();
     TEST_ASSERT_FALSE(barrier.TryEnter());
+    TEST_ASSERT_FALSE(barrier.Open());
     TEST_ASSERT_EQUAL_UINT32(2, barrier.in_flight());
     TEST_ASSERT_EQUAL_UINT32(1, barrier.Exit());
     TEST_ASSERT_EQUAL_UINT32(0, barrier.Exit());
     TEST_ASSERT_EQUAL_UINT32(0, barrier.in_flight());
 
-    barrier.Open();
+    TEST_ASSERT_TRUE(barrier.Open());
     TEST_ASSERT_TRUE(barrier.TryEnter());
+    barrier.Close();
+    TEST_ASSERT_FALSE(barrier.Open());
+    TEST_ASSERT_EQUAL_UINT32(1, barrier.in_flight());
     TEST_ASSERT_EQUAL_UINT32(0, barrier.Exit());
+    TEST_ASSERT_TRUE(barrier.Open());
+    TEST_ASSERT_EQUAL_UINT32(0, barrier.in_flight());
 }
 
 namespace {

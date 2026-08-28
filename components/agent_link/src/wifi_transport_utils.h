@@ -62,7 +62,7 @@ private:
 
 class PublicCallBarrier {
 public:
-    void Open();
+    bool Open();
     void Close();
     bool TryEnter();
     size_t Exit();
@@ -73,6 +73,18 @@ private:
     static constexpr size_t kCountMask = ~kClosed;
     std::atomic<size_t> state_{kClosed};
 };
+
+enum class CallbackLockStep : uint8_t {
+    kAcquired,
+    kRetry,
+    kStopInProgress,
+};
+
+using BooleanProbe = bool (*)(void* context);
+
+CallbackLockStep TryCallbackLifecycleLock(BooleanProbe try_lock,
+                                          BooleanProbe stop_in_progress,
+                                          void* context);
 
 class UplinkStreams {
 public:

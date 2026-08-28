@@ -191,8 +191,10 @@ void TxQueuePolicy::Reset() {
     queued_bytes_ = 0;
 }
 
-void PublicCallBarrier::Open() {
-    state_.store(0, std::memory_order_release);
+bool PublicCallBarrier::Open() {
+    size_t expected = kClosed;
+    return state_.compare_exchange_strong(
+        expected, 0, std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
 void PublicCallBarrier::Close() {
@@ -217,6 +219,14 @@ size_t PublicCallBarrier::Exit() {
 
 size_t PublicCallBarrier::in_flight() const {
     return state_.load(std::memory_order_acquire) & kCountMask;
+}
+
+CallbackLockStep TryCallbackLifecycleLock(BooleanProbe try_lock,
+                                          BooleanProbe stop_in_progress,
+                                          void* context) {
+    if (try_lock(context)) return CallbackLockStep::kAcquired;
+    return stop_in_progress(context) ? CallbackLockStep::kStopInProgress
+                                     : CallbackLockStep::kRetry;
 }
 
 bool UplinkStreams::ValidType(agent_stream_t type) {
