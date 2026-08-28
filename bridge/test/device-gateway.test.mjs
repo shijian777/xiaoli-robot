@@ -887,6 +887,80 @@ test('socket close during durable commit does not orphan or fail the committing 
   }, {gatewayOptions: {fileSystem}});
 });
 
+test('old generation commit completion cannot clear newer recording ownership', async (t) => {
+  for (const failOldCommit of [false, true]) {
+    await t.test(failOldCommit ? 'old commit failure' : 'old commit success', async () => {
+      const renameStarted = deferred();
+      const releaseRename = deferred();
+      let firstRename = true;
+      const fileSystem = {
+        ...realFs,
+        async rename(...args) {
+          if (firstRename) {
+            firstRename = false;
+            renameStarted.resolve();
+            await releaseRename.promise;
+            if (failOldCommit) {
+              throw Object.assign(new Error('injected old commit failure'), {code: 'EIO'});
+            }
+          }
+          return realFs.rename(...args);
+        }
+      };
+
+      await withGateway(async ({gateway, url, cases}) => {
+        const first = await openClient(url);
+        const firstChannel = inbox(first);
+        await authenticate(first, firstChannel);
+        first.send(JSON.stringify(control('case.start', 'owner-race-case-start', {
+          caseId: 'owner-race-case'
+        })));
+        await nextJson(firstChannel, 'ack');
+        first.send(startFrame({
+          messageId: 'owner-race-old-start', caseId: 'owner-race-case',
+          segmentId: 'owner-race-old-a', speaker: 'A'
+        }));
+        await nextJson(firstChannel, 'ack');
+        first.send(streamFrame(FrameKind.STREAM_CHUNK, 0, Buffer.from([1, 0])));
+        first.send(endFrame({
+          messageId: 'owner-race-old-end', caseId: 'owner-race-case',
+          segmentId: 'owner-race-old-a', bytes: 2, lastSequence: 0
+        }));
+        await settleWithin(renameStarted.promise);
+
+        const second = await openClient(url);
+        const secondChannel = inbox(second);
+        await authenticate(second, secondChannel);
+        second.send(JSON.stringify(control('case.start', 'owner-race-case-start', {
+          caseId: 'owner-race-case'
+        })));
+        await nextJson(secondChannel, 'ack');
+        second.send(startFrame({
+          messageId: 'owner-race-new-start', caseId: 'owner-race-case',
+          segmentId: 'owner-race-new-b', speaker: 'B'
+        }));
+        assert.equal((await nextJson(secondChannel, 'ack')).messageId, 'owner-race-new-start');
+
+        releaseRename.resolve();
+        await gateway.waitForIdle();
+
+        second.send(streamFrame(FrameKind.STREAM_CHUNK, 0, Buffer.from([2, 0])));
+        second.send(endFrame({
+          messageId: 'owner-race-new-end', caseId: 'owner-race-case',
+          segmentId: 'owner-race-new-b', bytes: 2, lastSequence: 0
+        }));
+        const durable = await nextJson(secondChannel, 'ack');
+        assert.equal(durable.messageId, 'owner-race-new-end');
+        assert.equal(durable.durable, true);
+        await nextJson(secondChannel, 'transcript.saved');
+        await gateway.waitForIdle();
+        assert.equal(cases.snapshot('owner-race-case').speakers.B[0].state, 'saved');
+        await closeClient(second);
+      }, {gatewayOptions: {fileSystem}});
+    });
+  }
+});
+
 test('a replay socket closed while waiting for commit cannot poison a third exact replay', async () => {
   const renameStarted = deferred();
   const releaseRename = deferred();

@@ -721,13 +721,13 @@ class DeviceGateway {
         await this.#tryRemoveOwnedTemp(wavPath);
       }
       if (this.#stopping || signal.aborted) {
-        device.activeRecording = null;
+        this.#releaseRecordingOwner(device, recording);
         device.segmentProgress.delete(meta.segmentId);
         this.#finishSegmentCommit(device, meta.segmentId, commit);
         return;
       }
       this.#failAndForgetRecording(device, recording, 'WAV assembly failed', true);
-      device.activeRecording = null;
+      this.#releaseRecordingOwner(device, recording);
       this.#finishSegmentCommit(device, meta.segmentId, commit);
       this.#sendError(connection, 'audio_write_failed', true, 'Recording could not be stored', meta.caseId, meta.segmentId);
       this.#logger.error?.('Gateway WAV write failed', {segmentId: meta.segmentId, errorCode: error?.code ?? 'UNKNOWN'});
@@ -735,7 +735,7 @@ class DeviceGateway {
     }
     if (this.#stopping || signal.aborted) {
       await this.#tryRemoveOwnedTemp(wavPath);
-      device.activeRecording = null;
+      this.#releaseRecordingOwner(device, recording);
       device.segmentProgress.delete(meta.segmentId);
       this.#finishSegmentCommit(device, meta.segmentId, commit);
       return;
@@ -753,7 +753,7 @@ class DeviceGateway {
     this.#storeAck(device, message, ack, meta);
     device.segmentAcks.set(meta.segmentId, {ack, meta: segmentBinding(meta)});
     device.segmentProgress.delete(meta.segmentId);
-    device.activeRecording = null;
+    this.#releaseRecordingOwner(device, recording);
     this.#finishSegmentCommit(device, meta.segmentId, commit);
     this.#sendJson(connection, ack);
     this.#broadcastState(device, 'transcribing', meta.caseId, meta.segmentId);
@@ -772,6 +772,10 @@ class DeviceGateway {
     device.activeRecording = null;
     this.#sendError(connection, code, true, message, meta?.caseId, segmentId);
     this.#broadcastState(device, 'error', meta?.caseId, segmentId);
+  }
+
+  #releaseRecordingOwner(device, recording) {
+    if (device.activeRecording === recording) device.activeRecording = null;
   }
 
   #failAndForgetRecording(device, recording, failure, force = false) {
