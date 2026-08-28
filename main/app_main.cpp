@@ -8,6 +8,15 @@
 namespace {
 constexpr const char* TAG = "agent_link.app";
 
+#if CONFIG_AGENT_LINK_TRANSPORT_WIFI
+const agent_wifi_config_t kWifiConfig = {
+    .ssid = nullptr,
+    .password = nullptr,
+    .endpoint = CONFIG_AGENT_LINK_WIFI_ENDPOINT,
+    .token = CONFIG_AGENT_LINK_WIFI_DEVICE_TOKEN,
+};
+#endif
+
 void on_audio_out(const uint8_t* pcm16, size_t bytes, void*) { Board::GetInstance().PlayAudio(pcm16, bytes); }
 void on_audio_end(void*) { Board::GetInstance().AudioEnd(); }
 void on_show_text(const char* utf8, void*) { Board::GetInstance().ShowText(utf8); }
@@ -40,6 +49,7 @@ extern "C" void app_main(void) {
     cfg.on_state    = on_state;
 #if CONFIG_AGENT_LINK_TRANSPORT_WIFI
     cfg.transport   = AGENT_TRANSPORT_WIFI;  // WiFi station + captive-portal provisioning
+    cfg.wifi        = &kWifiConfig;
 #endif
 
     ESP_ERROR_CHECK(agent_link_init(&cfg));     //agent_link initialization

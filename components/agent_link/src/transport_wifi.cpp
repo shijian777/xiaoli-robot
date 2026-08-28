@@ -36,6 +36,8 @@ constexpr const char* TAG = "agent_link.wifi";
 constexpr const char* kNvsNs   = "al_wifi";
 constexpr const char* kNvsSsid = "ssid";
 constexpr const char* kNvsPass = "pass";
+constexpr const char* kNvsEndpoint = "endpoint";
+constexpr const char* kNvsDeviceToken = "dev_token";
 
 // Reconnect / provisioning-fallback thresholds.
 constexpr int      kProvFailLimit   = 3;      // provisioning: give up an attempt after 3 disconnects
@@ -65,6 +67,8 @@ int   s_retry        = 0;        // consecutive failed joins in the current phas
 
 char       s_ssid[33] = {0};     // credentials currently being tried
 char       s_pass[65] = {0};
+char       s_endpoint[AL_PROV_ENDPOINT_CAPACITY] = {0};
+char       s_device_token[AL_PROV_DEVICE_TOKEN_CAPACITY] = {0};
 std::mutex s_cred_mtx;
 
 esp_timer_handle_t s_reconnect_timer = nullptr;
@@ -82,23 +86,59 @@ esp_err_t EnsureNvs() {
     return r;
 }
 
-bool LoadCreds(char* ssid, size_t ssid_sz, char* pass, size_t pass_sz) {
+void LoadStoredSettings(al_prov_settings_t& settings) {
+    settings = {};
     nvs_handle_t h;
-    if (nvs_open(kNvsNs, NVS_READONLY, &h) != ESP_OK) return false;
-    size_t sl = ssid_sz, pl = pass_sz;
-    const bool have_ssid = (nvs_get_str(h, kNvsSsid, ssid, &sl) == ESP_OK) && ssid[0];
-    if (nvs_get_str(h, kNvsPass, pass, &pl) != ESP_OK) pass[0] = '\0';   // password may be absent (open network)
+    if (nvs_open(kNvsNs, NVS_READONLY, &h) != ESP_OK) return;
+    struct Field { const char* key; char* value; size_t capacity; };
+    const Field fields[] = {
+        {kNvsSsid, settings.ssid, sizeof settings.ssid},
+        {kNvsPass, settings.password, sizeof settings.password},
+        {kNvsEndpoint, settings.endpoint, sizeof settings.endpoint},
+        {kNvsDeviceToken, settings.device_token, sizeof settings.device_token},
+    };
+    for (const auto& field : fields) {
+        size_t size = field.capacity;
+        if (nvs_get_str(h, field.key, field.value, &size) != ESP_OK) field.value[0] = '\0';
+    }
     nvs_close(h);
-    return have_ssid;
 }
 
-void SaveCreds(const char* ssid, const char* pass) {
+bool SaveSettings() {
     nvs_handle_t h;
-    if (nvs_open(kNvsNs, NVS_READWRITE, &h) != ESP_OK) { ESP_LOGW(TAG, "nvs open failed — creds not saved"); return; }
-    nvs_set_str(h, kNvsSsid, ssid);
-    nvs_set_str(h, kNvsPass, pass ? pass : "");
-    nvs_commit(h);
+    if (nvs_open(kNvsNs, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGW(TAG, "nvs open failed; settings not saved");
+        return false;
+    }
+    esp_err_t r = nvs_set_str(h, kNvsSsid, s_ssid);
+    if (r == ESP_OK) r = nvs_set_str(h, kNvsPass, s_pass);
+    if (r == ESP_OK) r = nvs_set_str(h, kNvsEndpoint, s_endpoint);
+    if (r == ESP_OK) r = nvs_set_str(h, kNvsDeviceToken, s_device_token);
+    if (r == ESP_OK) r = nvs_commit(h);  // exactly one commit for the complete settings set
     nvs_close(h);
+    if (r != ESP_OK) ESP_LOGW(TAG, "nvs settings commit failed: %s", esp_err_to_name(r));
+    return r == ESP_OK;
+}
+
+bool CopyPreferred(char* dst, size_t capacity, const char* explicit_value, const char* stored_value) {
+    const char* src = (explicit_value && explicit_value[0]) ? explicit_value : stored_value;
+    if (!src) src = "";
+    const size_t len = strnlen(src, capacity);
+    if (len >= capacity) { dst[0] = '\0'; return false; }
+    memcpy(dst, src, len + 1);
+    return true;
+}
+
+bool BuildEffectiveSettings(al_prov_settings_t& settings) {
+    al_prov_settings_t stored = {};
+    LoadStoredSettings(stored);
+    const bool sizes_ok =
+        CopyPreferred(settings.ssid, sizeof settings.ssid, s_cfg ? s_cfg->ssid : nullptr, stored.ssid) &&
+        CopyPreferred(settings.password, sizeof settings.password, s_cfg ? s_cfg->password : nullptr, stored.password) &&
+        CopyPreferred(settings.endpoint, sizeof settings.endpoint, s_cfg ? s_cfg->endpoint : nullptr, stored.endpoint) &&
+        CopyPreferred(settings.device_token, sizeof settings.device_token, s_cfg ? s_cfg->token : nullptr, stored.device_token);
+    return sizes_ok && settings.ssid[0] && al_wifi_endpoint_valid(settings.endpoint) &&
+           al_wifi_device_token_valid(settings.device_token);
 }
 
 //  Helpers 
@@ -163,11 +203,12 @@ void OnGotIp(const esp_netif_ip_info_t& ip) {
     s_retry = 0;
 
     if (s_phase == Phase::kProvisioning) {
-        // First successful join from the portal: persist the credentials now
+        // First successful join from the portal: persist all settings in one commit now.
         std::lock_guard<std::mutex> lk(s_cred_mtx);
-        SaveCreds(s_ssid, s_pass);
+        const bool saved = SaveSettings();
         al_wifi_prov_set_status(AL_PROV_CONNECTED, ip_str, nullptr);
-        ESP_LOGI(TAG, "provisioning succeeded: joined '%s', ip=%s (credentials saved)", s_ssid, ip_str);
+        ESP_LOGI(TAG, "provisioning succeeded: joined '%s', ip=%s (settings %s)",
+                 s_ssid, ip_str, saved ? "saved" : "not saved");
         if (s_teardown_timer) esp_timer_start_once(s_teardown_timer, static_cast<uint64_t>(kProvTeardownMs) * 1000);
     } else {
         ESP_LOGI(TAG, "WiFi connected: ip=%s", ip_str);
@@ -267,33 +308,39 @@ esp_err_t WifiInitOnce() {
 }
 
 // Join a network as a station (boot path with known credentials).
-void StartSta(const char* ssid, const char* pass) {
+void StartSta(const al_prov_settings_t& settings) {
     {
         std::lock_guard<std::mutex> lk(s_cred_mtx);
-        strncpy(s_ssid, ssid, sizeof(s_ssid) - 1); s_ssid[sizeof(s_ssid) - 1] = '\0';
-        strncpy(s_pass, pass ? pass : "", sizeof(s_pass) - 1); s_pass[sizeof(s_pass) - 1] = '\0';
+        memcpy(s_ssid, settings.ssid, sizeof s_ssid);
+        memcpy(s_pass, settings.password, sizeof s_pass);
+        memcpy(s_endpoint, settings.endpoint, sizeof s_endpoint);
+        memcpy(s_device_token, settings.device_token, sizeof s_device_token);
     }
     s_phase = Phase::kStaConnecting;
     s_want_connect = true;
     s_retry = 0;
     esp_wifi_set_mode(WIFI_MODE_STA);
-    ApplyStaConfig(ssid, pass);
+    ApplyStaConfig(s_ssid, s_pass);
     if (!s_started) { esp_wifi_start(); s_started = true; }   // STA_START -> connect
     else            { esp_wifi_connect(); }
-    ESP_LOGI(TAG, "joining WiFi '%s'…", ssid);
+    ESP_LOGI(TAG, "joining WiFi '%s'…", s_ssid);
 }
 
-// The user submitted credentials on the portal
-void OnProvCreds(const char* ssid, const char* pass) {
+// The user submitted complete settings on the portal. Copy them before returning.
+void OnProvSettings(const al_prov_settings_t* settings) {
+    if (!settings || !settings->ssid[0] || !al_wifi_endpoint_valid(settings->endpoint) ||
+        !al_wifi_device_token_valid(settings->device_token)) return;
     {
         std::lock_guard<std::mutex> lk(s_cred_mtx);
-        strncpy(s_ssid, ssid, sizeof(s_ssid) - 1); s_ssid[sizeof(s_ssid) - 1] = '\0';
-        strncpy(s_pass, pass ? pass : "", sizeof(s_pass) - 1); s_pass[sizeof(s_pass) - 1] = '\0';
+        memcpy(s_ssid, settings->ssid, sizeof s_ssid);
+        memcpy(s_pass, settings->password, sizeof s_pass);
+        memcpy(s_endpoint, settings->endpoint, sizeof s_endpoint);
+        memcpy(s_device_token, settings->device_token, sizeof s_device_token);
     }
     s_retry = 0;
     s_want_connect = true;
     al_wifi_prov_set_status(AL_PROV_CONNECTING, nullptr, nullptr);
-    ApplyStaConfig(ssid, pass);
+    ApplyStaConfig(s_ssid, s_pass);
     esp_wifi_disconnect();   // drop any half-open attempt, then connect with the new creds
     esp_wifi_connect();
 }
@@ -309,7 +356,7 @@ void StartProvisioning() {
     esp_wifi_set_mode(WIFI_MODE_APSTA);   // AP for the portal, STA idle so the page can scan + then join
     ApplyApConfig();
     if (!s_started) { esp_wifi_start(); s_started = true; }
-    al_wifi_prov_start(s_ap_ssid, &OnProvCreds);
+    al_wifi_prov_start(s_ap_ssid, &OnProvSettings);
 }
 
 // agent_transport_t interface
@@ -318,14 +365,12 @@ esp_err_t wifi_start(void* /*impl*/) {
     if (r != ESP_OK) return r;
     (void)s_on_recv; (void)s_on_conn; (void)s_on_stream;  // wired for the cloud plane (P3); unused until then
 
-    char ssid[33] = {0}, pass[65] = {0};
-    if (s_cfg && s_cfg->ssid && s_cfg->ssid[0]) {
-        StartSta(s_cfg->ssid, s_cfg->password ? s_cfg->password : "");
-    } else if (LoadCreds(ssid, sizeof ssid, pass, sizeof pass)) {
-        ESP_LOGI(TAG, "using stored WiFi credentials for '%s'", ssid);
-        StartSta(ssid, pass);
+    al_prov_settings_t settings = {};
+    if (BuildEffectiveSettings(settings)) {
+        ESP_LOGI(TAG, "using complete WiFi and Bridge settings for '%s'", settings.ssid);
+        StartSta(settings);
     } else {
-        ESP_LOGI(TAG, "no WiFi credentials — starting captive-portal provisioning");
+        ESP_LOGI(TAG, "WiFi or Bridge settings missing/invalid; starting captive-portal provisioning");
         StartProvisioning();
     }
     return ESP_OK;

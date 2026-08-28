@@ -1,9 +1,86 @@
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "protocol.h"
 #include "unity.h"
+#include "wifi_provision.h"
 #include "wifi_wire.h"
+
+TEST_CASE("Bridge endpoint accepts the local MVP WebSocket targets", "[wifi_provision]") {
+    TEST_ASSERT_TRUE(al_wifi_endpoint_valid("ws://192.168.1.8:8788/device"));
+    TEST_ASSERT_TRUE(al_wifi_endpoint_valid("ws://10.0.0.9/device"));
+    TEST_ASSERT_TRUE(al_wifi_endpoint_valid("ws://xiaoli-bridge.local:8788/device"));
+}
+
+TEST_CASE("Bridge endpoint rejects unsafe or ambiguous URLs", "[wifi_provision]") {
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid(nullptr));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid(""));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("http://192.168.1.8:8788/device"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("wss://192.168.1.8:8788/device"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("ws://192.168.1.8:8788"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("ws://192.168.1.8:8788/wrong"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("ws://user@192.168.1.8:8788/device"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("ws://192.168.1.8:8788/device?x=1"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("ws://192.168.1.8:8788/device#x"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("ws://8.8.8.8:8788/device"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("ws://bridge.example.com:8788/device"));
+}
+
+TEST_CASE("Bridge endpoint enforces its fixed storage boundary", "[wifi_provision]") {
+    std::vector<char> overlong(193, 'a');
+    overlong[0] = 'w';
+    overlong[1] = 's';
+    overlong[2] = ':';
+    overlong[3] = '/';
+    overlong[4] = '/';
+    overlong.back() = '\0';
+
+    TEST_ASSERT_EQUAL_UINT32(192, strlen(overlong.data()));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid(overlong.data()));
+}
+
+TEST_CASE("Device token must be non-empty and fit fixed storage", "[wifi_provision]") {
+    TEST_ASSERT_FALSE(al_wifi_device_token_valid(nullptr));
+    TEST_ASSERT_FALSE(al_wifi_device_token_valid(""));
+    TEST_ASSERT_TRUE(al_wifi_device_token_valid("demo-device-token"));
+
+    std::vector<char> overlong(AL_PROV_DEVICE_TOKEN_CAPACITY + 1, 't');
+    overlong.back() = '\0';
+    TEST_ASSERT_FALSE(al_wifi_device_token_valid(overlong.data()));
+}
+
+TEST_CASE("Provisioning form decodes one complete settings value", "[wifi_provision]") {
+    const char body[] =
+        "ssid=Room+WiFi&password=p%40ss&endpoint=ws%3A%2F%2F192.168.1.8%3A8788%2Fdevice"
+        "&device_token=demo%2Dtoken";
+    al_prov_settings_t settings = {};
+
+    TEST_ASSERT_TRUE(al_wifi_parse_provision_body(body, strlen(body), &settings));
+    TEST_ASSERT_EQUAL_STRING("Room WiFi", settings.ssid);
+    TEST_ASSERT_EQUAL_STRING("p@ss", settings.password);
+    TEST_ASSERT_EQUAL_STRING("ws://192.168.1.8:8788/device", settings.endpoint);
+    TEST_ASSERT_EQUAL_STRING("demo-token", settings.device_token);
+}
+
+TEST_CASE("Provisioning form rejects malformed ambiguous and oversized bodies", "[wifi_provision]") {
+    al_prov_settings_t settings = {};
+    const char malformed[] =
+        "ssid=Room&password=%ZZ&endpoint=ws%3A%2F%2F192.168.1.8%3A8788%2Fdevice"
+        "&device_token=demo";
+    const char duplicate[] =
+        "ssid=Room&ssid=Other&endpoint=ws%3A%2F%2F192.168.1.8%3A8788%2Fdevice"
+        "&device_token=demo";
+    const char malformed_unknown[] =
+        "ssid=Room&password=&endpoint=ws%3A%2F%2F192.168.1.8%3A8788%2Fdevice"
+        "&device_token=demo&ignored=%ZZ";
+    std::vector<char> oversized(1024, 'x');
+
+    TEST_ASSERT_FALSE(al_wifi_parse_provision_body(malformed, strlen(malformed), &settings));
+    TEST_ASSERT_FALSE(al_wifi_parse_provision_body(duplicate, strlen(duplicate), &settings));
+    TEST_ASSERT_FALSE(al_wifi_parse_provision_body(malformed_unknown, strlen(malformed_unknown), &settings));
+    TEST_ASSERT_FALSE(al_wifi_parse_provision_body(oversized.data(), oversized.size(), &settings));
+}
 
 TEST_CASE("XL stream chunk encoding is byte exact", "[xiaoli_wire]") {
     const uint8_t payload[] = {0x11, 0x22};

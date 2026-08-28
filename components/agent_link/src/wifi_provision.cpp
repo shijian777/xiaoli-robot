@@ -14,6 +14,7 @@
 
 #include <cstring>
 #include <cstdio>
+#include <cctype>
 #include <string>
 #include <mutex>
 
@@ -38,7 +39,7 @@ constexpr const char* TAG = "agent_link.prov";
 httpd_handle_t     s_httpd      = nullptr;
 TaskHandle_t       s_dns_task   = nullptr;
 volatile bool      s_dns_run    = false;
-al_prov_creds_cb_t s_on_creds   = nullptr;
+al_prov_settings_cb_t s_on_settings = nullptr;
 esp_ip4_addr_t     s_ap_ip      = { .addr = 0 };   // SoftAP gateway IP, network byte order
 char               s_ap_ip_str[16] = "192.168.4.1";
 
@@ -70,8 +71,8 @@ const char* StatusName(al_prov_status_t s) {
 }
 
 // ── Small helpers ──────────────────────────────────────────────────────────────────────────
-// Percent-decode an application/x-www-form-urlencoded value ('+' -> space, %XX -> byte).
-void UrlDecode(char* dst, size_t dst_sz, const char* src) {
+// Strictly percent-decode an application/x-www-form-urlencoded value ('+' -> space).
+bool UrlDecode(char* dst, size_t dst_sz, const char* src, size_t src_len) {
     auto hex = [](char c) -> int {
         if (c >= '0' && c <= '9') return c - '0';
         if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -79,16 +80,70 @@ void UrlDecode(char* dst, size_t dst_sz, const char* src) {
         return -1;
     };
     size_t di = 0;
-    for (size_t i = 0; src[i] && di + 1 < dst_sz; ) {
+    if (!dst || dst_sz == 0 || !src) return false;
+    for (size_t i = 0; i < src_len; ) {
         const char c = src[i];
-        if (c == '%' && src[i + 1] && src[i + 2]) {
+        unsigned char decoded = static_cast<unsigned char>(c == '+' ? ' ' : c);
+        if (c == '%') {
+            if (i + 2 >= src_len) return false;
             const int hi = hex(src[i + 1]), lo = hex(src[i + 2]);
-            if (hi >= 0 && lo >= 0) { dst[di++] = static_cast<char>((hi << 4) | lo); i += 3; continue; }
+            if (hi < 0 || lo < 0) return false;
+            decoded = static_cast<unsigned char>((hi << 4) | lo);
+            i += 3;
+        } else {
+            ++i;
         }
-        dst[di++] = (c == '+') ? ' ' : c;
-        ++i;
+        if (decoded == 0 || di + 1 >= dst_sz) return false;
+        dst[di++] = static_cast<char>(decoded);
     }
     dst[di] = '\0';
+    return true;
+}
+
+bool FormValue(const char* body, size_t body_len, const char* key,
+               char* dst, size_t dst_sz, bool required) {
+    const size_t key_len = strlen(key);
+    bool found = false;
+    const char* field = body;
+    const char* body_end = body + body_len;
+    while (field < body_end) {
+        const char* end = static_cast<const char*>(memchr(field, '&', body_end - field));
+        if (!end) end = body_end;
+        const char* equal = static_cast<const char*>(memchr(field, '=', end - field));
+        if (!equal) return false;
+        if (static_cast<size_t>(equal - field) == key_len && memcmp(field, key, key_len) == 0) {
+            if (found || !UrlDecode(dst, dst_sz, equal + 1, end - equal - 1)) return false;
+            found = true;
+        }
+        if (end == body_end) break;
+        field = end + 1;
+        if (field == body_end) return false;
+    }
+    if (!found) {
+        if (required) return false;
+        if (dst_sz) dst[0] = '\0';
+    }
+    return true;
+}
+
+bool FormEncodingValid(const char* body, size_t body_len) {
+    auto hex = [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    };
+    const char* field = body;
+    const char* body_end = body + body_len;
+    while (field < body_end) {
+        const char* end = static_cast<const char*>(memchr(field, '&', body_end - field));
+        if (!end) end = body_end;
+        if (!memchr(field, '=', end - field)) return false;
+        for (const char* p = field; p < end; ++p) {
+            if (*p == '%' && (p + 2 >= end || !hex(p[1]) || !hex(p[2]))) return false;
+        }
+        if (end == body_end) break;
+        field = end + 1;
+        if (field == body_end) return false;
+    }
+    return true;
 }
 
 // Append a JSON-escaped string (SSIDs can contain quotes/backslashes/control bytes).
@@ -232,10 +287,13 @@ esp_err_t ScanGet(httpd_req_t* req) {
 }
 
 esp_err_t ProvisionPost(httpd_req_t* req) {
-    char body[512];
+    char body[1024];
+    if (req->content_len <= 0 || req->content_len >= static_cast<int>(sizeof body)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body size");
+        return ESP_FAIL;
+    }
     int received = 0;
-    const int total = (req->content_len < static_cast<int>(sizeof body) - 1)
-                          ? static_cast<int>(req->content_len) : static_cast<int>(sizeof body) - 1;
+    const int total = static_cast<int>(req->content_len);
     while (received < total) {
         const int r = httpd_req_recv(req, body + received, total - received);
         if (r <= 0) {
@@ -247,21 +305,21 @@ esp_err_t ProvisionPost(httpd_req_t* req) {
     }
     body[received] = '\0';
 
-    char enc[256], ssid[33] = {0}, pass[65] = {0};
-    if (httpd_query_key_value(body, "ssid", enc, sizeof enc) == ESP_OK) UrlDecode(ssid, sizeof ssid, enc);
-    if (httpd_query_key_value(body, "password", enc, sizeof enc) == ESP_OK) UrlDecode(pass, sizeof pass, enc);
-
-    if (!ssid[0]) return SendRedirectToPortal(req);   // empty SSID -> back to the form
+    al_prov_settings_t settings = {};
+    if (!al_wifi_parse_provision_body(body, received, &settings)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid provisioning settings");
+        return ESP_FAIL;
+    }
 
     {   // seed status so the first /status poll already shows "connecting" for this SSID
         std::lock_guard<std::mutex> lk(s_status_mtx);
         s_status.st = AL_PROV_CONNECTING;
         s_status.ip[0] = s_status.reason[0] = '\0';
-        strncpy(s_status.ssid, ssid, sizeof(s_status.ssid) - 1);
+        strncpy(s_status.ssid, settings.ssid, sizeof(s_status.ssid) - 1);
         s_status.ssid[sizeof(s_status.ssid) - 1] = '\0';
     }
-    ESP_LOGI(TAG, "portal: credentials submitted for '%s'", ssid);
-    if (s_on_creds) s_on_creds(ssid, pass);           // transport kicks off the station connect
+    ESP_LOGI(TAG, "portal: settings submitted for SSID '%s'", settings.ssid);
+    if (s_on_settings) s_on_settings(&settings);       // callback must copy the complete structure
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_send(req, connecting_html_start, HTTPD_RESP_USE_STRLEN);
@@ -353,9 +411,9 @@ void DnsTask(void*) {
 }  // namespace
 
 // ── Public API ───────────────────────────────────────────────────────────────────────────
-extern "C" esp_err_t al_wifi_prov_start(const char* ap_ssid, al_prov_creds_cb_t on_creds) {
+extern "C" esp_err_t al_wifi_prov_start(const char* ap_ssid, al_prov_settings_cb_t on_settings) {
     if (s_httpd) return ESP_OK;                          // already running
-    s_on_creds = on_creds;
+    s_on_settings = on_settings;
     {
         std::lock_guard<std::mutex> lk(s_status_mtx);
         s_status = ProvStatus{};
@@ -423,7 +481,93 @@ extern "C" void al_wifi_prov_set_status(al_prov_status_t status, const char* ip,
 extern "C" void al_wifi_prov_stop(void) {
     if (s_httpd) { httpd_stop(s_httpd); s_httpd = nullptr; }
     s_dns_run = false;                                   // the DNS task exits within its 1s recv timeout
-    s_on_creds = nullptr;
+    s_on_settings = nullptr;
 }
 
 extern "C" bool al_wifi_prov_active(void) { return s_httpd != nullptr; }
+
+extern "C" bool al_wifi_endpoint_valid(const char* endpoint) {
+    if (!endpoint) return false;
+    const size_t len = strnlen(endpoint, AL_PROV_ENDPOINT_CAPACITY);
+    if (len == 0 || len >= AL_PROV_ENDPOINT_CAPACITY) return false;
+    constexpr const char kPrefix[] = "ws://";
+    if (len <= sizeof(kPrefix) - 1 || strncmp(endpoint, kPrefix, sizeof(kPrefix) - 1) != 0) return false;
+    for (size_t i = 0; i < len; ++i) {
+        const unsigned char c = static_cast<unsigned char>(endpoint[i]);
+        if (c <= 0x20 || c >= 0x7f || c == '@' || c == '?' || c == '#' || c == '%') return false;
+    }
+
+    const char* authority = endpoint + sizeof(kPrefix) - 1;
+    const char* path = strchr(authority, '/');
+    if (!path || strcmp(path, "/device") != 0 || path == authority) return false;
+    const char* host_end = path;
+    const char* colon = static_cast<const char*>(memchr(authority, ':', path - authority));
+    if (colon) {
+        if (colon == authority || colon + 1 == path) return false;
+        unsigned port = 0;
+        for (const char* p = colon + 1; p < path; ++p) {
+            if (!isdigit(static_cast<unsigned char>(*p))) return false;
+            port = port * 10u + static_cast<unsigned>(*p - '0');
+            if (port > 65535u) return false;
+        }
+        if (port == 0) return false;
+        host_end = colon;
+    }
+
+    const size_t host_len = static_cast<size_t>(host_end - authority);
+    if (host_len == 0 || host_len > 253) return false;
+    char host[254];
+    memcpy(host, authority, host_len);
+    host[host_len] = '\0';
+
+    unsigned octets[4] = {};
+    char tail = '\0';
+    if (sscanf(host, "%u.%u.%u.%u%c", &octets[0], &octets[1], &octets[2], &octets[3], &tail) == 4) {
+        for (unsigned octet : octets) if (octet > 255) return false;
+        return octets[0] == 10 ||
+               (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31) ||
+               (octets[0] == 192 && octets[1] == 168);
+    }
+
+    constexpr const char kLocalSuffix[] = ".local";
+    if (host_len <= sizeof(kLocalSuffix) - 1 ||
+        strcmp(host + host_len - (sizeof(kLocalSuffix) - 1), kLocalSuffix) != 0) return false;
+    bool label_start = true;
+    for (size_t i = 0; i < host_len; ++i) {
+        const unsigned char c = static_cast<unsigned char>(host[i]);
+        if (c == '.') {
+            if (label_start || host[i - 1] == '-') return false;
+            label_start = true;
+        } else {
+            if (!(isalnum(c) || c == '-') || (label_start && c == '-')) return false;
+            label_start = false;
+        }
+    }
+    return !label_start && host[host_len - 1] != '-';
+}
+
+extern "C" bool al_wifi_device_token_valid(const char* token) {
+    if (!token) return false;
+    const size_t len = strnlen(token, AL_PROV_DEVICE_TOKEN_CAPACITY);
+    if (len == 0 || len >= AL_PROV_DEVICE_TOKEN_CAPACITY) return false;
+    for (size_t i = 0; i < len; ++i) {
+        const unsigned char c = static_cast<unsigned char>(token[i]);
+        if (c <= 0x20 || c >= 0x7f) return false;
+    }
+    return true;
+}
+
+extern "C" bool al_wifi_parse_provision_body(const char* body, size_t body_len,
+                                                al_prov_settings_t* settings) {
+    if (!body || !settings || body_len == 0 || body_len >= 1024 || memchr(body, '\0', body_len)) return false;
+    al_prov_settings_t parsed = {};
+    if (!FormEncodingValid(body, body_len) ||
+        !FormValue(body, body_len, "ssid", parsed.ssid, sizeof parsed.ssid, true) ||
+        !FormValue(body, body_len, "password", parsed.password, sizeof parsed.password, false) ||
+        !FormValue(body, body_len, "endpoint", parsed.endpoint, sizeof parsed.endpoint, true) ||
+        !FormValue(body, body_len, "device_token", parsed.device_token, sizeof parsed.device_token, true) ||
+        !parsed.ssid[0] || !al_wifi_endpoint_valid(parsed.endpoint) ||
+        !al_wifi_device_token_valid(parsed.device_token)) return false;
+    *settings = parsed;
+    return true;
+}
