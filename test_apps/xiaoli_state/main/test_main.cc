@@ -1349,6 +1349,54 @@ TEST_CASE("Connection replay ledger suppresses immediate resend until reconnect"
     TEST_ASSERT_FALSE(ledger.WasSent(slot, ordinal));
 }
 
+TEST_CASE("Complete audio end failures preserve replay while discarded captures may abort",
+          "[mediation_runtime]") {
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<uint8_t>(xiaoli::AsrEndFailureAction::kRestartLink),
+        static_cast<uint8_t>(xiaoli::EndFailureActionFor(true)));
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<uint8_t>(xiaoli::AsrEndFailureAction::kRetryIncompleteEnd),
+        static_cast<uint8_t>(xiaoli::EndFailureActionFor(false)));
+}
+
+TEST_CASE("Transcript tracker waits for every durable segment and both speakers",
+          "[mediation_runtime]") {
+    xiaoli::TranscriptTracker tracker;
+    TEST_ASSERT_TRUE(tracker.NoteDurable("a-1", xiaoli::Speaker::kA));
+    TEST_ASSERT_TRUE(tracker.NoteDurable("b-1", xiaoli::Speaker::kB));
+    TEST_ASSERT_FALSE(tracker.ReadyToMediate());
+    TEST_ASSERT_TRUE(tracker.NoteSaved("a-1", xiaoli::Speaker::kA));
+    TEST_ASSERT_FALSE(tracker.ReadyToMediate());
+    TEST_ASSERT_TRUE(tracker.NoteSaved("b-1", xiaoli::Speaker::kB));
+    TEST_ASSERT_TRUE(tracker.ReadyToMediate());
+
+    TEST_ASSERT_TRUE(tracker.NoteDurable("a-2", xiaoli::Speaker::kA));
+    TEST_ASSERT_FALSE(tracker.ReadyToMediate());
+    TEST_ASSERT_TRUE(tracker.NoteFailed("a-2"));
+    TEST_ASSERT_TRUE(tracker.ReadyToMediate());
+    TEST_ASSERT_TRUE(tracker.NoteSaved("b-1", xiaoli::Speaker::kB));
+    TEST_ASSERT_FALSE(tracker.NoteSaved("b-1", xiaoli::Speaker::kA));
+}
+
+TEST_CASE("Segment-scoped errors never target a different live stream",
+          "[mediation_runtime]") {
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<uint8_t>(xiaoli::BridgeErrorTarget::kCaseWide),
+        static_cast<uint8_t>(xiaoli::ClassifyBridgeErrorTarget("", "b-live", "a-replay")));
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<uint8_t>(xiaoli::BridgeErrorTarget::kActiveRecording),
+        static_cast<uint8_t>(xiaoli::ClassifyBridgeErrorTarget(
+            "b-live", "b-live", "a-replay")));
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<uint8_t>(xiaoli::BridgeErrorTarget::kReplay),
+        static_cast<uint8_t>(xiaoli::ClassifyBridgeErrorTarget(
+            "a-replay", "b-live", "a-replay")));
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<uint8_t>(xiaoli::BridgeErrorTarget::kStale),
+        static_cast<uint8_t>(xiaoli::ClassifyBridgeErrorTarget(
+            "a-old", "b-live", "a-replay")));
+}
+
 TEST_CASE("Durable retry ACK can recover an end-admission error without losing count",
           "[mediation_state]") {
     MediationStateMachine machine;
@@ -1489,6 +1537,38 @@ TEST_CASE("Playback ingress accounting precedes a deterministically interleaved 
     TEST_ASSERT_FALSE(playback.ReadyToFinish(true));
 }
 
+TEST_CASE("Playback start gate preserves chunks that arrive before state-machine adoption",
+          "[mediation_runtime]") {
+    xiaoli::PlaybackIngressGate gate;
+    xiaoli::PlaybackSession playback;
+    TEST_ASSERT_TRUE(gate.Arm("case", 640, 16000, 16, 1));
+    TEST_ASSERT_TRUE(gate.ReserveChunk(320));
+    TEST_ASSERT_TRUE(gate.ReserveChunk(320));
+    TEST_ASSERT_TRUE(gate.Matches("case", 640, 16000, 16, 1));
+
+    TEST_ASSERT_TRUE(playback.Begin("case", 11, 640, 16000, 16, 1));
+    TEST_ASSERT_TRUE(gate.AdoptInto(playback));
+    TEST_ASSERT_FALSE(gate.armed());
+    TEST_ASSERT_EQUAL_UINT32(640, playback.received_bytes());
+    TEST_ASSERT_EQUAL_UINT32(2, playback.chunk_count());
+    TEST_ASSERT_TRUE(playback.MarkWritten(640));
+    TEST_ASSERT_TRUE(playback.AcceptEnd("case", 640, 1, true));
+    TEST_ASSERT_TRUE(playback.ReadyToFinish(true));
+}
+
+TEST_CASE("Playback start gate fails closed on staged ingress truncation",
+          "[mediation_runtime]") {
+    xiaoli::PlaybackIngressGate gate;
+    xiaoli::PlaybackSession playback;
+    TEST_ASSERT_TRUE(gate.Arm("case", 640, 16000, 16, 1));
+    TEST_ASSERT_TRUE(gate.ReserveChunk(640));
+    gate.FailIngress();
+    TEST_ASSERT_TRUE(playback.Begin("case", 12, 640, 16000, 16, 1));
+    TEST_ASSERT_FALSE(gate.AdoptInto(playback));
+    TEST_ASSERT_FALSE(gate.armed());
+    TEST_ASSERT_TRUE(playback.incomplete());
+}
+
 TEST_CASE("Haptic duration clamps without delay semantics", "[mediation_runtime]") {
     TEST_ASSERT_EQUAL_UINT32(20, xiaoli::ClampHapticDuration(0));
     TEST_ASSERT_EQUAL_UINT32(20, xiaoli::ClampHapticDuration(19));
@@ -1510,6 +1590,30 @@ TEST_CASE("New case can be denied before state generation changes", "[mediation_
     AssertAction(batch, 0, ActionType::kVibrate, Speaker::kNone,
                  StatusId::kWaiting, xiaoli::kErrorVibrateMs);
     TEST_ASSERT_EQUAL_UINT32(generation, machine.case_generation());
+}
+
+TEST_CASE("Long press during the first B recording stops it and preserves mediation intent",
+          "[mediation_state]") {
+    MediationStateMachine machine;
+    machine.Handle(StateEvent(EventType::kBoot, 0));
+    ShortCase(machine, 1, 2);
+    const uint32_t generation = machine.case_generation();
+    machine.Handle(AckEvent(Speaker::kA, generation, 3));
+    machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kPersonB, 4));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(MediationState::kRecordingB),
+                            static_cast<uint8_t>(machine.state()));
+    machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kCase, 10));
+    const auto batch = machine.Handle(StateEvent(EventType::kTick,
+                                                  10 + xiaoli::kLongPressMs));
+    TEST_ASSERT_EQUAL_UINT8(3, batch.count);
+    AssertAction(batch, 0, ActionType::kStopRecording, Speaker::kB);
+    AssertAction(batch, 1, ActionType::kRequestMediation, Speaker::kNone,
+                 StatusId::kWaiting);
+    TEST_ASSERT_EQUAL_UINT32(generation, batch.items[1].case_generation);
+    AssertAction(batch, 2, ActionType::kShowStatus, Speaker::kNone,
+                 StatusId::kMediating);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(MediationState::kMediating),
+                            static_cast<uint8_t>(machine.state()));
 }
 
 extern "C" void app_main(void) {

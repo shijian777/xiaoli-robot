@@ -19,7 +19,38 @@ bool ValidId(const char* value) {
     return strnlen(value, kIdCapacity) < kIdCapacity;
 }
 
+bool ValidPlaybackStart(const char* case_id, uint32_t expected_bytes,
+                        uint32_t sample_rate, uint8_t bits,
+                        uint8_t channels) {
+    return ValidId(case_id) && expected_bytes != 0 &&
+           expected_bytes <= kMaxPlaybackBytes &&
+           (expected_bytes & 1U) == 0 && sample_rate == 16000 &&
+           bits == 16 && channels == 1;
+}
+
 }  // namespace
+
+AsrEndFailureAction EndFailureActionFor(bool complete) {
+    return complete ? AsrEndFailureAction::kRestartLink
+                    : AsrEndFailureAction::kRetryIncompleteEnd;
+}
+
+BridgeErrorTarget ClassifyBridgeErrorTarget(
+    const char* error_segment_id, const char* active_segment_id,
+    const char* replay_segment_id) {
+    if (error_segment_id == nullptr || error_segment_id[0] == '\0') {
+        return BridgeErrorTarget::kCaseWide;
+    }
+    if (ValidId(active_segment_id) &&
+        std::strncmp(error_segment_id, active_segment_id, kIdCapacity) == 0) {
+        return BridgeErrorTarget::kActiveRecording;
+    }
+    if (ValidId(replay_segment_id) &&
+        std::strncmp(error_segment_id, replay_segment_id, kIdCapacity) == 0) {
+        return BridgeErrorTarget::kReplay;
+    }
+    return BridgeErrorTarget::kStale;
+}
 
 bool BusinessIdGenerator::Initialize(const uint8_t mac[6],
                                      uint32_t boot_epoch,
@@ -145,6 +176,106 @@ void ConnectionReplayLedger::Reset() {
     }
 }
 
+TranscriptTracker::Entry* TranscriptTracker::Find(const char* segment_id) {
+    if (!ValidId(segment_id)) {
+        return nullptr;
+    }
+    for (Entry& entry : entries_) {
+        if (entry.status != Status::kEmpty &&
+            std::strncmp(entry.segment_id, segment_id,
+                         sizeof(entry.segment_id)) == 0) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+const TranscriptTracker::Entry* TranscriptTracker::Find(
+    const char* segment_id) const {
+    return const_cast<TranscriptTracker*>(this)->Find(segment_id);
+}
+
+TranscriptTracker::Entry* TranscriptTracker::Add(
+    const char* segment_id, Speaker speaker, Status status) {
+    if (!ValidId(segment_id) ||
+        (speaker != Speaker::kA && speaker != Speaker::kB) ||
+        status == Status::kEmpty) {
+        return nullptr;
+    }
+    for (Entry& entry : entries_) {
+        if (entry.status != Status::kEmpty) {
+            continue;
+        }
+        std::snprintf(entry.segment_id, sizeof(entry.segment_id), "%s",
+                      segment_id);
+        entry.speaker = speaker;
+        entry.status = status;
+        return &entry;
+    }
+    return nullptr;
+}
+
+bool TranscriptTracker::NoteDurable(const char* segment_id, Speaker speaker) {
+    Entry* entry = Find(segment_id);
+    if (entry == nullptr) {
+        return Add(segment_id, speaker, Status::kPending) != nullptr;
+    }
+    return entry->speaker == speaker;
+}
+
+bool TranscriptTracker::NoteSaved(const char* segment_id, Speaker speaker) {
+    Entry* entry = Find(segment_id);
+    if (entry == nullptr) {
+        entry = Add(segment_id, speaker, Status::kSaved);
+        return entry != nullptr;
+    }
+    if (entry->speaker != speaker || entry->status == Status::kFailed) {
+        return false;
+    }
+    entry->status = Status::kSaved;
+    return true;
+}
+
+bool TranscriptTracker::NoteFailed(const char* segment_id) {
+    Entry* entry = Find(segment_id);
+    if (entry == nullptr || entry->status == Status::kSaved) {
+        return false;
+    }
+    entry->status = Status::kFailed;
+    return true;
+}
+
+bool TranscriptTracker::HasPending() const {
+    for (const Entry& entry : entries_) {
+        if (entry.status == Status::kPending) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TranscriptTracker::ReadyToMediate() const {
+    bool saved_a = false;
+    bool saved_b = false;
+    for (const Entry& entry : entries_) {
+        if (entry.status == Status::kPending) {
+            return false;
+        }
+        if (entry.status != Status::kSaved) {
+            continue;
+        }
+        saved_a = saved_a || entry.speaker == Speaker::kA;
+        saved_b = saved_b || entry.speaker == Speaker::kB;
+    }
+    return saved_a && saved_b;
+}
+
+void TranscriptTracker::Reset() {
+    for (Entry& entry : entries_) {
+        entry = {};
+    }
+}
+
 uint32_t ClampHapticDuration(uint32_t duration_ms) {
     if (duration_ms < 20) {
         return 20;
@@ -155,9 +286,9 @@ uint32_t ClampHapticDuration(uint32_t duration_ms) {
 bool PlaybackSession::Begin(const char* case_id, uint32_t case_generation,
                             uint32_t expected_bytes, uint32_t sample_rate,
                             uint8_t bits, uint8_t channels) {
-    if (!ValidId(case_id) || case_generation == 0 || expected_bytes == 0 ||
-        expected_bytes > kMaxPlaybackBytes || (expected_bytes & 1U) != 0 ||
-        sample_rate != 16000 || bits != 16 || channels != 1) {
+    if (case_generation == 0 ||
+        !ValidPlaybackStart(case_id, expected_bytes, sample_rate, bits,
+                            channels)) {
         return false;
     }
     std::snprintf(case_id_, sizeof(case_id_), "%s", case_id);
@@ -172,18 +303,24 @@ bool PlaybackSession::Begin(const char* case_id, uint32_t case_generation,
     return true;
 }
 
-bool PlaybackSession::ReserveChunk(size_t bytes) {
-    if (!active_ || input_complete_ || incomplete_ || bytes == 0 ||
-        (bytes & 1U) != 0 || bytes > expected_bytes_ - received_bytes_ ||
-        chunk_count_ >= 0x10000U) {
+bool PlaybackSession::ReserveChunks(size_t bytes, uint32_t chunks) {
+    const bool empty = bytes == 0 && chunks == 0;
+    if (!active_ || input_complete_ || incomplete_ ||
+        (!empty && (bytes == 0 || chunks == 0)) || (bytes & 1U) != 0 ||
+        bytes > expected_bytes_ || received_bytes_ > expected_bytes_ - bytes ||
+        chunks > 0x10000U || chunk_count_ > 0x10000U - chunks) {
         if (active_) {
             incomplete_ = true;
         }
         return false;
     }
     received_bytes_ += static_cast<uint32_t>(bytes);
-    ++chunk_count_;
+    chunk_count_ += chunks;
     return true;
+}
+
+bool PlaybackSession::ReserveChunk(size_t bytes) {
+    return ReserveChunks(bytes, 1);
 }
 
 void PlaybackSession::FailIngress() {
@@ -241,6 +378,82 @@ void PlaybackSession::Abort() {
     active_ = false;
     incomplete_ = true;
     input_complete_ = false;
+}
+
+bool PlaybackIngressGate::Arm(const char* case_id, uint32_t expected_bytes,
+                              uint32_t sample_rate, uint8_t bits,
+                              uint8_t channels) {
+    if (armed_ || !ValidPlaybackStart(case_id, expected_bytes, sample_rate,
+                                      bits, channels)) {
+        return false;
+    }
+    std::snprintf(case_id_, sizeof(case_id_), "%s", case_id);
+    expected_bytes_ = expected_bytes;
+    sample_rate_ = sample_rate;
+    received_bytes_ = 0;
+    chunk_count_ = 0;
+    bits_ = bits;
+    channels_ = channels;
+    armed_ = true;
+    incomplete_ = false;
+    return true;
+}
+
+bool PlaybackIngressGate::ReserveChunk(size_t bytes) {
+    if (!armed_ || incomplete_ || bytes == 0 || (bytes & 1U) != 0 ||
+        bytes > expected_bytes_ || received_bytes_ > expected_bytes_ - bytes ||
+        chunk_count_ >= 0x10000U) {
+        if (armed_) {
+            incomplete_ = true;
+        }
+        return false;
+    }
+    received_bytes_ += static_cast<uint32_t>(bytes);
+    ++chunk_count_;
+    return true;
+}
+
+void PlaybackIngressGate::FailIngress() {
+    if (armed_) {
+        incomplete_ = true;
+    }
+}
+
+bool PlaybackIngressGate::Matches(const char* case_id,
+                                  uint32_t expected_bytes,
+                                  uint32_t sample_rate, uint8_t bits,
+                                  uint8_t channels) const {
+    return armed_ && ValidId(case_id) &&
+           std::strncmp(case_id_, case_id, sizeof(case_id_)) == 0 &&
+           expected_bytes_ == expected_bytes && sample_rate_ == sample_rate &&
+           bits_ == bits && channels_ == channels;
+}
+
+bool PlaybackIngressGate::AdoptInto(PlaybackSession& playback) {
+    const bool valid = armed_ && !incomplete_ && playback.active() &&
+                       std::strncmp(case_id_, playback.case_id(),
+                                    sizeof(case_id_)) == 0 &&
+                       expected_bytes_ == playback.expected_bytes();
+    const uint32_t received = received_bytes_;
+    const uint32_t chunks = chunk_count_;
+    Reset();
+    if (!valid || !playback.ReserveChunks(received, chunks)) {
+        playback.FailIngress();
+        return false;
+    }
+    return true;
+}
+
+void PlaybackIngressGate::Reset() {
+    std::memset(case_id_, 0, sizeof(case_id_));
+    expected_bytes_ = 0;
+    sample_rate_ = 0;
+    received_bytes_ = 0;
+    chunk_count_ = 0;
+    bits_ = 0;
+    channels_ = 0;
+    armed_ = false;
+    incomplete_ = false;
 }
 
 }  // namespace xiaoli

@@ -794,6 +794,47 @@ test('an exact speech.start retry after reconnect restores retained progress wit
   }, {asrService});
 });
 
+test('an exact completed-segment replay end releases the replay stream for the next recording', async () => {
+  await withGateway(async ({gateway, url}) => {
+    const ws = await openClient(url);
+    const channel = inbox(ws);
+    await authenticate(ws, channel);
+    ws.send(JSON.stringify(control('case.start', 'exact-case-start', {caseId: 'exact-case'})));
+    await nextJson(channel, 'ack');
+
+    const exactStart = startFrame({
+      messageId: 'exact-start-a', caseId: 'exact-case', segmentId: 'exact-a', speaker: 'A'
+    });
+    const exactEnd = endFrame({
+      messageId: 'exact-end-a', caseId: 'exact-case', segmentId: 'exact-a', bytes: 4, lastSequence: 0
+    });
+    const pcm = Buffer.from([1, 0, 2, 0]);
+    ws.send(exactStart);
+    await nextJson(channel, 'ack');
+    ws.send(streamFrame(FrameKind.STREAM_CHUNK, 0, pcm));
+    ws.send(exactEnd);
+    const originalDurable = await nextJson(channel, 'ack');
+    assert.equal(originalDurable.durable, true);
+    await nextJson(channel, 'transcript.saved');
+    await gateway.waitForIdle();
+
+    // Firmware reconnect replay deliberately preserves the original IDs.
+    ws.send(exactStart);
+    await nextJson(channel, 'ack');
+    ws.send(streamFrame(FrameKind.STREAM_CHUNK, 0, pcm));
+    ws.send(exactEnd);
+    assert.deepEqual(await nextJson(channel, 'ack'), originalDurable);
+
+    ws.send(startFrame({
+      messageId: 'next-start-b', caseId: 'exact-case', segmentId: 'next-b', speaker: 'B'
+    }));
+    const nextStart = await nextJson(channel);
+    assert.equal(nextStart.type, 'ack');
+    assert.equal(nextStart.messageId, 'next-start-b');
+    await closeClient(ws);
+  });
+});
+
 test('segment replay rejects changed format, speaker, and case instead of returning an old ACK', async () => {
   await withGateway(async ({url}) => {
     const ws = await openClient(url);

@@ -11,6 +11,7 @@
 #include "bq27220.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -23,6 +24,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 #include "nvs.h"
@@ -34,8 +36,7 @@ namespace {
 constexpr uint16_t kBridgeCustomCommand = 0x7e;
 constexpr size_t kCaptureSamples = AUDIO_SAMPLE_RATE / 50;
 constexpr size_t kCaptureBytes = kCaptureSamples * sizeof(int16_t);
-constexpr size_t kCustomQueueDepth = 4;
-constexpr size_t kStateQueueDepth = 8;
+constexpr size_t kBridgeQueueDepth = 16;
 constexpr size_t kPlaybackNoticeDepth = 4;
 constexpr size_t kPlaybackStorageBytes = xiaoli::kMaxPlaybackBytes + 1;
 
@@ -47,12 +48,6 @@ bool SameId(const char* lhs, const char* rhs) {
     return lhs != nullptr && rhs != nullptr &&
            std::strncmp(lhs, rhs, xiaoli::kIdCapacity) == 0;
 }
-
-struct CustomEnvelope {
-    uint16_t command = 0;
-    uint16_t len = 0;
-    uint8_t payload[xiaoli::kMaxBridgeMessageBytes + 1] = {};
-};
 
 struct PlaybackNotice {
     uint32_t case_generation = 0;
@@ -126,19 +121,30 @@ public:
             return;
         }
 
-        // Account for the entire chunk before making any byte visible to the
-        // speaker task.  The reader may wake inside xStreamBufferSend().
+        // audio.start is parsed and arms the bounded ingress gate in the same
+        // ordered callback worker before the first binary callback.  Account
+        // either there or in the adopted session before publishing bytes.
         portENTER_CRITICAL(&playback_mux_);
-        const bool reserved = playback_.ReserveChunk(bytes);
+        const bool staged = playback_ingress_.armed();
+        const bool reserved = staged
+            ? playback_ingress_.ReserveChunk(bytes)
+            : playback_.ReserveChunk(bytes);
         portEXIT_CRITICAL(&playback_mux_);
         if (!reserved) {
+            SignalBridgeIngressFault();
             return;
         }
 
         const size_t sent = xStreamBufferSend(play_buf_, pcm16, bytes, 0);
         if (sent != bytes) {
             portENTER_CRITICAL(&playback_mux_);
-            playback_.FailIngress();
+            // Adoption may have happened while xStreamBufferSend ran.  The
+            // reservation was transferred to playback_ in that case.
+            if (playback_ingress_.armed()) {
+                playback_ingress_.FailIngress();
+            } else {
+                playback_.FailIngress();
+            }
             portEXIT_CRITICAL(&playback_mux_);
             ESP_LOGE(TAG, "playback ingress incomplete (%u/%u bytes)",
                      static_cast<unsigned>(sent), static_cast<unsigned>(bytes));
@@ -154,16 +160,32 @@ public:
     }
 
     void Vibrate(uint32_t duration_ms) override {
-        if (haptic_timer_ == nullptr) {
+        if (haptic_timer_ == nullptr || haptic_mutex_ == nullptr ||
+            xSemaphoreTake(haptic_mutex_, portMAX_DELAY) != pdTRUE) {
             return;
         }
         const uint32_t clamped = xiaoli::ClampHapticDuration(duration_ms);
-        gpio_set_level(HAPTIC_PIN, 1);
+        // Serialize stop/start requests.  The deadline also prevents an old
+        // callback that was already dispatched from switching off a newer
+        // vibration.
         (void)esp_timer_stop(haptic_timer_);
-        if (esp_timer_start_once(haptic_timer_,
-                                 static_cast<uint64_t>(clamped) * 1000ULL) != ESP_OK) {
-            gpio_set_level(HAPTIC_PIN, 0);
+        const int64_t deadline_us = esp_timer_get_time() +
+            static_cast<int64_t>(clamped) * 1000LL;
+        portENTER_CRITICAL(&haptic_mux_);
+        haptic_deadline_us_ = deadline_us;
+        gpio_set_level(HAPTIC_PIN, 1);
+        portEXIT_CRITICAL(&haptic_mux_);
+        const esp_err_t started = esp_timer_start_once(
+            haptic_timer_, static_cast<uint64_t>(clamped) * 1000ULL);
+        if (started != ESP_OK) {
+            portENTER_CRITICAL(&haptic_mux_);
+            if (haptic_deadline_us_ == deadline_us) {
+                haptic_deadline_us_ = 0;
+                gpio_set_level(HAPTIC_PIN, 0);
+            }
+            portEXIT_CRITICAL(&haptic_mux_);
         }
+        xSemaphoreGive(haptic_mutex_);
     }
 
     void HandleCustom(uint16_t command, const uint8_t* payload,
@@ -176,27 +198,36 @@ public:
                      static_cast<unsigned>(len));
             return;
         }
-        CustomEnvelope envelope{};
-        envelope.command = command;
-        envelope.len = static_cast<uint16_t>(len);
-        std::memcpy(envelope.payload, payload, len);
-        envelope.payload[len] = 0;
-        if (xQueueSend(custom_queue_, &envelope, 0) != pdTRUE) {
-            ESP_LOGW(TAG, "Bridge message queue full");
+        xiaoli::BridgeMessage message{};
+        const xiaoli::BridgeParseResult parsed =
+            xiaoli::ParseBridgeMessage(payload, len, &message);
+        if (parsed == xiaoli::BridgeParseResult::kUnknown) {
+            ESP_LOGW(TAG, "unknown Bridge message ignored");
+            return;
+        }
+        if (parsed != xiaoli::BridgeParseResult::kOk) {
+            ESP_LOGW(TAG, "invalid Bridge message rejected");
+            return;
+        }
+        if (message.type == xiaoli::BridgeMessageType::kAudioStart &&
+            !ArmPlaybackIngress(message)) {
+            ESP_LOGE(TAG, "audio.start ingress could not be armed");
+            SignalBridgeIngressFault();
+            return;
+        }
+        if (xQueueSend(custom_queue_, &message, 0) != pdTRUE) {
+            ESP_LOGE(TAG, "Bridge message queue full; reconnect required");
+            SignalBridgeIngressFault();
         } else if (mediation_task_ != nullptr) {
-            // Wake the higher-priority owner before the transport can deliver
-            // the first PCM chunk following an audio.start message.
             xTaskNotifyGive(mediation_task_);
         }
     }
 
     void HandleAgentState(agent_state_t state) override {
-        if (state_queue_ == nullptr) {
-            return;
-        }
-        if (xQueueSend(state_queue_, &state, 0) != pdTRUE) {
-            ESP_LOGW(TAG, "Agent state queue full");
-        } else if (mediation_task_ != nullptr) {
+        latest_agent_state_.store(static_cast<uint8_t>(state),
+                                  std::memory_order_release);
+        agent_state_epoch_.fetch_add(1, std::memory_order_acq_rel);
+        if (mediation_task_ != nullptr) {
             xTaskNotifyGive(mediation_task_);
         }
     }
@@ -215,23 +246,67 @@ private:
 
     static void HapticTimerEntry(void* arg) {
         auto* self = static_cast<RoRoLeeS3Board*>(arg);
-        gpio_set_level(HAPTIC_PIN, 0);
-        (void)self;
+        const int64_t now_us = esp_timer_get_time();
+        portENTER_CRITICAL(&self->haptic_mux_);
+        if (self->haptic_deadline_us_ != 0 &&
+            now_us >= self->haptic_deadline_us_) {
+            self->haptic_deadline_us_ = 0;
+            gpio_set_level(HAPTIC_PIN, 0);
+        }
+        portEXIT_CRITICAL(&self->haptic_mux_);
     }
 
     void InitQueues() {
         custom_queue_ = xQueueCreateStatic(
-            kCustomQueueDepth, sizeof(CustomEnvelope), custom_queue_storage_,
+            kBridgeQueueDepth, sizeof(xiaoli::BridgeMessage),
+            custom_queue_storage_,
             &custom_queue_control_);
-        state_queue_ = xQueueCreateStatic(
-            kStateQueueDepth, sizeof(agent_state_t), state_queue_storage_,
-            &state_queue_control_);
         playback_notice_queue_ = xQueueCreateStatic(
             kPlaybackNoticeDepth, sizeof(PlaybackNotice),
             playback_notice_storage_, &playback_notice_control_);
-        if (custom_queue_ == nullptr || state_queue_ == nullptr ||
-            playback_notice_queue_ == nullptr) {
+        haptic_mutex_ = xSemaphoreCreateMutexStatic(&haptic_mutex_control_);
+        if (custom_queue_ == nullptr || playback_notice_queue_ == nullptr ||
+            haptic_mutex_ == nullptr) {
             ESP_LOGE(TAG, "static queue initialization failed");
+        }
+    }
+
+    void SignalBridgeIngressFault() {
+        bridge_ingress_fault_.store(true, std::memory_order_release);
+        if (mediation_task_ != nullptr) {
+            xTaskNotifyGive(mediation_task_);
+        }
+    }
+
+    bool ArmPlaybackIngress(const xiaoli::BridgeMessage& message) {
+        if (play_buf_ == nullptr || play_task_ == nullptr) {
+            return false;
+        }
+        portENTER_CRITICAL(&playback_mux_);
+        const bool idle = !playback_.active() && !playback_ingress_.armed();
+        portEXIT_CRITICAL(&playback_mux_);
+        if (!idle || xStreamBufferReset(play_buf_) != pdPASS) {
+            return false;
+        }
+        portENTER_CRITICAL(&playback_mux_);
+        const bool armed = !playback_.active() &&
+            playback_ingress_.Arm(
+                message.case_id, message.bytes, message.sample_rate,
+                message.bits, message.channels);
+        portEXIT_CRITICAL(&playback_mux_);
+        return armed;
+    }
+
+    void CancelPlaybackIngress() {
+        if (play_buf_ == nullptr) {
+            return;
+        }
+        portENTER_CRITICAL(&playback_mux_);
+        const bool reset_buffer = playback_ingress_.armed();
+        playback_ingress_.Reset();
+        portEXIT_CRITICAL(&playback_mux_);
+        if (reset_buffer) {
+            xStreamBufferReset(play_buf_);
         }
     }
 
@@ -356,7 +431,8 @@ private:
         }
 
         while (true) {
-            DrainAgentStates();
+            DrainBridgeIngressFault();
+            ReconcileAgentState();
             DrainBridgeMessages();
             DrainPlaybackNotices();
             SampleButtons();
@@ -365,6 +441,7 @@ private:
             tick.type = xiaoli::EventType::kTick;
             tick.now_ms = NowMs();
             ApplyActions(state_machine_.Handle(tick));
+            MaybeRecoverRetryableError(tick.now_ms);
 
             if (active_slot_ != xiaoli::kInvalidSlot) {
                 CaptureOneFrame();
@@ -478,6 +555,10 @@ private:
         next.generation = generation;
         next.active = true;
         case_ = next;
+        transcript_tracker_.Reset();
+        mediation_request_pending_ = false;
+        mediation_request_inflight_ = false;
+        mediation_pending_generation_ = 0;
         ResetReplayConnectionMarks();
         if (!link_ready_ || SendCaseStart() != ESP_OK) {
             FeedError(xiaoli::ErrorReason::kNetworkUnavailable);
@@ -645,11 +726,26 @@ private:
     }
 
     bool RequestMediation(uint32_t generation) {
-        if (!case_.active || generation != case_.generation || !link_ready_ ||
-            !case_.registered || replay_.active) {
+        if (!case_.active || generation != case_.generation) {
             FeedError(xiaoli::ErrorReason::kNetworkUnavailable);
             return false;
         }
+        mediation_request_pending_ = true;
+        mediation_request_inflight_ = false;
+        mediation_pending_generation_ = generation;
+        if (active_slot_ == xiaoli::kInvalidSlot && !replay_.active &&
+            !capture_store_.HasCompleteUnacked() &&
+            !transcript_tracker_.ReadyToMediate() &&
+            !transcript_tracker_.HasPending()) {
+            mediation_request_pending_ = false;
+            FeedError(xiaoli::ErrorReason::kMediationFailed, true);
+            return false;
+        }
+        MaybeDispatchPendingMediation(false);
+        return true;
+    }
+
+    bool SendMediationRequestNow() {
         char message_id[xiaoli::kIdCapacity] = {};
         char json[256] = {};
         if (!ids_.NextMessage(message_id, sizeof(message_id))) {
@@ -661,27 +757,51 @@ private:
             "{\"v\":1,\"type\":\"mediate.request\",\"messageId\":\"%s\","
             "\"caseId\":\"%s\"}",
             message_id, case_.case_id);
-        if (written <= 0 || static_cast<size_t>(written) >= sizeof(json) ||
-            agent_link_push_event(AGENT_EVT_CUSTOM,
-                                  reinterpret_cast<const uint8_t*>(json),
-                                  static_cast<size_t>(written)) != ESP_OK) {
-            FeedError(xiaoli::ErrorReason::kNetworkUnavailable);
+        if (written <= 0 || static_cast<size_t>(written) >= sizeof(json)) {
+            FeedError(xiaoli::ErrorReason::kMediationFailed);
             return false;
         }
+        if (agent_link_push_event(
+                AGENT_EVT_CUSTOM, reinterpret_cast<const uint8_t*>(json),
+                static_cast<size_t>(written)) != ESP_OK) {
+            RestartLinkPreservingCompleteAudio();
+            return false;
+        }
+        mediation_request_inflight_ = true;
         ESP_LOGI(TAG, "mediation requested case=%s", case_.case_id);
         return true;
     }
 
-    void FeedError(xiaoli::ErrorReason reason) {
+    void MaybeDispatchPendingMediation(bool allow_readiness_probe) {
+        if (!mediation_request_pending_ || mediation_request_inflight_ ||
+            !case_.active ||
+            mediation_pending_generation_ != case_.generation ||
+            state_machine_.state() != xiaoli::MediationState::kMediating ||
+            !link_ready_ || !case_.registered || replay_.active ||
+            active_slot_ != xiaoli::kInvalidSlot ||
+            capture_store_.HasCompleteUnacked()) {
+            return;
+        }
+        if (!transcript_tracker_.ReadyToMediate() &&
+            !allow_readiness_probe) {
+            return;
+        }
+        (void)SendMediationRequestNow();
+    }
+
+    void FeedError(xiaoli::ErrorReason reason, bool auto_recover = false) {
         xiaoli::Event event{};
         event.type = xiaoli::EventType::kRecoverableError;
         event.now_ms = NowMs();
         event.error = reason;
         event.case_generation = case_.active ? case_.generation : 0;
         ApplyActions(state_machine_.Handle(event));
+        recoverable_error_deadline_ms_ = auto_recover
+            ? NowMs() + 1500 : 0;
     }
 
     void FeedRecovered() {
+        recoverable_error_deadline_ms_ = 0;
         xiaoli::Event event{};
         event.type = xiaoli::EventType::kRecovered;
         event.now_ms = NowMs();
@@ -689,56 +809,75 @@ private:
         ApplyActions(state_machine_.Handle(event));
     }
 
-    void DrainAgentStates() {
-        if (state_queue_ == nullptr) {
+    void MaybeRecoverRetryableError(uint64_t now_ms) {
+        if (recoverable_error_deadline_ms_ == 0 ||
+            now_ms < recoverable_error_deadline_ms_ ||
+            state_machine_.state() !=
+                xiaoli::MediationState::kRecoverableError) {
             return;
         }
-        agent_state_t state = AGENT_STATE_DISCONNECTED;
-        while (xQueueReceive(state_queue_, &state, 0) == pdTRUE) {
-            if (state == last_agent_state_) {
-                continue;
-            }
-            last_agent_state_ = state;
-            if (state == AGENT_STATE_READY) {
-                link_ready_ = true;
-                ResetReplayConnectionMarks();
-                if (case_.active) {
-                    if (SendCaseStart() != ESP_OK) {
-                        FeedError(xiaoli::ErrorReason::kNetworkUnavailable);
-                    }
-                } else {
-                    FeedRecovered();
-                }
-                continue;
-            }
-            link_ready_ = false;
-            case_.registered = false;
-            if (state == AGENT_STATE_DISCONNECTED) {
-                AbortActiveRecording();
-                replay_ = {};
-                AbortPlayback(false);
-                FeedError(xiaoli::ErrorReason::kNetworkUnavailable);
-            }
+        FeedRecovered();
+    }
+
+    void ReconcileAgentState() {
+        const uint32_t epoch =
+            agent_state_epoch_.load(std::memory_order_acquire);
+        const agent_state_t state = agent_link_state();
+        if (epoch == observed_agent_state_epoch_ &&
+            state == last_agent_state_) {
+            return;
         }
+        observed_agent_state_epoch_ = epoch;
+        last_agent_state_ = state;
+        if (state == AGENT_STATE_READY) {
+            link_ready_ = true;
+            mediation_request_inflight_ = false;
+            ResetReplayConnectionMarks();
+            if (case_.active) {
+                if (SendCaseStart() != ESP_OK) {
+                    RestartLinkPreservingCompleteAudio();
+                }
+            } else {
+                FeedRecovered();
+            }
+            return;
+        }
+
+        link_ready_ = false;
+        case_.registered = false;
+        mediation_request_inflight_ = false;
+        if (state != AGENT_STATE_DISCONNECTED) {
+            return;
+        }
+        AbortActiveRecording();
+        replay_ = {};
+        AbortPlayback(false);
+        CancelPlaybackIngress();
+        if (!mediation_request_pending_) {
+            FeedError(xiaoli::ErrorReason::kNetworkUnavailable);
+        }
+    }
+
+    void DrainBridgeIngressFault() {
+        if (!bridge_ingress_fault_.exchange(false,
+                                            std::memory_order_acq_rel)) {
+            return;
+        }
+        ESP_LOGE(TAG, "Bridge callback ingress lost ordering; restarting link");
+        if (custom_queue_ != nullptr) {
+            xQueueReset(custom_queue_);
+        }
+        CancelPlaybackIngress();
+        AbortPlayback(false);
+        RestartLinkPreservingCompleteAudio();
     }
 
     void DrainBridgeMessages() {
         if (custom_queue_ == nullptr) {
             return;
         }
-        CustomEnvelope envelope{};
-        while (xQueueReceive(custom_queue_, &envelope, 0) == pdTRUE) {
-            xiaoli::BridgeMessage message{};
-            const xiaoli::BridgeParseResult parsed = xiaoli::ParseBridgeMessage(
-                envelope.payload, envelope.len, &message);
-            if (parsed == xiaoli::BridgeParseResult::kUnknown) {
-                ESP_LOGW(TAG, "unknown Bridge message ignored");
-                continue;
-            }
-            if (parsed != xiaoli::BridgeParseResult::kOk) {
-                ESP_LOGW(TAG, "invalid Bridge message rejected");
-                continue;
-            }
+        xiaoli::BridgeMessage message{};
+        while (xQueueReceive(custom_queue_, &message, 0) == pdTRUE) {
             ApplyBridgeMessage(message);
         }
     }
@@ -764,6 +903,17 @@ private:
                              static_cast<unsigned>(message.state),
                              message.case_id[0] ? message.case_id : "-",
                              message.segment_id[0] ? message.segment_id : "-");
+                    if (message.state == xiaoli::BridgeState::kWaiting) {
+                        if (state_machine_.state() ==
+                            xiaoli::MediationState::kRecoverableError) {
+                            FeedRecovered();
+                        }
+                        MaybeDispatchPendingMediation(true);
+                    } else if (message.state ==
+                               xiaoli::BridgeState::kMediating) {
+                        mediation_request_pending_ = false;
+                        mediation_request_inflight_ = false;
+                    }
                 }
                 break;
             case xiaoli::BridgeMessageType::kTranscriptSaved:
@@ -771,6 +921,13 @@ private:
                     ESP_LOGI(TAG, "transcript saved case=%s segment=%s speaker=%s",
                              message.case_id, message.segment_id,
                              message.speaker == xiaoli::Speaker::kA ? "A" : "B");
+                    if (!transcript_tracker_.NoteSaved(message.segment_id,
+                                                       message.speaker)) {
+                        ESP_LOGE(TAG, "conflicting transcript identity rejected");
+                        FeedError(xiaoli::ErrorReason::kMediationFailed);
+                        break;
+                    }
+                    MaybeDispatchPendingMediation(false);
                 }
                 break;
             case xiaoli::BridgeMessageType::kUnknown:
@@ -789,6 +946,7 @@ private:
             ESP_LOGI(TAG, "case registered case=%s", case_.case_id);
             FeedRecovered();
             StartReplayIfPossible();
+            MaybeDispatchPendingMediation(true);
             return;
         }
         if (!message.has_durable || !message.has_bytes ||
@@ -807,10 +965,20 @@ private:
         if (!released.released) {
             return;
         }
-        if (replay_.active && replay_.slot == released.slot &&
-            replay_.insertion_ordinal == released.insertion_ordinal) {
-            CloseAsrStreamFailClosed(false);
-            replay_ = {};
+        if (!transcript_tracker_.NoteDurable(message.segment_id,
+                                             released.speaker)) {
+            ESP_LOGE(TAG, "durable ACK transcript identity conflict");
+            FeedError(xiaoli::ErrorReason::kMediationFailed);
+            return;
+        }
+        const bool acknowledged_active_replay =
+            replay_.active && replay_.slot == released.slot &&
+            replay_.insertion_ordinal == released.insertion_ordinal;
+        if (acknowledged_active_replay) {
+            // The cached ACK can race ahead of replay completion.  Disconnect
+            // to discard the local stream without sending terminal
+            // speech.end(complete=false) for data we still promise to retain.
+            RestartLinkPreservingCompleteAudio();
         }
         ESP_LOGI(TAG, "durable audio ACK case=%s segment=%s bytes=%lu",
                  message.case_id, message.segment_id,
@@ -830,28 +998,39 @@ private:
             xiaoli::MediationState::kRecoverableError) {
             FeedRecovered();
         }
+        MaybeDispatchPendingMediation(acknowledged_active_replay);
+        StartReplayIfPossible();
     }
 
     void ApplyAudioStart(const xiaoli::BridgeMessage& message) {
         if (!case_.active || !SameId(message.case_id, case_.case_id)) {
+            CancelPlaybackIngress();
             return;
         }
         if (state_machine_.state() != xiaoli::MediationState::kMediating ||
             play_buf_ == nullptr || play_task_ == nullptr) {
+            CancelPlaybackIngress();
             return;
         }
-        xStreamBufferReset(play_buf_);
         portENTER_CRITICAL(&playback_mux_);
         play_abort_requested_ = false;
         play_abort_report_error_ = false;
-        const bool begun = playback_.Begin(
+        const bool matches = playback_ingress_.Matches(
+            message.case_id, message.bytes, message.sample_rate,
+            message.bits, message.channels);
+        const bool begun = matches && playback_.Begin(
             message.case_id, case_.generation, message.bytes,
             message.sample_rate, message.bits, message.channels);
+        const bool adopted = begun && playback_ingress_.AdoptInto(playback_);
         portEXIT_CRITICAL(&playback_mux_);
-        if (!begun) {
+        if (!adopted) {
+            AbortPlayback(false);
+            CancelPlaybackIngress();
             FeedError(xiaoli::ErrorReason::kMediationFailed);
             return;
         }
+        mediation_request_pending_ = false;
+        mediation_request_inflight_ = false;
         xiaoli::Event event{};
         event.type = xiaoli::EventType::kAudioStart;
         event.now_ms = NowMs();
@@ -887,16 +1066,72 @@ private:
                  message.code, static_cast<int>(message.retryable),
                  message.case_id[0] ? message.case_id : "-",
                  message.segment_id[0] ? message.segment_id : "-");
-        AbortActiveRecording();
-        AbortPlayback(false);
+
+        if (std::strcmp(message.code, "mediation_not_ready") == 0 &&
+            mediation_request_pending_) {
+            // Admission raced durable storage/transcription.  Keep the
+            // original long-press intent and mediating UI; transcript.saved
+            // or a later waiting state will retry automatically.
+            mediation_request_inflight_ = false;
+            Vibrate(xiaoli::kErrorVibrateMs);
+            return;
+        }
+
+        char active_segment[xiaoli::kIdCapacity] = {};
+        char replay_segment[xiaoli::kIdCapacity] = {};
+        xiaoli::PendingSegmentView view{};
+        if (active_slot_ != xiaoli::kInvalidSlot &&
+            capture_store_.Get(active_slot_, &view)) {
+            std::snprintf(active_segment, sizeof(active_segment), "%s",
+                          view.meta.segment_id);
+        }
+        if (replay_.active && capture_store_.Get(replay_.slot, &view) &&
+            view.insertion_ordinal == replay_.insertion_ordinal) {
+            std::snprintf(replay_segment, sizeof(replay_segment), "%s",
+                          view.meta.segment_id);
+        }
+        const xiaoli::BridgeErrorTarget target =
+            xiaoli::ClassifyBridgeErrorTarget(
+                message.segment_id, active_segment, replay_segment);
+
+        if (std::strcmp(message.code, "transcription_failed") == 0 &&
+            message.segment_id[0] != '\0') {
+            (void)transcript_tracker_.NoteFailed(message.segment_id);
+            if (mediation_request_pending_ &&
+                transcript_tracker_.ReadyToMediate()) {
+                mediation_request_inflight_ = false;
+                MaybeDispatchPendingMediation(false);
+                return;
+            }
+            mediation_request_pending_ = false;
+            mediation_request_inflight_ = false;
+        }
+
+        if (target == xiaoli::BridgeErrorTarget::kStale &&
+            (active_segment[0] != '\0' || replay_segment[0] != '\0')) {
+            ESP_LOGW(TAG, "stale segment error left current stream untouched");
+            return;
+        }
+        if (target == xiaoli::BridgeErrorTarget::kActiveRecording ||
+            target == xiaoli::BridgeErrorTarget::kCaseWide) {
+            AbortActiveRecording();
+        } else if (target == xiaoli::BridgeErrorTarget::kReplay) {
+            RestartLinkPreservingCompleteAudio();
+        }
+        if (target == xiaoli::BridgeErrorTarget::kCaseWide) {
+            AbortPlayback(false);
+        }
         xiaoli::ErrorReason reason = xiaoli::ErrorReason::kNetworkUnavailable;
         if (std::strstr(message.code, "mediation") != nullptr) {
             reason = xiaoli::ErrorReason::kMediationFailed;
+            mediation_request_pending_ = false;
+            mediation_request_inflight_ = false;
         } else if (std::strstr(message.code, "audio") != nullptr ||
-                   std::strstr(message.code, "segment") != nullptr) {
+                   std::strstr(message.code, "segment") != nullptr ||
+                   std::strstr(message.code, "transcription") != nullptr) {
             reason = xiaoli::ErrorReason::kRecordingIncomplete;
         }
-        FeedError(reason);
+        FeedError(reason, message.retryable);
     }
 
     bool FindReplayCandidate(xiaoli::PendingSegmentView* selected) {
@@ -958,7 +1193,7 @@ private:
             !view.locally_complete ||
             view.insertion_ordinal != replay_.insertion_ordinal) {
             if (replay_.stream_open) {
-                CloseAsrStreamFailClosed(false);
+                RestartLinkPreservingCompleteAudio();
             }
             replay_ = {};
             StartReplayIfPossible();
@@ -987,8 +1222,9 @@ private:
         } else if (pushed == ESP_ERR_TIMEOUT) {
             replay_.cursor.OnTimeout();
         } else {
-            CloseAsrStreamFailClosed(false);
-            replay_ = {};
+            // The slot remains complete-unacked.  Never tell Bridge that this
+            // retained business segment is terminally incomplete.
+            RestartLinkPreservingCompleteAudio();
             FeedError(xiaoli::ErrorReason::kNetworkUnavailable);
         }
     }
@@ -1007,21 +1243,49 @@ private:
                  complete ? "complete" : "incomplete",
                  esp_err_to_name(ended));
 
-        // agent_link deliberately keeps the core session open after a failed
-        // end so this incomplete close still targets the same transport
-        // stream.  It is never a successful business completion.
+        if (xiaoli::EndFailureActionFor(complete) ==
+            xiaoli::AsrEndFailureAction::kRestartLink) {
+            // A locally complete slot must remain replayable from its original
+            // speech.start after reconnect.  end(false) would make the Bridge
+            // segment terminal-failed and permanently poison that retry.
+            RestartLinkPreservingCompleteAudio();
+            return false;
+        }
+
+        // A truly discarded recording may retry its terminal incomplete end
+        // once because agent_link keeps the core stream open on admission
+        // failure.  If that also fails, tear down the transport.
         const esp_err_t aborted = agent_link_asr_end(false);
-        if (aborted != ESP_OK && agent_link_state() == AGENT_STATE_READY) {
+        if (aborted != ESP_OK) {
             ESP_LOGE(TAG, "ASR abort admission failed; restarting link");
-            link_ready_ = false;
-            case_.registered = false;
-            ResetReplayConnectionMarks();
-            agent_link_stop();
-            if (agent_link_start() != ESP_OK) {
-                ESP_LOGE(TAG, "link restart failed after ASR stream fault");
-            }
+            RestartLinkPreservingCompleteAudio();
         }
         return false;
+    }
+
+    void RestartLinkPreservingCompleteAudio() {
+        // A callback-ingress or transport fault can arrive while a live
+        // recording still owns the microphone. Stop that local producer
+        // before restarting the link. AbortIncomplete deliberately leaves a
+        // slot untouched once MarkLocallyComplete() has succeeded, so this is
+        // also safe on the complete-end admission failure path.
+        if (active_slot_ != xiaoli::kInvalidSlot) {
+            (void)codec_.StopMic();
+            capture_store_.AbortIncomplete(active_slot_);
+            active_slot_ = xiaoli::kInvalidSlot;
+            active_speaker_ = xiaoli::Speaker::kNone;
+            recording_frames_ = 0;
+        }
+        link_ready_ = false;
+        case_.registered = false;
+        mediation_request_inflight_ = false;
+        ResetReplayConnectionMarks();
+        agent_link_stop();
+        const esp_err_t restarted = agent_link_start();
+        if (restarted != ESP_OK) {
+            ESP_LOGE(TAG, "link restart failed after protocol fault: %s",
+                     esp_err_to_name(restarted));
+        }
     }
 
     void AbortPlayback(bool report_error) {
@@ -1220,6 +1484,11 @@ private:
     bool ids_ok_ = false;
     bool link_ready_ = false;
     agent_state_t last_agent_state_ = static_cast<agent_state_t>(0xff);
+    std::atomic<uint8_t> latest_agent_state_{
+        static_cast<uint8_t>(AGENT_STATE_DISCONNECTED)};
+    std::atomic<uint32_t> agent_state_epoch_{0};
+    uint32_t observed_agent_state_epoch_ = 0;
+    std::atomic<bool> bridge_ingress_fault_{false};
 
     xiaoli::MediationStateMachine state_machine_;
     xiaoli::ButtonDebouncer button_debouncer_;
@@ -1228,20 +1497,27 @@ private:
     CaseRuntime case_;
     ReplayRuntime replay_;
     xiaoli::ConnectionReplayLedger replay_ledger_;
+    xiaoli::TranscriptTracker transcript_tracker_;
     xiaoli::SlotId active_slot_ = xiaoli::kInvalidSlot;
     xiaoli::Speaker active_speaker_ = xiaoli::Speaker::kNone;
     uint32_t recording_frames_ = 0;
+    bool mediation_request_pending_ = false;
+    bool mediation_request_inflight_ = false;
+    uint32_t mediation_pending_generation_ = 0;
+    uint64_t recoverable_error_deadline_ms_ = 0;
 
     TaskHandle_t mediation_task_ = nullptr;
     TaskHandle_t play_task_ = nullptr;
     esp_timer_handle_t haptic_timer_ = nullptr;
+    StaticSemaphore_t haptic_mutex_control_{};
+    SemaphoreHandle_t haptic_mutex_ = nullptr;
+    portMUX_TYPE haptic_mux_ = portMUX_INITIALIZER_UNLOCKED;
+    int64_t haptic_deadline_us_ = 0;
 
     StaticQueue_t custom_queue_control_{};
-    uint8_t custom_queue_storage_[kCustomQueueDepth * sizeof(CustomEnvelope)] = {};
+    uint8_t custom_queue_storage_[
+        kBridgeQueueDepth * sizeof(xiaoli::BridgeMessage)] = {};
     QueueHandle_t custom_queue_ = nullptr;
-    StaticQueue_t state_queue_control_{};
-    uint8_t state_queue_storage_[kStateQueueDepth * sizeof(agent_state_t)] = {};
-    QueueHandle_t state_queue_ = nullptr;
     StaticQueue_t playback_notice_control_{};
     uint8_t playback_notice_storage_[kPlaybackNoticeDepth * sizeof(PlaybackNotice)] = {};
     QueueHandle_t playback_notice_queue_ = nullptr;
@@ -1251,6 +1527,7 @@ private:
     StreamBufferHandle_t play_buf_ = nullptr;
     portMUX_TYPE playback_mux_ = portMUX_INITIALIZER_UNLOCKED;
     xiaoli::PlaybackSession playback_;
+    xiaoli::PlaybackIngressGate playback_ingress_;
     bool play_abort_requested_ = false;
     bool play_abort_report_error_ = false;
 };

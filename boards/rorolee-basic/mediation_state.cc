@@ -151,6 +151,8 @@ ActionBatch MediationStateMachine::StartOrStopSpeaker(Button button) {
 ActionBatch MediationStateMachine::HandleLongPress() {
     ActionBatch batch{};
     const Speaker active = RecordingSpeaker(state_);
+    const bool completing_a = active == Speaker::kA;
+    const bool completing_b = active == Speaker::kB;
     if (active != Speaker::kNone) {
         AddAction(batch, ActionType::kStopRecording, active);
         state_ = MediationState::kWaiting;
@@ -175,7 +177,12 @@ ActionBatch MediationStateMachine::HandleLongPress() {
     }
 
     CancelEndStatus();
-    if (completed_a_ == 0 || completed_b_ == 0) {
+    // A long press while recording promises to close and save that utterance
+    // before mediation.  Treat the just-stopped speaker as provisionally
+    // present; the board defers the cloud request until its durable ACK and
+    // transcript arrive, and aborts the remaining actions if local stop fails.
+    if ((completed_a_ == 0 && !completing_a) ||
+        (completed_b_ == 0 && !completing_b)) {
         AddAction(batch, ActionType::kVibrate, Speaker::kNone, StatusId::kWaiting,
                   kErrorVibrateMs);
         AddAction(batch, ActionType::kShowStatus, Speaker::kNone,

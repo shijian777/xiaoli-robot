@@ -577,7 +577,20 @@ class DeviceGateway {
     }
     const device = connection.device;
     if (!this.#ownedCase(connection, message.caseId)) return;
-    if (this.#replayMessage(connection, message)) return;
+    const exactReplay = device.acks.has(message.messageId) &&
+      device.messageFingerprints.get(message.messageId) === messageFingerprint(message);
+    if (this.#replayMessage(connection, message)) {
+      const recording = device.activeRecording;
+      if (exactReplay && recording?.owner === connection && recording.replayAck &&
+          message.caseId === recording.meta.caseId && message.segmentId === recording.meta.segmentId) {
+        // An exact-ID firmware replay can hit the cached durable ACK before
+        // normal completion handling.  It still owns the replay stream opened
+        // by speech.start, so release that binding before accepting another
+        // segment on this connection.
+        device.activeRecording = null;
+      }
+      return;
+    }
     const recording = device.activeRecording;
     if (!recording || recording.owner !== connection) {
       const replay = device.segmentAcks.get(message.segmentId);
@@ -746,6 +759,10 @@ class DeviceGateway {
         this.#cases.failSegment(segment.segmentId, 'Transcription failed');
       } catch {}
       this.#broadcastError(device, 'transcription_failed', true, 'Recording transcription failed', segment.caseId, segment.segmentId);
+      // A retryable ASR failure is terminal for this segment, but not for the
+      // case.  Publish the stable waiting state so hardware can leave its
+      // recoverable error UI and let the same speaker record again.
+      this.#broadcastState(device, 'waiting', segment.caseId, segment.segmentId);
       this.#logger.error?.('Gateway transcription failed', {caseId: segment.caseId, segmentId: segment.segmentId, errorName: error?.name ?? 'Error'});
     } finally {
       await this.#tryRemoveOwnedTemp(wavPath);

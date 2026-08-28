@@ -9,6 +9,25 @@ namespace xiaoli {
 
 inline constexpr size_t kPcmFrameBytes = 640;
 inline constexpr size_t kMaxPlaybackBytes = 1'920'000;
+inline constexpr size_t kMaxTrackedSegments = 64;
+
+enum class AsrEndFailureAction : uint8_t {
+    kRetryIncompleteEnd,
+    kRestartLink,
+};
+
+AsrEndFailureAction EndFailureActionFor(bool complete);
+
+enum class BridgeErrorTarget : uint8_t {
+    kCaseWide,
+    kActiveRecording,
+    kReplay,
+    kStale,
+};
+
+BridgeErrorTarget ClassifyBridgeErrorTarget(const char* error_segment_id,
+                                             const char* active_segment_id,
+                                             const char* replay_segment_id);
 
 class BusinessIdGenerator {
 public:
@@ -61,6 +80,30 @@ private:
     uint64_t sent_ordinal_[kPendingSlotCount] = {};
 };
 
+class TranscriptTracker {
+public:
+    bool NoteDurable(const char* segment_id, Speaker speaker);
+    bool NoteSaved(const char* segment_id, Speaker speaker);
+    bool NoteFailed(const char* segment_id);
+    bool HasPending() const;
+    bool ReadyToMediate() const;
+    void Reset();
+
+private:
+    enum class Status : uint8_t { kEmpty, kPending, kSaved, kFailed };
+    struct Entry {
+        char segment_id[kIdCapacity] = {};
+        Speaker speaker = Speaker::kNone;
+        Status status = Status::kEmpty;
+    };
+
+    Entry* Find(const char* segment_id);
+    const Entry* Find(const char* segment_id) const;
+    Entry* Add(const char* segment_id, Speaker speaker, Status status);
+
+    Entry entries_[kMaxTrackedSegments] = {};
+};
+
 uint32_t ClampHapticDuration(uint32_t duration_ms);
 
 class PlaybackSession {
@@ -68,6 +111,7 @@ public:
     bool Begin(const char* case_id, uint32_t case_generation,
                uint32_t expected_bytes, uint32_t sample_rate,
                uint8_t bits, uint8_t channels);
+    bool ReserveChunks(size_t bytes, uint32_t chunks);
     bool ReserveChunk(size_t bytes);
     void FailIngress();
     bool AcceptChunk(size_t requested_bytes, size_t accepted_bytes);
@@ -98,6 +142,35 @@ private:
     bool active_ = false;
     bool incomplete_ = false;
     bool input_complete_ = false;
+};
+
+class PlaybackIngressGate {
+public:
+    bool Arm(const char* case_id, uint32_t expected_bytes,
+             uint32_t sample_rate, uint8_t bits, uint8_t channels);
+    bool ReserveChunk(size_t bytes);
+    void FailIngress();
+    bool Matches(const char* case_id, uint32_t expected_bytes,
+                 uint32_t sample_rate, uint8_t bits,
+                 uint8_t channels) const;
+    bool AdoptInto(PlaybackSession& playback);
+    void Reset();
+
+    bool armed() const { return armed_; }
+    bool incomplete() const { return incomplete_; }
+    uint32_t received_bytes() const { return received_bytes_; }
+    uint32_t chunk_count() const { return chunk_count_; }
+
+private:
+    char case_id_[kIdCapacity] = {};
+    uint32_t expected_bytes_ = 0;
+    uint32_t sample_rate_ = 0;
+    uint32_t received_bytes_ = 0;
+    uint32_t chunk_count_ = 0;
+    uint8_t bits_ = 0;
+    uint8_t channels_ = 0;
+    bool armed_ = false;
+    bool incomplete_ = false;
 };
 
 }  // namespace xiaoli
