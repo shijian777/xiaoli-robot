@@ -69,6 +69,16 @@ npm run fake-device
 
 The fake device reads `DEVICE_SHARED_TOKEN` from `.env.local` and never prints it. A successful exit occurs only after `audio.end` and the WAV has been saved.
 
+## Hardware-only local check
+
+Before real Agent Stack credentials are ready, the firmware can exercise the complete Wi-Fi path against a deterministic local service. Put only a local `DEVICE_SHARED_TOKEN` in the ignored `.env.local` file, use the same token in the device provisioning portal, then run:
+
+```powershell
+npm run hardware-mock
+```
+
+This mode binds the normal Bridge endpoint, advertises `xiaoli-bridge.local`, validates that each uploaded WAV contains non-silent PCM, returns deterministic A/B transcripts and mediation data, and sends a three-second rising tone to the device speaker. It does not contact Agent Stack and never prints the token. Replace this mode with `npm start` for the real cloud acceptance run.
+
 ## Privacy and local data lifetime
 
 - Secrets are read only from `.env.local` or the process environment. They are not embedded in source code or ordinary logs.
