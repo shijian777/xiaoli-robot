@@ -69,6 +69,7 @@ struct Event {
     Speaker speaker = Speaker::kNone;
     ErrorReason error = ErrorReason::kNetworkUnavailable;
     uint32_t case_generation = 0;
+    bool allow_new_case = true;
 };
 
 enum class ActionType : uint8_t {

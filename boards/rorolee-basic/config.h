@@ -53,6 +53,12 @@
 #define BUTTON_BOOT_PIN         GPIO_NUM_0
 #define BUTTON_VOL_UP_PIN       GPIO_NUM_39
 #define BUTTON_VOL_DOWN_PIN     GPIO_NUM_40
+#define BUTTON_PERSON_A_PIN     GPIO_NUM_40  // physical left key
+#define BUTTON_PERSON_B_PIN     GPIO_NUM_39  // physical right key
+
+static_assert(BUTTON_PERSON_A_PIN != BUTTON_PERSON_B_PIN);
+static_assert(BUTTON_PERSON_A_PIN != BUTTON_BOOT_PIN);
+static_assert(BUTTON_PERSON_B_PIN != BUTTON_BOOT_PIN);
 
 // motor
 #define HAPTIC_PIN              GPIO_NUM_1

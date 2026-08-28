@@ -215,7 +215,12 @@ ActionBatch MediationStateMachine::HandleButtonReleased(const Event& event) {
         batch = HandleLongPress();
     } else if (!case_long_fired_) {
         if (short_press_allowed_at_press_ && ShortCaseAllowed(state_)) {
-            batch = StartNewCase();
+            if (event.allow_new_case) {
+                batch = StartNewCase();
+            } else {
+                AddAction(batch, ActionType::kVibrate, Speaker::kNone,
+                          StatusId::kWaiting, kErrorVibrateMs);
+            }
         } else {
             AddAction(batch, ActionType::kVibrate, Speaker::kNone,
                       StatusId::kWaiting, kErrorVibrateMs);

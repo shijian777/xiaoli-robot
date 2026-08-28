@@ -1,11 +1,16 @@
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
 #include <vector>
 
+#include "bridge_message.h"
+#include "config.h"
 #include "mediation_state.h"
+#include "mediation_runtime.h"
+#include "pending_audio_store.h"
 #include "protocol.h"
 #include "unity.h"
 #include "wifi_provision.h"
@@ -1108,6 +1113,403 @@ TEST_CASE("WiFi mDNS ownership follows query state rather than hostname presence
     TEST_ASSERT_EQUAL_INT(1, missing.init_calls);
     TEST_ASSERT_TRUE(owned);
     TEST_ASSERT_EQUAL_STRING("ws://192.168.1.8:8788/device", resolved.c_str());
+}
+
+namespace {
+
+xiaoli::PendingSegmentMeta SegmentMeta(const char* case_id,
+                                       const char* segment_id,
+                                       const char* start_id,
+                                       const char* end_id,
+                                       xiaoli::Speaker speaker,
+                                       uint32_t generation) {
+    xiaoli::PendingSegmentMeta meta{};
+    snprintf(meta.case_id, sizeof(meta.case_id), "%s", case_id);
+    snprintf(meta.segment_id, sizeof(meta.segment_id), "%s", segment_id);
+    snprintf(meta.start_message_id, sizeof(meta.start_message_id), "%s", start_id);
+    snprintf(meta.end_message_id, sizeof(meta.end_message_id), "%s", end_id);
+    snprintf(meta.start_json, sizeof(meta.start_json),
+             "{\"v\":1,\"type\":\"speech.start\",\"messageId\":\"%s\","
+             "\"caseId\":\"%s\",\"segmentId\":\"%s\",\"speaker\":\"%s\","
+             "\"audio\":{\"sampleRate\":16000,\"bits\":16,\"channels\":1}}",
+             start_id, case_id, segment_id,
+             speaker == xiaoli::Speaker::kA ? "A" : "B");
+    meta.speaker = speaker;
+    meta.case_generation = generation;
+    return meta;
+}
+
+xiaoli::DurableAck Durable(const char* case_id, const char* segment_id,
+                           const char* message_id, uint32_t bytes,
+                           bool durable = true) {
+    xiaoli::DurableAck ack{};
+    snprintf(ack.case_id, sizeof(ack.case_id), "%s", case_id);
+    snprintf(ack.segment_id, sizeof(ack.segment_id), "%s", segment_id);
+    snprintf(ack.message_id, sizeof(ack.message_id), "%s", message_id);
+    ack.bytes = bytes;
+    ack.durable = durable;
+    return ack;
+}
+
+}  // namespace
+
+static_assert(BUTTON_PERSON_A_PIN == GPIO_NUM_40);
+static_assert(BUTTON_PERSON_B_PIN == GPIO_NUM_39);
+static_assert(BUTTON_BOOT_PIN == GPIO_NUM_0);
+static_assert(AUDIO_PA_EN == GPIO_NUM_3);
+static_assert(AUDIO_I2S_DIN == GPIO_NUM_12);
+static_assert(HAPTIC_PIN == GPIO_NUM_1);
+
+TEST_CASE("Pending audio accepts its exact capacity and atomically rejects overflow",
+          "[pending_audio]") {
+    std::array<uint8_t, 16> a{};
+    std::array<uint8_t, 16> b{};
+    xiaoli::PendingAudioStore store;
+    TEST_ASSERT_TRUE(store.InitWithBuffers(a.data(), b.data(), a.size()));
+
+    xiaoli::SlotId slot = xiaoli::kInvalidSlot;
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.Begin(
+            SegmentMeta("case-1", "segment-a", "start-a", "start-a-end",
+                        xiaoli::Speaker::kA, 7), &slot)));
+    const uint8_t exact[16] = {0, 1, 2, 3, 4, 5, 6, 7,
+                               8, 9, 10, 11, 12, 13, 14, 15};
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.Append(slot, exact, sizeof(exact))));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOverflow),
+        static_cast<uint8_t>(store.Append(slot, exact, 1)));
+    xiaoli::PendingSegmentView view{};
+    TEST_ASSERT_TRUE(store.Get(slot, &view));
+    TEST_ASSERT_EQUAL_UINT32(sizeof(exact), view.bytes);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(exact, view.pcm, sizeof(exact));
+}
+
+TEST_CASE("Pending audio keeps two speakers and replays complete slots oldest first",
+          "[pending_audio]") {
+    std::array<uint8_t, 8> a{};
+    std::array<uint8_t, 8> b{};
+    xiaoli::PendingAudioStore store;
+    TEST_ASSERT_TRUE(store.InitWithBuffers(a.data(), b.data(), a.size()));
+    xiaoli::SlotId first = xiaoli::kInvalidSlot;
+    xiaoli::SlotId second = xiaoli::kInvalidSlot;
+    const uint8_t pcm_a[] = {1, 2};
+    const uint8_t pcm_b[] = {3, 4, 5, 6};
+
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.Begin(SegmentMeta(
+            "case", "a", "sa", "sa-end", xiaoli::Speaker::kA, 3), &first)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.Append(first, pcm_a, sizeof(pcm_a))));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.MarkLocallyComplete(first)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.Begin(SegmentMeta(
+            "case", "b", "sb", "sb-end", xiaoli::Speaker::kB, 3), &second)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.Append(second, pcm_b, sizeof(pcm_b))));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.MarkLocallyComplete(second)));
+
+    xiaoli::SlotId third = xiaoli::kInvalidSlot;
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kNoFreeSlot),
+        static_cast<uint8_t>(store.Begin(SegmentMeta(
+            "other", "third", "sc", "sc-end", xiaoli::Speaker::kA, 4), &third)));
+    xiaoli::PendingSegmentView oldest{};
+    TEST_ASSERT_TRUE(store.OldestCompleteUnacked(&oldest));
+    TEST_ASSERT_EQUAL_UINT8(first, oldest.slot);
+    TEST_ASSERT_EQUAL_STRING("a", oldest.meta.segment_id);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::Speaker::kA),
+                            static_cast<uint8_t>(oldest.meta.speaker));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(pcm_a, oldest.pcm, sizeof(pcm_a));
+}
+
+TEST_CASE("Incomplete audio is zeroed and never enters replay iteration",
+          "[pending_audio]") {
+    std::array<uint8_t, 8> a{};
+    std::array<uint8_t, 8> b{};
+    xiaoli::PendingAudioStore store;
+    TEST_ASSERT_TRUE(store.InitWithBuffers(a.data(), b.data(), a.size()));
+    xiaoli::SlotId slot = xiaoli::kInvalidSlot;
+    const uint8_t pcm[] = {9, 8, 7, 6};
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.Begin(SegmentMeta(
+            "case", "bad", "start", "start-end", xiaoli::Speaker::kA, 1), &slot)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.Append(slot, pcm, sizeof(pcm))));
+    store.AbortIncomplete(slot);
+    TEST_ASSERT_TRUE(store.HasFreeSlot());
+    xiaoli::PendingSegmentView view{};
+    TEST_ASSERT_FALSE(store.OldestCompleteUnacked(&view));
+    TEST_ASSERT_EQUAL_UINT8(0, a[0]);
+    TEST_ASSERT_EQUAL_UINT8(0, a[1]);
+    TEST_ASSERT_EQUAL_UINT8(0, a[2]);
+    TEST_ASSERT_EQUAL_UINT8(0, a[3]);
+}
+
+TEST_CASE("Only the exact durable end ACK releases one pending segment",
+          "[pending_audio]") {
+    std::array<uint8_t, 8> a{};
+    std::array<uint8_t, 8> b{};
+    xiaoli::PendingAudioStore store;
+    TEST_ASSERT_TRUE(store.InitWithBuffers(a.data(), b.data(), a.size()));
+    xiaoli::SlotId first = xiaoli::kInvalidSlot;
+    xiaoli::SlotId second = xiaoli::kInvalidSlot;
+    const uint8_t pcm[] = {1, 2, 3, 4};
+    store.Begin(SegmentMeta("case", "a", "start-a", "start-a-end",
+                            xiaoli::Speaker::kA, 5), &first);
+    store.Append(first, pcm, sizeof(pcm));
+    store.MarkLocallyComplete(first);
+    store.Begin(SegmentMeta("case", "b", "start-b", "start-b-end",
+                            xiaoli::Speaker::kB, 5), &second);
+    store.Append(second, pcm, sizeof(pcm));
+    store.MarkLocallyComplete(second);
+
+    TEST_ASSERT_FALSE(store.ApplyDurableAck(Durable(
+        "case", "a", "start-a", sizeof(pcm), false)).released);
+    TEST_ASSERT_FALSE(store.ApplyDurableAck(Durable(
+        "wrong", "a", "start-a-end", sizeof(pcm))).released);
+    TEST_ASSERT_FALSE(store.ApplyDurableAck(Durable(
+        "case", "wrong", "start-a-end", sizeof(pcm))).released);
+    TEST_ASSERT_FALSE(store.ApplyDurableAck(Durable(
+        "case", "a", "wrong-end", sizeof(pcm))).released);
+    TEST_ASSERT_FALSE(store.ApplyDurableAck(Durable(
+        "case", "a", "start-a-end", sizeof(pcm) + 2)).released);
+    TEST_ASSERT_EQUAL_UINT8(2, store.CompleteCount());
+
+    const auto released = store.ApplyDurableAck(Durable(
+        "case", "a", "start-a-end", sizeof(pcm)));
+    TEST_ASSERT_TRUE(released.released);
+    TEST_ASSERT_EQUAL_UINT8(first, released.slot);
+    TEST_ASSERT_NOT_EQUAL(0, released.insertion_ordinal);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::Speaker::kA),
+                            static_cast<uint8_t>(released.speaker));
+    TEST_ASSERT_EQUAL_UINT32(5, released.case_generation);
+    TEST_ASSERT_EQUAL_UINT32(sizeof(pcm), released.bytes);
+    TEST_ASSERT_EQUAL_UINT8(1, store.CompleteCount());
+    TEST_ASSERT_FALSE(store.ApplyDurableAck(Durable(
+        "case", "a", "start-a-end", sizeof(pcm))).released);
+    xiaoli::PendingSegmentView oldest{};
+    TEST_ASSERT_TRUE(store.OldestCompleteUnacked(&oldest));
+    TEST_ASSERT_EQUAL_STRING("b", oldest.meta.segment_id);
+}
+
+TEST_CASE("Business IDs are boot-epoch unique and require committed storage",
+          "[mediation_runtime]") {
+    const uint8_t mac[6] = {0xaa, 0xbb, 0xcc, 0x01, 0x02, 0x03};
+    xiaoli::BusinessIdGenerator boot_one;
+    xiaoli::BusinessIdGenerator boot_two;
+    xiaoli::BusinessIdGenerator failed;
+    TEST_ASSERT_TRUE(boot_one.Initialize(mac, 41, true));
+    TEST_ASSERT_TRUE(boot_two.Initialize(mac, 42, true));
+    TEST_ASSERT_FALSE(failed.Initialize(mac, 43, false));
+    char case_one[xiaoli::kIdCapacity] = {};
+    char case_two[xiaoli::kIdCapacity] = {};
+    char message_one[xiaoli::kIdCapacity] = {};
+    char message_two[xiaoli::kIdCapacity] = {};
+    TEST_ASSERT_TRUE(boot_one.NextCase(case_one, sizeof(case_one)));
+    TEST_ASSERT_TRUE(boot_two.NextCase(case_two, sizeof(case_two)));
+    TEST_ASSERT_TRUE(boot_one.NextMessage(message_one, sizeof(message_one)));
+    TEST_ASSERT_TRUE(boot_two.NextMessage(message_two, sizeof(message_two)));
+    TEST_ASSERT_NOT_EQUAL(0, strcmp(case_one, case_two));
+    TEST_ASSERT_NOT_EQUAL(0, strcmp(message_one, message_two));
+    TEST_ASSERT_FALSE(failed.NextCase(case_one, sizeof(case_one)));
+}
+
+TEST_CASE("Replay cursor retries the same 640 byte frame without advancing",
+          "[mediation_runtime]") {
+    xiaoli::ReplayFrameCursor cursor;
+    cursor.Reset(1300);
+    TEST_ASSERT_EQUAL_UINT32(0, cursor.offset());
+    TEST_ASSERT_EQUAL_UINT16(0, cursor.sequence());
+    TEST_ASSERT_EQUAL_UINT32(640, cursor.CurrentBytes());
+    cursor.OnTimeout();
+    TEST_ASSERT_EQUAL_UINT32(0, cursor.offset());
+    TEST_ASSERT_EQUAL_UINT16(0, cursor.sequence());
+    cursor.CommitSuccess();
+    TEST_ASSERT_EQUAL_UINT32(640, cursor.offset());
+    TEST_ASSERT_EQUAL_UINT16(1, cursor.sequence());
+    TEST_ASSERT_EQUAL_UINT32(640, cursor.CurrentBytes());
+    cursor.CommitSuccess();
+    TEST_ASSERT_EQUAL_UINT32(20, cursor.CurrentBytes());
+    cursor.CommitSuccess();
+    TEST_ASSERT_TRUE(cursor.done());
+    TEST_ASSERT_EQUAL_UINT16(3, cursor.sequence());
+}
+
+TEST_CASE("Connection replay ledger suppresses immediate resend until reconnect",
+          "[mediation_runtime]") {
+    xiaoli::ConnectionReplayLedger ledger;
+    constexpr xiaoli::SlotId slot = 1;
+    constexpr uint64_t ordinal = 42;
+    TEST_ASSERT_FALSE(ledger.WasSent(slot, ordinal));
+    ledger.MarkSent(slot, ordinal);
+    TEST_ASSERT_TRUE(ledger.WasSent(slot, ordinal));
+    TEST_ASSERT_FALSE(ledger.WasSent(slot, ordinal + 1));
+    ledger.Reset();
+    TEST_ASSERT_FALSE(ledger.WasSent(slot, ordinal));
+}
+
+TEST_CASE("Durable retry ACK can recover an end-admission error without losing count",
+          "[mediation_state]") {
+    MediationStateMachine machine;
+    machine.Handle(StateEvent(EventType::kBoot, 0));
+    ShortCase(machine, 1, 2);
+    const uint32_t generation = machine.case_generation();
+    Event error = CaseEvent(EventType::kRecoverableError, generation, 3);
+    error.error = ErrorReason::kNetworkUnavailable;
+    machine.Handle(error);
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<uint8_t>(MediationState::kRecoverableError),
+        static_cast<uint8_t>(machine.state()));
+
+    machine.Handle(AckEvent(Speaker::kA, generation, 4));
+    TEST_ASSERT_EQUAL_UINT16(1, machine.completed_a());
+    machine.Handle(CaseEvent(EventType::kRecovered, generation, 5));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(MediationState::kWaiting),
+                            static_cast<uint8_t>(machine.state()));
+}
+
+TEST_CASE("Bridge parser accepts exact durable ACK and rejects unsafe variants",
+          "[bridge_message]") {
+    const char exact[] =
+        "{\"v\":1,\"type\":\"ack\",\"messageId\":\"end-a\","
+        "\"caseId\":\"case\",\"segmentId\":\"a\",\"bytes\":640,\"durable\":true}";
+    xiaoli::BridgeMessage message{};
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeParseResult::kOk),
+        static_cast<uint8_t>(xiaoli::ParseBridgeMessage(
+            reinterpret_cast<const uint8_t*>(exact), strlen(exact), &message)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeMessageType::kAck),
+                            static_cast<uint8_t>(message.type));
+    TEST_ASSERT_TRUE(message.has_durable);
+    TEST_ASSERT_TRUE(message.durable);
+    TEST_ASSERT_TRUE(message.has_bytes);
+    TEST_ASSERT_EQUAL_UINT32(640, message.bytes);
+    TEST_ASSERT_EQUAL_STRING("end-a", message.message_id);
+
+    const char trailing[] =
+        "{\"v\":1,\"type\":\"ack\",\"messageId\":\"x\",\"caseId\":\"c\","
+        "\"segmentId\":\"s\",\"bytes\":2,\"durable\":true}garbage";
+    const char wrong_type[] =
+        "{\"v\":1,\"type\":\"ack\",\"messageId\":9,\"caseId\":\"c\","
+        "\"segmentId\":\"s\",\"bytes\":2,\"durable\":true}";
+    const char overflow[] =
+        "{\"v\":1,\"type\":\"ack\",\"messageId\":\"x\",\"caseId\":\"c\","
+        "\"segmentId\":\"s\",\"bytes\":4294967296,\"durable\":true}";
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeParseResult::kInvalid),
+        static_cast<uint8_t>(xiaoli::ParseBridgeMessage(
+            reinterpret_cast<const uint8_t*>(trailing), strlen(trailing), &message)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeParseResult::kInvalid),
+        static_cast<uint8_t>(xiaoli::ParseBridgeMessage(
+            reinterpret_cast<const uint8_t*>(wrong_type), strlen(wrong_type), &message)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeParseResult::kInvalid),
+        static_cast<uint8_t>(xiaoli::ParseBridgeMessage(
+            reinterpret_cast<const uint8_t*>(overflow), strlen(overflow), &message)));
+    std::array<uint8_t, xiaoli::kMaxBridgeMessageBytes + 1> oversized{};
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeParseResult::kOversized),
+        static_cast<uint8_t>(xiaoli::ParseBridgeMessage(
+            oversized.data(), oversized.size(), &message)));
+}
+
+TEST_CASE("Bridge parser distinguishes harmless state transcript and start ACK",
+          "[bridge_message]") {
+    xiaoli::BridgeMessage message{};
+    const char start_ack[] =
+        "{\"v\":1,\"type\":\"ack\",\"messageId\":\"start\","
+        "\"caseId\":\"case\",\"segmentId\":\"a\",\"accepted\":true}";
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeParseResult::kOk),
+        static_cast<uint8_t>(xiaoli::ParseBridgeMessage(
+            reinterpret_cast<const uint8_t*>(start_ack), strlen(start_ack), &message)));
+    TEST_ASSERT_TRUE(message.has_accepted);
+    TEST_ASSERT_FALSE(message.has_durable);
+    const char transcript[] =
+        "{\"v\":1,\"type\":\"transcript.saved\",\"caseId\":\"case\","
+        "\"segmentId\":\"a\",\"speaker\":\"A\"}";
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeParseResult::kOk),
+        static_cast<uint8_t>(xiaoli::ParseBridgeMessage(
+            reinterpret_cast<const uint8_t*>(transcript), strlen(transcript), &message)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeMessageType::kTranscriptSaved),
+                            static_cast<uint8_t>(message.type));
+    const char state[] =
+        "{\"v\":1,\"type\":\"state\",\"state\":\"transcribing\","
+        "\"caseId\":\"case\",\"segmentId\":\"a\"}";
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeParseResult::kOk),
+        static_cast<uint8_t>(xiaoli::ParseBridgeMessage(
+            reinterpret_cast<const uint8_t*>(state), strlen(state), &message)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeMessageType::kState),
+                            static_cast<uint8_t>(message.type));
+}
+
+TEST_CASE("Playback completion waits for validated end metadata and local drain",
+          "[mediation_runtime]") {
+    xiaoli::PlaybackSession playback;
+    TEST_ASSERT_TRUE(playback.Begin("case", 9, 20000, 16000, 16, 1));
+    TEST_ASSERT_TRUE(playback.AcceptChunk(12000, 12000));
+    TEST_ASSERT_TRUE(playback.AcceptChunk(8000, 8000));
+    TEST_ASSERT_FALSE(playback.AcceptEnd("other", 20000, 1, true));
+    TEST_ASSERT_FALSE(playback.AcceptEnd("case", 19998, 1, true));
+    TEST_ASSERT_FALSE(playback.AcceptEnd("case", 20000, 0, true));
+    TEST_ASSERT_FALSE(playback.AcceptEnd("case", 20000, 1, false));
+    TEST_ASSERT_TRUE(playback.AcceptEnd("case", 20000, 1, true));
+    TEST_ASSERT_TRUE(playback.MarkWritten(20000));
+    TEST_ASSERT_FALSE(playback.ReadyToFinish(false));
+    TEST_ASSERT_TRUE(playback.ReadyToFinish(true));
+    TEST_ASSERT_EQUAL_UINT32(9, playback.case_generation());
+}
+
+TEST_CASE("Playback accepts bursts beyond 16 KiB and fails closed on overflow",
+          "[mediation_runtime]") {
+    xiaoli::PlaybackSession playback;
+    TEST_ASSERT_TRUE(playback.Begin("case", 1, xiaoli::kMaxPlaybackBytes,
+                                    16000, 16, 1));
+    TEST_ASSERT_TRUE(playback.AcceptChunk(20000, 20000));
+    TEST_ASSERT_EQUAL_UINT32(20000, playback.received_bytes());
+    TEST_ASSERT_FALSE(playback.AcceptChunk(xiaoli::kMaxPlaybackBytes, 0));
+    TEST_ASSERT_TRUE(playback.incomplete());
+    TEST_ASSERT_FALSE(playback.ReadyToFinish(true));
+    TEST_ASSERT_FALSE(playback.Begin("case", 1, xiaoli::kMaxPlaybackBytes + 2,
+                                     16000, 16, 1));
+}
+
+TEST_CASE("Playback ingress accounting precedes a deterministically interleaved reader",
+          "[mediation_runtime]") {
+    xiaoli::PlaybackSession playback;
+    TEST_ASSERT_TRUE(playback.Begin("case", 2, 640, 16000, 16, 1));
+
+    // Producer reserves before publishing to the stream buffer.  A reader
+    // that runs immediately afterwards must be able to account the bytes.
+    TEST_ASSERT_TRUE(playback.ReserveChunk(640));
+    TEST_ASSERT_TRUE(playback.MarkWritten(640));
+    TEST_ASSERT_TRUE(playback.AcceptEnd("case", 640, 0, true));
+    TEST_ASSERT_TRUE(playback.ReadyToFinish(true));
+
+    TEST_ASSERT_TRUE(playback.Begin("case", 3, 640, 16000, 16, 1));
+    TEST_ASSERT_TRUE(playback.ReserveChunk(640));
+    playback.FailIngress();
+    TEST_ASSERT_TRUE(playback.incomplete());
+    TEST_ASSERT_FALSE(playback.ReadyToFinish(true));
+}
+
+TEST_CASE("Haptic duration clamps without delay semantics", "[mediation_runtime]") {
+    TEST_ASSERT_EQUAL_UINT32(20, xiaoli::ClampHapticDuration(0));
+    TEST_ASSERT_EQUAL_UINT32(20, xiaoli::ClampHapticDuration(19));
+    TEST_ASSERT_EQUAL_UINT32(120, xiaoli::ClampHapticDuration(120));
+    TEST_ASSERT_EQUAL_UINT32(3000, xiaoli::ClampHapticDuration(4000));
+}
+
+TEST_CASE("New case can be denied before state generation changes", "[mediation_state]") {
+    MediationStateMachine machine;
+    machine.Handle(StateEvent(EventType::kBoot, 0));
+    ShortCase(machine, 1, 2);
+    const uint32_t generation = machine.case_generation();
+    Event press = ButtonEvent(EventType::kButtonPressed, Button::kCase, 10);
+    Event release = ButtonEvent(EventType::kButtonReleased, Button::kCase, 11);
+    release.allow_new_case = false;
+    machine.Handle(press);
+    const auto batch = machine.Handle(release);
+    TEST_ASSERT_EQUAL_UINT8(1, batch.count);
+    AssertAction(batch, 0, ActionType::kVibrate, Speaker::kNone,
+                 StatusId::kWaiting, xiaoli::kErrorVibrateMs);
+    TEST_ASSERT_EQUAL_UINT32(generation, machine.case_generation());
 }
 
 extern "C" void app_main(void) {
