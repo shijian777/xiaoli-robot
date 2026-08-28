@@ -66,6 +66,7 @@ constexpr uint32_t kBridgeRetryMaxMs = 30000;
 constexpr uint32_t kHelloAckTimeoutMs = 5000;
 constexpr uint32_t kWorkerPollMs = 100;
 constexpr size_t kRxItemCapacity = 8;
+constexpr size_t kCallbackItemCapacity = 24;
 
 constexpr EventBits_t kWsGotIp = BIT0;
 constexpr EventBits_t kWsConnected = BIT1;
@@ -108,6 +109,17 @@ struct TxItem {
 
 using RxItem = xiaoli::wifi::CompleteMessage;
 
+enum class CallbackKind : uint8_t { kConnection, kControl, kStream };
+
+struct CallbackItem {
+    CallbackKind kind = CallbackKind::kConnection;
+    bool connected = false;
+    bool counted = false;
+    agent_stream_t stream = AGENT_STREAM_VOICE;
+    uint32_t generation = 0;
+    std::vector<uint8_t> payload;
+};
+
 QueueHandle_t s_tx_queue = nullptr;
 QueueHandle_t s_rx_queue = nullptr;
 SemaphoreHandle_t s_tx_lock = nullptr;
@@ -116,11 +128,14 @@ SemaphoreHandle_t s_worker_done = nullptr;
 EventGroupHandle_t s_ws_events = nullptr;
 TaskHandle_t s_ws_worker = nullptr;
 esp_websocket_client_handle_t s_ws_client = nullptr;
+QueueHandle_t s_callback_queue = nullptr;
+TaskHandle_t s_callback_worker = nullptr;
 
 xiaoli::wifi::TxQueuePolicy s_tx_policy;
 xiaoli::wifi::UplinkStreams s_uplink;
 xiaoli::wifi::FragmentAssembler s_fragments;
 xiaoli::wifi::VoiceRxTracker s_voice_rx;
+xiaoli::wifi::PublicCallBarrier s_public_calls;
 
 std::atomic<bool> s_got_ip{false};
 std::atomic<bool> s_ws_connected{false};
@@ -130,12 +145,16 @@ std::atomic<bool> s_stopping{false};
 std::atomic<bool> s_ready_announced{false};
 std::atomic<bool> s_destroying_client{false};
 std::atomic<int64_t> s_hello_deadline_us{0};
+std::atomic<size_t> s_callback_queued{0};
+std::atomic<uint32_t> s_callback_generation{0};
+std::atomic<bool> s_callbacks_active{false};
 
 uint8_t s_rx_control_sequence = 0;
 uint32_t s_boot_nonce = 0;
 uint32_t s_client_generation = 0;
 uint32_t s_bridge_retry_ms = kReconnectBaseMs;
 bool s_mdns_owned = false;
+std::mutex s_lifecycle_mtx;
 std::string s_mac12;
 std::string s_device_id;
 std::string s_hello_message_id;
@@ -273,6 +292,15 @@ private:
     bool locked_;
 };
 
+class PublicCallGuard {
+public:
+    PublicCallGuard() : entered_(s_public_calls.TryEnter()) {}
+    ~PublicCallGuard() { if (entered_) s_public_calls.Exit(); }
+    bool entered() const { return entered_; }
+private:
+    bool entered_;
+};
+
 void SignalWs(EventBits_t bits) {
     if (s_ws_events != nullptr) xEventGroupSetBits(s_ws_events, bits);
 }
@@ -321,8 +349,101 @@ void DrainRxQueue() {
     while (xQueueReceive(s_rx_queue, &item, 0) == pdTRUE) delete item;
 }
 
+void CallbackWorker(void*) {
+    while (true) {
+        CallbackItem* item = nullptr;
+        if (xQueueReceive(s_callback_queue, &item, portMAX_DELAY) != pdTRUE || item == nullptr) {
+            continue;
+        }
+        if (item->counted) s_callback_queued.fetch_sub(1, std::memory_order_acq_rel);
+        const bool current = item->generation ==
+                             s_callback_generation.load(std::memory_order_acquire);
+        const bool deliver = current &&
+                             (s_callbacks_active.load(std::memory_order_acquire) ||
+                              (item->kind == CallbackKind::kConnection && !item->connected));
+        if (!deliver) {
+            delete item;
+            continue;
+        }
+        switch (item->kind) {
+        case CallbackKind::kConnection:
+            if (s_on_conn != nullptr) s_on_conn(item->connected);
+            break;
+        case CallbackKind::kControl:
+            if (s_on_recv != nullptr) s_on_recv(item->payload.data(), item->payload.size());
+            break;
+        case CallbackKind::kStream:
+            if (s_on_stream != nullptr) {
+                s_on_stream(item->stream, item->payload.data(), item->payload.size());
+            }
+            break;
+        }
+        delete item;
+    }
+}
+
+bool InitializeCallbackWorker() {
+    if (s_callback_worker != nullptr) return true;
+    if (s_callback_queue == nullptr) {
+        s_callback_queue = xQueueCreate(kCallbackItemCapacity, sizeof(CallbackItem*));
+        if (s_callback_queue == nullptr) return false;
+    }
+    if (xTaskCreate(&CallbackWorker, "al_ws_callback", 8192, nullptr, 5,
+                    &s_callback_worker) == pdPASS) {
+        return true;
+    }
+    vQueueDelete(s_callback_queue);
+    s_callback_queue = nullptr;
+    return false;
+}
+
+bool QueueCallback(CallbackItem* item, bool reserve_disconnect_slot = true) {
+    if (item == nullptr || s_callback_queue == nullptr) {
+        delete item;
+        return false;
+    }
+    if (reserve_disconnect_slot) {
+        size_t queued = s_callback_queued.load(std::memory_order_acquire);
+        do {
+            if (queued >= kCallbackItemCapacity - 1) {
+                delete item;
+                return false;
+            }
+        } while (!s_callback_queued.compare_exchange_weak(
+            queued, queued + 1, std::memory_order_acq_rel, std::memory_order_acquire));
+        item->counted = true;
+    }
+    if (xQueueSend(s_callback_queue, &item, 0) == pdTRUE) return true;
+    if (item->counted) s_callback_queued.fetch_sub(1, std::memory_order_acq_rel);
+    delete item;
+    return false;
+}
+
+bool QueueConnectionCallback(bool connected) {
+    if (s_on_conn == nullptr) return true;
+    auto* item = new (std::nothrow) CallbackItem;
+    if (item == nullptr) return false;
+    item->kind = CallbackKind::kConnection;
+    item->connected = connected;
+    item->generation = s_callback_generation.load(std::memory_order_acquire);
+    return QueueCallback(item, connected);
+}
+
+bool QueueDataCallback(CallbackKind kind, agent_stream_t stream,
+                       const uint8_t* data, size_t len) {
+    auto* item = new (std::nothrow) CallbackItem;
+    if (item == nullptr) return false;
+    item->kind = kind;
+    item->stream = stream;
+    item->generation = s_callback_generation.load(std::memory_order_acquire);
+    if (len > 0) item->payload.assign(data, data + len);
+    return QueueCallback(item);
+}
+
 void PublishDisconnected() {
-    if (s_ready_announced.exchange(false) && s_on_conn != nullptr) s_on_conn(false);
+    if (s_ready_announced.exchange(false) && !QueueConnectionCallback(false)) {
+        ESP_LOGE(TAG, "could not enqueue disconnect callback");
+    }
 }
 
 bool IsHelloAckMessage(const uint8_t* data, size_t len) {
@@ -362,7 +483,11 @@ void DispatchText(const uint8_t* data, size_t len) {
         0x7e, s_rx_control_sequence, data, len);
     if (command.empty()) return;
     ++s_rx_control_sequence;
-    if (s_on_recv != nullptr) s_on_recv(command.data(), command.size());
+    if (s_on_recv != nullptr &&
+        !QueueDataCallback(CallbackKind::kControl, AGENT_STREAM_VOICE,
+                           command.data(), command.size())) {
+        MarkConnectionUnusable();
+    }
 }
 
 void DispatchBinary(const uint8_t* data, size_t len) {
@@ -373,7 +498,11 @@ void DispatchBinary(const uint8_t* data, size_t len) {
         return;
     }
     if (frame.kind == xiaoli::WireKind::kControl) {
-        if (s_on_recv != nullptr) s_on_recv(frame.payload, frame.payload_len);
+        if (s_on_recv != nullptr &&
+            !QueueDataCallback(CallbackKind::kControl, AGENT_STREAM_VOICE,
+                               frame.payload, frame.payload_len)) {
+            MarkConnectionUnusable();
+        }
         return;
     }
     if (frame.kind == xiaoli::WireKind::kStreamChunk) {
@@ -382,8 +511,10 @@ void DispatchBinary(const uint8_t* data, size_t len) {
             s_voice_rx.Reset();
             return;
         }
-        if (s_on_stream != nullptr) {
-            s_on_stream(AGENT_STREAM_VOICE, frame.payload, frame.payload_len);
+        if (s_on_stream != nullptr &&
+            !QueueDataCallback(CallbackKind::kStream, AGENT_STREAM_VOICE,
+                               frame.payload, frame.payload_len)) {
+            MarkConnectionUnusable();
         }
         return;
     }
@@ -396,7 +527,11 @@ void DispatchBinary(const uint8_t* data, size_t len) {
         const uint8_t status[] = {0, 0, 0, 0, 3};
         const std::vector<uint8_t> command = agentlink::BuildCommand(
             0x05, static_cast<uint8_t>(frame.sequence), status, sizeof(status));
-        if (!command.empty() && s_on_recv != nullptr) s_on_recv(command.data(), command.size());
+        if (!command.empty() && s_on_recv != nullptr &&
+            !QueueDataCallback(CallbackKind::kControl, AGENT_STREAM_VOICE,
+                               command.data(), command.size())) {
+            MarkConnectionUnusable();
+        }
         return;
     }
     s_voice_rx.Reset();
@@ -456,24 +591,8 @@ esp_err_t MdnsResolve(const char* host, uint32_t timeout_ms, uint32_t* ipv4_be, 
     return result;
 }
 
-bool EndpointUsesMdns(const std::string& endpoint) {
-    const size_t authority = endpoint.find("ws://");
-    const size_t path = endpoint.find('/', authority == std::string::npos ? 0 : authority + 5);
-    const size_t host_end = endpoint.find(':', authority == std::string::npos ? 0 : authority + 5);
-    const size_t end = host_end != std::string::npos && host_end < path ? host_end : path;
-    if (authority != 0 || end == std::string::npos || end < 11) return false;
-    return endpoint.compare(end - 6, 6, ".local") == 0;
-}
-
-esp_err_t EnsureMdns() {
-    if (s_mdns_owned) return ESP_OK;
-    char hostname[64] = {};
-    const esp_err_t prior = mdns_hostname_get(hostname);
-    if (prior == ESP_OK) return ESP_OK;
-    if (prior != ESP_ERR_INVALID_STATE) return prior;
-    const esp_err_t result = mdns_init();
-    if (result == ESP_OK) s_mdns_owned = true;
-    return result;
+esp_err_t MdnsInit(void*) {
+    return mdns_init();
 }
 
 esp_err_t ResolveConfiguredEndpoint(std::string& resolved) {
@@ -482,11 +601,8 @@ esp_err_t ResolveConfiguredEndpoint(std::string& resolved) {
         std::lock_guard<std::mutex> lock(s_cred_mtx);
         endpoint = s_endpoint;
     }
-    if (EndpointUsesMdns(endpoint)) {
-        esp_err_t result = EnsureMdns();
-        if (result != ESP_OK) return result;
-    }
-    return xiaoli::wifi::ResolveEndpoint(endpoint.c_str(), &MdnsResolve, nullptr, resolved);
+    return xiaoli::wifi::ResolveEndpointWithMdnsOwnership(
+        endpoint.c_str(), &MdnsResolve, &MdnsInit, nullptr, s_mdns_owned, resolved);
 }
 
 bool BuildIdentity() {
@@ -672,7 +788,10 @@ void WebSocketWorker(void*) {
             s_got_ip.load() && s_ws_connected.load()) {
             s_accepting.store(true);
             s_bridge_retry_ms = kReconnectBaseMs;
-            if (!s_ready_announced.exchange(true) && s_on_conn != nullptr) s_on_conn(true);
+            if (!s_ready_announced.exchange(true) && !QueueConnectionCallback(true)) {
+                ESP_LOGE(TAG, "could not enqueue ready callback");
+                MarkConnectionUnusable();
+            }
         }
 
         if ((bits & kWsTxReady) != 0) DrainTransmit();
@@ -734,6 +853,7 @@ esp_err_t QueueReserved(xiaoli::wifi::OutboundMessage&& message) {
 
 bool InitializeWebSocketWorker() {
     if (s_ws_worker != nullptr) return true;
+    if (!InitializeCallbackWorker()) return false;
     s_tx_queue = xQueueCreate(xiaoli::wifi::kTxItemCapacity, sizeof(TxItem*));
     s_rx_queue = xQueueCreate(kRxItemCapacity, sizeof(RxItem*));
     s_tx_lock = xSemaphoreCreateMutex();
@@ -934,18 +1054,23 @@ void StartProvisioning() {
 
 // agent_transport_t interface
 esp_err_t wifi_start(void* /*impl*/) {
+    std::lock_guard<std::mutex> lifecycle(s_lifecycle_mtx);
     if (!InitializeWebSocketWorker()) {
         DeleteWebSocketWorkerResources();
         return ESP_ERR_NO_MEM;
     }
     esp_err_t r = WifiInitOnce();
     if (r != ESP_OK) {
+        s_public_calls.Close();
         s_stopping.store(true);
         SignalWs(kWsStop);
         if (s_worker_done) xSemaphoreTake(s_worker_done, pdMS_TO_TICKS(5000));
         DeleteWebSocketWorkerResources();
         return r;
     }
+    s_public_calls.Open();
+    s_callback_generation.fetch_add(1, std::memory_order_acq_rel);
+    s_callbacks_active.store(true, std::memory_order_release);
 
     al_prov_settings_t settings = {};
     if (BuildEffectiveSettings(settings)) {
@@ -959,6 +1084,9 @@ esp_err_t wifi_start(void* /*impl*/) {
 }
 
 void wifi_stop(void* /*impl*/) {
+    std::lock_guard<std::mutex> lifecycle(s_lifecycle_mtx);
+    s_public_calls.Close();
+    s_callbacks_active.store(false, std::memory_order_release);
     s_stopping.store(true);
     s_accepting.store(false);
     s_got_ip.store(false);
@@ -967,6 +1095,9 @@ void wifi_stop(void* /*impl*/) {
     SignalWs(kWsStop);
     if (s_worker_done != nullptr) {
         (void)xSemaphoreTake(s_worker_done, portMAX_DELAY);
+    }
+    while (s_public_calls.in_flight() != 0) {
+        vTaskDelay(1);
     }
     if (s_mdns_owned) {
         mdns_free();
@@ -981,6 +1112,8 @@ void wifi_stop(void* /*impl*/) {
 
 // Control plane
 esp_err_t wifi_send_ctrl(void* /*impl*/, const uint8_t* frame, size_t len) {
+    PublicCallGuard call;
+    if (!call.entered()) return ESP_ERR_INVALID_STATE;
     if (!s_accepting.load()) return ESP_ERR_INVALID_STATE;
     xiaoli::wifi::OutboundMessage message;
     esp_err_t result = xiaoli::wifi::EncodeControl(frame, len, message);
@@ -989,6 +1122,8 @@ esp_err_t wifi_send_ctrl(void* /*impl*/, const uint8_t* frame, size_t len) {
 }
 esp_err_t wifi_stream_start(void* /*impl*/, agent_stream_t type,
                             const uint8_t* meta, size_t meta_len) {
+    PublicCallGuard call;
+    if (!call.entered()) return ESP_ERR_INVALID_STATE;
     if (!s_accepting.load()) return ESP_ERR_INVALID_STATE;
     const TickType_t started = xTaskGetTickCount();
     const TickType_t wait_ticks = pdMS_TO_TICKS(xiaoli::wifi::kReservedAdmissionWaitMs);
@@ -1019,6 +1154,8 @@ esp_err_t wifi_stream_start(void* /*impl*/, agent_stream_t type,
 }
 esp_err_t wifi_send_stream(void* /*impl*/, agent_stream_t type,
                            const uint8_t* data, size_t len) {
+    PublicCallGuard call;
+    if (!call.entered()) return ESP_ERR_INVALID_STATE;
     if (!s_accepting.load()) return ESP_ERR_INVALID_STATE;
     TxLockGuard lock;
     if (!lock.locked() || !s_accepting.load()) return ESP_ERR_INVALID_STATE;
@@ -1037,6 +1174,8 @@ esp_err_t wifi_send_stream(void* /*impl*/, agent_stream_t type,
 }
 esp_err_t wifi_stream_end(void* /*impl*/, agent_stream_t type, bool complete,
                           const uint8_t* meta, size_t meta_len) {
+    PublicCallGuard call;
+    if (!call.entered()) return ESP_ERR_INVALID_STATE;
     if (!s_accepting.load()) return ESP_ERR_INVALID_STATE;
     const TickType_t started = xTaskGetTickCount();
     const TickType_t wait_ticks = pdMS_TO_TICKS(xiaoli::wifi::kReservedAdmissionWaitMs);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -57,6 +58,20 @@ private:
     size_t queued_items_ = 0;
     size_t queued_audio_items_ = 0;
     size_t queued_bytes_ = 0;
+};
+
+class PublicCallBarrier {
+public:
+    void Open();
+    void Close();
+    bool TryEnter();
+    size_t Exit();
+    size_t in_flight() const;
+
+private:
+    static constexpr size_t kClosed = size_t{1} << (sizeof(size_t) * 8 - 1);
+    static constexpr size_t kCountMask = ~kClosed;
+    std::atomic<size_t> state_{kClosed};
 };
 
 class UplinkStreams {
@@ -132,8 +147,14 @@ private:
 
 using EndpointResolver = esp_err_t (*)(const char* host, uint32_t timeout_ms,
                                        uint32_t* ipv4_be, void* context);
+using EndpointInitializer = esp_err_t (*)(void* context);
 
 esp_err_t ResolveEndpoint(const char* endpoint, EndpointResolver resolver,
                           void* context, std::string& resolved);
+esp_err_t ResolveEndpointWithMdnsOwnership(const char* endpoint,
+                                            EndpointResolver resolver,
+                                            EndpointInitializer initializer,
+                                            void* context, bool& owned,
+                                            std::string& resolved);
 
 }  // namespace xiaoli::wifi

@@ -996,6 +996,71 @@ TEST_CASE("Nonmonotonic state events do not mutate state counters or button armi
     TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(StateEvent(EventType::kTick, 3198)).count);
 }
 
+TEST_CASE("WiFi public call barrier rejects entrants after stop and drains existing calls",
+          "[wifi_transport]") {
+    xiaoli::wifi::PublicCallBarrier barrier;
+    barrier.Open();
+    TEST_ASSERT_TRUE(barrier.TryEnter());
+    TEST_ASSERT_TRUE(barrier.TryEnter());
+    barrier.Close();
+    TEST_ASSERT_FALSE(barrier.TryEnter());
+    TEST_ASSERT_EQUAL_UINT32(2, barrier.in_flight());
+    TEST_ASSERT_EQUAL_UINT32(1, barrier.Exit());
+    TEST_ASSERT_EQUAL_UINT32(0, barrier.Exit());
+    TEST_ASSERT_EQUAL_UINT32(0, barrier.in_flight());
+
+    barrier.Open();
+    TEST_ASSERT_TRUE(barrier.TryEnter());
+    TEST_ASSERT_EQUAL_UINT32(0, barrier.Exit());
+}
+
+namespace {
+struct MdnsOwnershipFixture {
+    int resolve_calls = 0;
+    int init_calls = 0;
+    bool initially_missing = false;
+};
+
+esp_err_t OwnershipResolve(const char*, uint32_t, uint32_t* address, void* raw) {
+    auto* fixture = static_cast<MdnsOwnershipFixture*>(raw);
+    ++fixture->resolve_calls;
+    if (fixture->initially_missing && fixture->resolve_calls == 1) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    *address = 0xc0a80108;
+    return fixture->initially_missing ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t OwnershipInit(void* raw) {
+    auto* fixture = static_cast<MdnsOwnershipFixture*>(raw);
+    ++fixture->init_calls;
+    return ESP_OK;
+}
+}  // namespace
+
+TEST_CASE("WiFi mDNS ownership follows query state rather than hostname presence",
+          "[wifi_transport]") {
+    std::string resolved;
+    bool owned = false;
+    MdnsOwnershipFixture existing;
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND, xiaoli::wifi::ResolveEndpointWithMdnsOwnership(
+        "ws://xiaoli-bridge.local:8788/device", &OwnershipResolve, &OwnershipInit,
+        &existing, owned, resolved));
+    TEST_ASSERT_EQUAL_INT(1, existing.resolve_calls);
+    TEST_ASSERT_EQUAL_INT(0, existing.init_calls);
+    TEST_ASSERT_FALSE(owned);
+
+    MdnsOwnershipFixture missing;
+    missing.initially_missing = true;
+    TEST_ASSERT_EQUAL(ESP_OK, xiaoli::wifi::ResolveEndpointWithMdnsOwnership(
+        "ws://xiaoli-bridge.local:8788/device", &OwnershipResolve, &OwnershipInit,
+        &missing, owned, resolved));
+    TEST_ASSERT_EQUAL_INT(2, missing.resolve_calls);
+    TEST_ASSERT_EQUAL_INT(1, missing.init_calls);
+    TEST_ASSERT_TRUE(owned);
+    TEST_ASSERT_EQUAL_STRING("ws://192.168.1.8:8788/device", resolved.c_str());
+}
+
 extern "C" void app_main(void) {
     UNITY_BEGIN();
     unity_run_all_tests();

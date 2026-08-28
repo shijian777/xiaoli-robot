@@ -191,6 +191,34 @@ void TxQueuePolicy::Reset() {
     queued_bytes_ = 0;
 }
 
+void PublicCallBarrier::Open() {
+    state_.store(0, std::memory_order_release);
+}
+
+void PublicCallBarrier::Close() {
+    state_.fetch_or(kClosed, std::memory_order_acq_rel);
+}
+
+bool PublicCallBarrier::TryEnter() {
+    size_t state = state_.load(std::memory_order_acquire);
+    while ((state & kClosed) == 0) {
+        if ((state & kCountMask) == kCountMask) return false;
+        if (state_.compare_exchange_weak(
+                state, state + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t PublicCallBarrier::Exit() {
+    return (state_.fetch_sub(1, std::memory_order_acq_rel) & kCountMask) - 1;
+}
+
+size_t PublicCallBarrier::in_flight() const {
+    return state_.load(std::memory_order_acquire) & kCountMask;
+}
+
 bool UplinkStreams::ValidType(agent_stream_t type) {
     return static_cast<unsigned>(type) < 5;
 }
@@ -424,6 +452,20 @@ esp_err_t ResolveEndpoint(const char* endpoint, EndpointResolver resolver,
     if (colon != nullptr) resolved.append(colon, path);
     resolved += path;
     return ESP_OK;
+}
+
+esp_err_t ResolveEndpointWithMdnsOwnership(const char* endpoint,
+                                            EndpointResolver resolver,
+                                            EndpointInitializer initializer,
+                                            void* context, bool& owned,
+                                            std::string& resolved) {
+    esp_err_t result = ResolveEndpoint(endpoint, resolver, context, resolved);
+    if (result != ESP_ERR_INVALID_STATE) return result;
+    if (initializer == nullptr) return ESP_ERR_INVALID_ARG;
+    result = initializer(context);
+    if (result != ESP_OK) return result;
+    owned = true;
+    return ResolveEndpoint(endpoint, resolver, context, resolved);
 }
 
 }  // namespace xiaoli::wifi
