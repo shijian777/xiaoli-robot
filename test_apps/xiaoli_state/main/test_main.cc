@@ -2,8 +2,10 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
+#include "mediation_state.h"
 #include "protocol.h"
 #include "unity.h"
 #include "wifi_provision.h"
@@ -500,6 +502,453 @@ TEST_CASE("WiFi mDNS resolution strips local suffix and retains URI structure", 
         "ws://xiaoli-bridge.local:8788/device", &TestResolve, &queried, resolved));
     TEST_ASSERT_EQUAL_STRING("xiaoli-bridge", queried.c_str());
     TEST_ASSERT_EQUAL_STRING("ws://192.168.1.8:8788/device", resolved.c_str());
+}
+
+namespace {
+
+using xiaoli::ActionBatch;
+using xiaoli::ActionType;
+using xiaoli::Button;
+using xiaoli::ButtonDebouncer;
+using xiaoli::ErrorReason;
+using xiaoli::Event;
+using xiaoli::EventType;
+using xiaoli::MediationState;
+using xiaoli::MediationStateMachine;
+using xiaoli::Speaker;
+using xiaoli::StatusId;
+
+Event StateEvent(EventType type, uint64_t now_ms = 0) {
+    Event event{};
+    event.type = type;
+    event.now_ms = now_ms;
+    return event;
+}
+
+Event ButtonEvent(EventType type, Button button, uint64_t now_ms) {
+    Event event = StateEvent(type, now_ms);
+    event.button = button;
+    return event;
+}
+
+Event CaseEvent(EventType type, uint32_t generation, uint64_t now_ms) {
+    Event event = StateEvent(type, now_ms);
+    event.case_generation = generation;
+    return event;
+}
+
+Event AckEvent(Speaker speaker, uint32_t generation, uint64_t now_ms) {
+    Event event = CaseEvent(EventType::kSegmentDurableAck, generation, now_ms);
+    event.speaker = speaker;
+    return event;
+}
+
+void AssertSafeBatch(const ActionBatch& batch) {
+    TEST_ASSERT_LESS_OR_EQUAL_UINT8(xiaoli::kMaxActions, batch.count);
+    for (uint8_t i = 0; i < batch.count; ++i) {
+        TEST_ASSERT_NOT_EQUAL(static_cast<uint8_t>(ActionType::kNone),
+                              static_cast<uint8_t>(batch.items[i].type));
+    }
+}
+
+void AssertAction(const ActionBatch& batch, uint8_t index, ActionType type,
+                  Speaker speaker = Speaker::kNone,
+                  StatusId status = StatusId::kWaiting,
+                  uint32_t duration_ms = 0) {
+    AssertSafeBatch(batch);
+    TEST_ASSERT_GREATER_THAN_UINT8(index, batch.count);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(type),
+                           static_cast<uint8_t>(batch.items[index].type));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(speaker),
+                           static_cast<uint8_t>(batch.items[index].speaker));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(status),
+                           static_cast<uint8_t>(batch.items[index].status));
+    TEST_ASSERT_EQUAL_UINT32(duration_ms, batch.items[index].duration_ms);
+}
+
+ActionBatch ShortCase(MediationStateMachine& machine, uint64_t press_ms,
+                      uint64_t release_ms) {
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(
+        ButtonEvent(EventType::kButtonPressed, Button::kCase, press_ms)).count);
+    return machine.Handle(
+        ButtonEvent(EventType::kButtonReleased, Button::kCase, release_ms));
+}
+
+void AddDurablePair(MediationStateMachine& machine, uint64_t now_ms) {
+    const uint32_t generation = machine.case_generation();
+    machine.Handle(AckEvent(Speaker::kA, generation, now_ms));
+    machine.Handle(AckEvent(Speaker::kB, generation, now_ms + 1));
+}
+
+}  // namespace
+
+static_assert(std::is_trivially_destructible_v<xiaoli::MediationStateMachine>);
+static_assert(std::is_trivially_destructible_v<xiaoli::ButtonDebouncer>);
+static_assert(std::is_trivially_destructible_v<xiaoli::Event>);
+static_assert(std::is_trivially_destructible_v<xiaoli::ActionBatch>);
+
+TEST_CASE("Mediation status text is fixed and heap-free", "[mediation_state]") {
+    TEST_ASSERT_EQUAL_STRING("欢迎来到小理天秤官", xiaoli::StatusText(StatusId::kWelcome));
+    TEST_ASSERT_EQUAL_STRING("小理开始倾听", xiaoli::StatusText(StatusId::kWaiting));
+    TEST_ASSERT_EQUAL_STRING("小理开始倾听A发言", xiaoli::StatusText(StatusId::kRecordingA));
+    TEST_ASSERT_EQUAL_STRING("小理开始倾听B发言", xiaoli::StatusText(StatusId::kRecordingB));
+    TEST_ASSERT_EQUAL_STRING("A发言结束", xiaoli::StatusText(StatusId::kStatementEndedA));
+    TEST_ASSERT_EQUAL_STRING("B发言结束", xiaoli::StatusText(StatusId::kStatementEndedB));
+    TEST_ASSERT_EQUAL_STRING("小理调解中", xiaoli::StatusText(StatusId::kMediating));
+    TEST_ASSERT_EQUAL_STRING("请先短按侧边键创建案件", xiaoli::StatusText(StatusId::kNeedCase));
+    TEST_ASSERT_EQUAL_STRING("请先收集双方发言", xiaoli::StatusText(StatusId::kNeedBothStatements));
+    TEST_ASSERT_EQUAL_STRING("网络连接不可用，请稍后重试", xiaoli::StatusText(StatusId::kNetworkUnavailable));
+    TEST_ASSERT_EQUAL_STRING("录音不完整，请重新发言", xiaoli::StatusText(StatusId::kRecordingIncomplete));
+    TEST_ASSERT_EQUAL_STRING("录音缓存已满，请稍后重试", xiaoli::StatusText(StatusId::kAudioCapacity));
+    TEST_ASSERT_EQUAL_STRING("调解失败，请稍后重试", xiaoli::StatusText(StatusId::kMediationFailed));
+}
+
+TEST_CASE("Debouncer honors 39 40 ms boundaries and fixed edge order", "[mediation_state]") {
+    ButtonDebouncer debounce;
+    debounce.Reset(0, 0);
+    TEST_ASSERT_EQUAL_UINT8(0, debounce.Sample(0, 0x07).count);
+    TEST_ASSERT_EQUAL_UINT8(0, debounce.Sample(39, 0x07).count);
+    const auto pressed = debounce.Sample(40, 0x07);
+    TEST_ASSERT_EQUAL_UINT8(3, pressed.count);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(Button::kCase),
+                            static_cast<uint8_t>(pressed.items[0].button));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(Button::kPersonA),
+                            static_cast<uint8_t>(pressed.items[1].button));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(Button::kPersonB),
+                            static_cast<uint8_t>(pressed.items[2].button));
+    for (uint8_t i = 0; i < pressed.count; ++i) {
+        TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(EventType::kButtonPressed),
+                               static_cast<uint8_t>(pressed.items[i].type));
+        TEST_ASSERT_TRUE(pressed.items[i].now_ms == 40);
+    }
+    TEST_ASSERT_EQUAL_UINT8(0, debounce.Sample(400, 0x07).count);
+    TEST_ASSERT_EQUAL_UINT8(0, debounce.Sample(401, 0).count);
+    TEST_ASSERT_EQUAL_UINT8(0, debounce.Sample(440, 0).count);
+    const auto released = debounce.Sample(441, 0);
+    TEST_ASSERT_EQUAL_UINT8(3, released.count);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(EventType::kButtonReleased),
+                           static_cast<uint8_t>(released.items[0].type));
+}
+
+TEST_CASE("Debouncer restarts after bounce and rejects time reversal", "[mediation_state]") {
+    ButtonDebouncer debounce;
+    debounce.Reset(0, 0);
+    TEST_ASSERT_EQUAL_UINT8(0, debounce.Sample(0, 0x01).count);
+    TEST_ASSERT_EQUAL_UINT8(0, debounce.Sample(39, 0).count);
+    TEST_ASSERT_EQUAL_UINT8(0, debounce.Sample(40, 0x01).count);
+    TEST_ASSERT_EQUAL_UINT8(0, debounce.Sample(79, 0x01).count);
+    TEST_ASSERT_EQUAL_UINT8(1, debounce.Sample(80, 0x01).count);
+    TEST_ASSERT_EQUAL_UINT8(0, debounce.Sample(79, 0).count);
+    TEST_ASSERT_EQUAL_UINT8(0, debounce.Sample(120, 0x01).count);
+
+    debounce.Reset(200, 0x02);
+    TEST_ASSERT_EQUAL_UINT8(0, debounce.Sample(300, 0x02).count);
+    TEST_ASSERT_EQUAL_UINT8(0, debounce.Sample(301, 0).count);
+    const auto held_release = debounce.Sample(341, 0);
+    TEST_ASSERT_EQUAL_UINT8(1, held_release.count);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(Button::kPersonA),
+                            static_cast<uint8_t>(held_release.items[0].button));
+}
+
+TEST_CASE("Boot short case and generation reset preserve strict lifecycle", "[mediation_state]") {
+    MediationStateMachine machine;
+    auto batch = machine.Handle(StateEvent(EventType::kBoot, 1));
+    TEST_ASSERT_EQUAL_UINT8(1, batch.count);
+    AssertAction(batch, 0, ActionType::kShowStatus, Speaker::kNone, StatusId::kWelcome);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(MediationState::kWelcome),
+                           static_cast<uint8_t>(machine.state()));
+    TEST_ASSERT_FALSE(machine.has_case());
+
+    batch = ShortCase(machine, 10, 3009);
+    TEST_ASSERT_EQUAL_UINT8(2, batch.count);
+    AssertAction(batch, 0, ActionType::kNewCase);
+    AssertAction(batch, 1, ActionType::kShowStatus, Speaker::kNone, StatusId::kWaiting);
+    TEST_ASSERT_NOT_EQUAL(0, batch.items[0].case_generation);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(MediationState::kWaiting),
+                           static_cast<uint8_t>(machine.state()));
+    const uint32_t first_generation = machine.case_generation();
+
+    machine.Handle(AckEvent(Speaker::kA, first_generation, 3010));
+    machine.Handle(AckEvent(Speaker::kB, first_generation, 3011));
+    batch = ShortCase(machine, 3020, 3021);
+    TEST_ASSERT_EQUAL_UINT8(2, batch.count);
+    TEST_ASSERT_NOT_EQUAL(first_generation, machine.case_generation());
+    TEST_ASSERT_EQUAL_UINT16(0, machine.completed_a());
+    TEST_ASSERT_EQUAL_UINT16(0, machine.completed_b());
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(AckEvent(
+        Speaker::kA, first_generation, 3022)).count);
+    TEST_ASSERT_EQUAL_UINT16(0, machine.completed_a());
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(CaseEvent(
+        EventType::kAudioStart, first_generation, 3023)).count);
+}
+
+TEST_CASE("Case long press uses exact 2999 3000 ms boundary once", "[mediation_state]") {
+    MediationStateMachine machine;
+    machine.Handle(StateEvent(EventType::kBoot, 0));
+    const auto no_case_press = machine.Handle(
+        ButtonEvent(EventType::kButtonPressed, Button::kCase, 10));
+    TEST_ASSERT_EQUAL_UINT8(0, no_case_press.count);
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(StateEvent(EventType::kTick, 3009)).count);
+    auto batch = machine.Handle(StateEvent(EventType::kTick, 3010));
+    TEST_ASSERT_EQUAL_UINT8(2, batch.count);
+    AssertAction(batch, 0, ActionType::kVibrate, Speaker::kNone,
+                 StatusId::kWaiting, xiaoli::kErrorVibrateMs);
+    AssertAction(batch, 1, ActionType::kShowStatus, Speaker::kNone, StatusId::kNeedCase);
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(StateEvent(EventType::kTick, 9000)).count);
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(ButtonEvent(
+        EventType::kButtonReleased, Button::kCase, 9001)).count);
+
+    batch = ShortCase(machine, 9010, 12009);
+    TEST_ASSERT_EQUAL_UINT8(2, batch.count);
+    const uint32_t generation = machine.case_generation();
+    machine.Handle(AckEvent(Speaker::kA, generation, 12010));
+    machine.Handle(AckEvent(Speaker::kB, generation, 12011));
+    machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kCase, 13000));
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(StateEvent(EventType::kTick, 15999)).count);
+    batch = machine.Handle(StateEvent(EventType::kTick, 16000));
+    TEST_ASSERT_EQUAL_UINT8(2, batch.count);
+    AssertAction(batch, 0, ActionType::kRequestMediation);
+    TEST_ASSERT_EQUAL_UINT32(generation, batch.items[0].case_generation);
+    AssertAction(batch, 1, ActionType::kShowStatus, Speaker::kNone, StatusId::kMediating);
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(StateEvent(EventType::kTick, 16001)).count);
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(ButtonEvent(
+        EventType::kButtonReleased, Button::kCase, 17000)).count);
+}
+
+TEST_CASE("Release at long boundary decides long while 2999 remains short", "[mediation_state]") {
+    MediationStateMachine short_machine;
+    short_machine.Handle(StateEvent(EventType::kBoot, 0));
+    auto batch = ShortCase(short_machine, 100, 3099);
+    TEST_ASSERT_EQUAL_UINT8(2, batch.count);
+    AssertAction(batch, 0, ActionType::kNewCase);
+
+    MediationStateMachine long_machine;
+    long_machine.Handle(StateEvent(EventType::kBoot, 0));
+    ShortCase(long_machine, 10, 20);
+    AddDurablePair(long_machine, 21);
+    long_machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kCase, 100));
+    batch = long_machine.Handle(ButtonEvent(
+        EventType::kButtonReleased, Button::kCase, 3100));
+    TEST_ASSERT_EQUAL_UINT8(2, batch.count);
+    AssertAction(batch, 0, ActionType::kRequestMediation);
+    TEST_ASSERT_EQUAL_UINT8(0, long_machine.Handle(ButtonEvent(
+        EventType::kButtonReleased, Button::kCase, 3101)).count);
+}
+
+TEST_CASE("Speaker buttons toggle only their side and reject the opposite side", "[mediation_state]") {
+    MediationStateMachine machine;
+    machine.Handle(StateEvent(EventType::kBoot, 0));
+    ShortCase(machine, 1, 2);
+
+    auto batch = machine.Handle(ButtonEvent(
+        EventType::kButtonPressed, Button::kPersonA, 3));
+    TEST_ASSERT_EQUAL_UINT8(2, batch.count);
+    AssertAction(batch, 0, ActionType::kStartRecording, Speaker::kA);
+    AssertAction(batch, 1, ActionType::kShowStatus, Speaker::kNone, StatusId::kRecordingA);
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(ButtonEvent(
+        EventType::kButtonReleased, Button::kPersonA, 4)).count);
+    batch = machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kPersonB, 5));
+    TEST_ASSERT_EQUAL_UINT8(1, batch.count);
+    AssertAction(batch, 0, ActionType::kVibrate, Speaker::kNone,
+                 StatusId::kWaiting, xiaoli::kErrorVibrateMs);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(MediationState::kRecordingA),
+                           static_cast<uint8_t>(machine.state()));
+    batch = machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kPersonA, 6));
+    TEST_ASSERT_EQUAL_UINT8(2, batch.count);
+    AssertAction(batch, 0, ActionType::kStopRecording, Speaker::kA);
+    TEST_ASSERT_EQUAL_UINT16(0, machine.completed_a());
+
+    batch = machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kPersonB, 7));
+    AssertAction(batch, 0, ActionType::kStartRecording, Speaker::kB);
+    batch = machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kPersonA, 8));
+    TEST_ASSERT_EQUAL_UINT8(1, batch.count);
+    AssertAction(batch, 0, ActionType::kVibrate, Speaker::kNone,
+                 StatusId::kWaiting, xiaoli::kErrorVibrateMs);
+    batch = machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kPersonB, 9));
+    AssertAction(batch, 0, ActionType::kStopRecording, Speaker::kB);
+    TEST_ASSERT_EQUAL_UINT16(0, machine.completed_b());
+}
+
+TEST_CASE("Durable ACK alone counts and owns the nonblocking five second status", "[mediation_state]") {
+    MediationStateMachine machine;
+    machine.Handle(StateEvent(EventType::kBoot, 0));
+    ShortCase(machine, 1, 2);
+    const uint32_t generation = machine.case_generation();
+
+    auto batch = machine.Handle(AckEvent(Speaker::kA, generation, 100));
+    TEST_ASSERT_EQUAL_UINT8(1, batch.count);
+    AssertAction(batch, 0, ActionType::kShowStatus, Speaker::kNone,
+                 StatusId::kStatementEndedA);
+    TEST_ASSERT_EQUAL_UINT16(1, machine.completed_a());
+    TEST_ASSERT_EQUAL_UINT16(0, machine.completed_b());
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(StateEvent(EventType::kTick, 5099)).count);
+    batch = machine.Handle(StateEvent(EventType::kTick, 5100));
+    TEST_ASSERT_EQUAL_UINT8(1, batch.count);
+    AssertAction(batch, 0, ActionType::kShowStatus, Speaker::kNone, StatusId::kWaiting);
+
+    machine.Handle(AckEvent(Speaker::kA, generation, 6000));
+    batch = machine.Handle(AckEvent(Speaker::kB, generation, 10000));
+    AssertAction(batch, 0, ActionType::kShowStatus, Speaker::kNone,
+                 StatusId::kStatementEndedB);
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(StateEvent(EventType::kTick, 14999)).count);
+    TEST_ASSERT_EQUAL_UINT8(1, machine.Handle(StateEvent(EventType::kTick, 15000)).count);
+    TEST_ASSERT_EQUAL_UINT16(2, machine.completed_a());
+    TEST_ASSERT_EQUAL_UINT16(1, machine.completed_b());
+
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(AckEvent(
+        Speaker::kNone, generation, 15001)).count);
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(AckEvent(
+        Speaker::kA, generation - 1, 15002)).count);
+}
+
+TEST_CASE("ACK status never overwrites active recording mediation playback or error", "[mediation_state]") {
+    MediationStateMachine machine;
+    machine.Handle(StateEvent(EventType::kBoot, 0));
+    ShortCase(machine, 1, 2);
+    const uint32_t generation = machine.case_generation();
+    machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kPersonA, 10));
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(AckEvent(Speaker::kA, generation, 11)).count);
+    TEST_ASSERT_EQUAL_UINT16(1, machine.completed_a());
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(StateEvent(EventType::kTick, 10000)).count);
+    machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kPersonA, 10001));
+    machine.Handle(AckEvent(Speaker::kB, generation, 10002));
+    machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kCase, 10003));
+    machine.Handle(StateEvent(EventType::kTick, 13003));
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(AckEvent(Speaker::kA, generation, 13004)).count);
+    machine.Handle(CaseEvent(EventType::kAudioStart, generation, 13005));
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(AckEvent(Speaker::kB, generation, 13006)).count);
+    Event error = CaseEvent(EventType::kRecoverableError, generation, 13007);
+    error.error = ErrorReason::kMediationFailed;
+    machine.Handle(error);
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(AckEvent(Speaker::kA, generation, 13008)).count);
+}
+
+TEST_CASE("Mediation gate rejects missing side and orders stop before request", "[mediation_state]") {
+    MediationStateMachine missing;
+    missing.Handle(StateEvent(EventType::kBoot, 0));
+    ShortCase(missing, 1, 2);
+    missing.Handle(AckEvent(Speaker::kA, missing.case_generation(), 3));
+    missing.Handle(ButtonEvent(EventType::kButtonPressed, Button::kPersonB, 4));
+    missing.Handle(ButtonEvent(EventType::kButtonPressed, Button::kCase, 5));
+    auto batch = missing.Handle(StateEvent(EventType::kTick, 3005));
+    TEST_ASSERT_EQUAL_UINT8(3, batch.count);
+    AssertAction(batch, 0, ActionType::kStopRecording, Speaker::kB);
+    AssertAction(batch, 1, ActionType::kVibrate, Speaker::kNone,
+                 StatusId::kWaiting, xiaoli::kErrorVibrateMs);
+    AssertAction(batch, 2, ActionType::kShowStatus, Speaker::kNone,
+                 StatusId::kNeedBothStatements);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(MediationState::kWaiting),
+                           static_cast<uint8_t>(missing.state()));
+    TEST_ASSERT_EQUAL_UINT16(0, missing.completed_b());
+
+    missing.Handle(ButtonEvent(EventType::kButtonReleased, Button::kCase, 3006));
+    missing.Handle(AckEvent(Speaker::kB, missing.case_generation(), 3007));
+    missing.Handle(ButtonEvent(EventType::kButtonPressed, Button::kPersonA, 3008));
+    missing.Handle(ButtonEvent(EventType::kButtonPressed, Button::kCase, 3009));
+    batch = missing.Handle(StateEvent(EventType::kTick, 6009));
+    TEST_ASSERT_EQUAL_UINT8(3, batch.count);
+    AssertAction(batch, 0, ActionType::kStopRecording, Speaker::kA);
+    AssertAction(batch, 1, ActionType::kRequestMediation);
+    AssertAction(batch, 2, ActionType::kShowStatus, Speaker::kNone, StatusId::kMediating);
+}
+
+TEST_CASE("Playback accepts only current generation and preserves the case", "[mediation_state]") {
+    MediationStateMachine machine;
+    machine.Handle(StateEvent(EventType::kBoot, 0));
+    ShortCase(machine, 1, 2);
+    const uint32_t generation = machine.case_generation();
+    AddDurablePair(machine, 3);
+    machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kCase, 10));
+    machine.Handle(StateEvent(EventType::kTick, 3010));
+
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(CaseEvent(
+        EventType::kAudioStart, generation + 1, 3011)).count);
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(CaseEvent(
+        EventType::kAudioStart, generation, 3012)).count);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(MediationState::kPlaying),
+                           static_cast<uint8_t>(machine.state()));
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(CaseEvent(
+        EventType::kAudioStart, generation, 3013)).count);
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(CaseEvent(
+        EventType::kAudioEnd, generation + 1, 3014)).count);
+    const auto batch = machine.Handle(CaseEvent(EventType::kAudioEnd, generation, 3015));
+    TEST_ASSERT_EQUAL_UINT8(1, batch.count);
+    AssertAction(batch, 0, ActionType::kShowStatus, Speaker::kNone, StatusId::kWaiting);
+    TEST_ASSERT_EQUAL_UINT16(1, machine.completed_a());
+    TEST_ASSERT_EQUAL_UINT16(1, machine.completed_b());
+    TEST_ASSERT_EQUAL_UINT32(generation, machine.case_generation());
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(CaseEvent(
+        EventType::kAudioEnd, generation, 3016)).count);
+}
+
+TEST_CASE("Active short case presses are rejected without data loss", "[mediation_state]") {
+    MediationStateMachine machine;
+    machine.Handle(StateEvent(EventType::kBoot, 0));
+    ShortCase(machine, 1, 2);
+    const uint32_t generation = machine.case_generation();
+    AddDurablePair(machine, 3);
+    machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kPersonA, 10));
+    auto batch = ShortCase(machine, 11, 12);
+    TEST_ASSERT_EQUAL_UINT8(1, batch.count);
+    AssertAction(batch, 0, ActionType::kVibrate, Speaker::kNone,
+                 StatusId::kWaiting, xiaoli::kErrorVibrateMs);
+    TEST_ASSERT_EQUAL_UINT32(generation, machine.case_generation());
+    TEST_ASSERT_EQUAL_UINT16(1, machine.completed_a());
+    TEST_ASSERT_EQUAL_UINT16(1, machine.completed_b());
+}
+
+TEST_CASE("Recoverable errors stop recording map whitelist and recover safely", "[mediation_state]") {
+    MediationStateMachine machine;
+    machine.Handle(StateEvent(EventType::kBoot, 0));
+    Event error = StateEvent(EventType::kRecoverableError, 1);
+    error.error = ErrorReason::kNetworkUnavailable;
+    auto batch = machine.Handle(error);
+    TEST_ASSERT_EQUAL_UINT8(2, batch.count);
+    AssertAction(batch, 0, ActionType::kVibrate, Speaker::kNone,
+                 StatusId::kWaiting, xiaoli::kErrorVibrateMs);
+    AssertAction(batch, 1, ActionType::kShowStatus, Speaker::kNone,
+                 StatusId::kNetworkUnavailable);
+    batch = machine.Handle(StateEvent(EventType::kRecovered, 2));
+    AssertAction(batch, 0, ActionType::kShowStatus, Speaker::kNone, StatusId::kWelcome);
+
+    ShortCase(machine, 3, 4);
+    const uint32_t generation = machine.case_generation();
+    machine.Handle(AckEvent(Speaker::kA, generation, 5));
+    machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kPersonB, 6));
+    error = CaseEvent(EventType::kRecoverableError, generation, 7);
+    error.error = ErrorReason::kRecordingIncomplete;
+    batch = machine.Handle(error);
+    TEST_ASSERT_EQUAL_UINT8(3, batch.count);
+    AssertAction(batch, 0, ActionType::kStopRecording, Speaker::kB);
+    AssertAction(batch, 1, ActionType::kVibrate, Speaker::kNone,
+                 StatusId::kWaiting, xiaoli::kErrorVibrateMs);
+    AssertAction(batch, 2, ActionType::kShowStatus, Speaker::kNone,
+                 StatusId::kRecordingIncomplete);
+    TEST_ASSERT_EQUAL_UINT16(1, machine.completed_a());
+    TEST_ASSERT_EQUAL_UINT16(0, machine.completed_b());
+
+    error = CaseEvent(EventType::kRecoverableError, generation, 8);
+    error.error = ErrorReason::kAudioCapacity;
+    batch = machine.Handle(error);
+    TEST_ASSERT_EQUAL_UINT8(2, batch.count);
+    AssertAction(batch, 1, ActionType::kShowStatus, Speaker::kNone, StatusId::kAudioCapacity);
+    batch = machine.Handle(StateEvent(EventType::kRecovered, 9));
+    AssertAction(batch, 0, ActionType::kShowStatus, Speaker::kNone, StatusId::kWaiting);
+    TEST_ASSERT_EQUAL_UINT32(generation, machine.case_generation());
+}
+
+TEST_CASE("Nonmonotonic state events do not mutate state counters or button arming", "[mediation_state]") {
+    MediationStateMachine machine;
+    machine.Handle(StateEvent(EventType::kBoot, 100));
+    ShortCase(machine, 101, 102);
+    const uint32_t generation = machine.case_generation();
+    machine.Handle(AckEvent(Speaker::kA, generation, 200));
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(AckEvent(Speaker::kB, generation, 199)).count);
+    TEST_ASSERT_EQUAL_UINT16(1, machine.completed_a());
+    TEST_ASSERT_EQUAL_UINT16(0, machine.completed_b());
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(ButtonEvent(
+        EventType::kButtonPressed, Button::kCase, 198)).count);
+    TEST_ASSERT_EQUAL_UINT8(0, machine.Handle(StateEvent(EventType::kTick, 3198)).count);
 }
 
 extern "C" void app_main(void) {
