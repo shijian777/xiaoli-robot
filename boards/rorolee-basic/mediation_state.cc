@@ -44,6 +44,12 @@ Speaker RecordingSpeaker(MediationState state) {
     return Speaker::kNone;
 }
 
+bool ShortCaseAllowed(MediationState state) {
+    return state == MediationState::kWelcome ||
+           state == MediationState::kWaiting ||
+           state == MediationState::kRecoverableError;
+}
+
 uint64_t DeadlineAfter(uint64_t now_ms, uint32_t delay_ms) {
     constexpr uint64_t kMax = std::numeric_limits<uint64_t>::max();
     return now_ms > kMax - delay_ms ? kMax : now_ms + delay_ms;
@@ -190,6 +196,7 @@ ActionBatch MediationStateMachine::HandleButtonPressed(const Event& event) {
             case_button_down_ = true;
             case_long_fired_ = false;
             case_pressed_at_ms_ = event.now_ms;
+            short_press_allowed_at_press_ = ShortCaseAllowed(state_);
         }
         return ActionBatch{};
     }
@@ -207,9 +214,7 @@ ActionBatch MediationStateMachine::HandleButtonReleased(const Event& event) {
         case_long_fired_ = true;
         batch = HandleLongPress();
     } else if (!case_long_fired_) {
-        if (state_ == MediationState::kWelcome ||
-            state_ == MediationState::kWaiting ||
-            state_ == MediationState::kRecoverableError) {
+        if (short_press_allowed_at_press_ && ShortCaseAllowed(state_)) {
             batch = StartNewCase();
         } else {
             AddAction(batch, ActionType::kVibrate, Speaker::kNone,
@@ -218,6 +223,7 @@ ActionBatch MediationStateMachine::HandleButtonReleased(const Event& event) {
     }
     case_button_down_ = false;
     case_long_fired_ = false;
+    short_press_allowed_at_press_ = false;
     return batch;
 }
 
@@ -235,6 +241,7 @@ ActionBatch MediationStateMachine::Handle(const Event& event) {
         has_case_ = false;
         case_button_down_ = false;
         case_long_fired_ = false;
+        short_press_allowed_at_press_ = false;
         CancelEndStatus();
         ActionBatch batch{};
         AddAction(batch, ActionType::kShowStatus, Speaker::kNone, StatusId::kWelcome);

@@ -897,6 +897,51 @@ TEST_CASE("Active short case presses are rejected without data loss", "[mediatio
     TEST_ASSERT_EQUAL_UINT16(1, machine.completed_b());
 }
 
+TEST_CASE("Case press begun while recording cannot reset after recording stops", "[mediation_state]") {
+    MediationStateMachine machine;
+    machine.Handle(StateEvent(EventType::kBoot, 0));
+    ShortCase(machine, 1, 2);
+    const uint32_t generation = machine.case_generation();
+    AddDurablePair(machine, 3);
+    machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kPersonA, 10));
+    machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kCase, 11));
+    const auto stopped = machine.Handle(ButtonEvent(
+        EventType::kButtonPressed, Button::kPersonA, 12));
+    AssertAction(stopped, 0, ActionType::kStopRecording, Speaker::kA);
+
+    const auto released = machine.Handle(ButtonEvent(
+        EventType::kButtonReleased, Button::kCase, 13));
+    TEST_ASSERT_EQUAL_UINT8(1, released.count);
+    AssertAction(released, 0, ActionType::kVibrate, Speaker::kNone,
+                 StatusId::kWaiting, xiaoli::kErrorVibrateMs);
+    TEST_ASSERT_EQUAL_UINT32(generation, machine.case_generation());
+    TEST_ASSERT_EQUAL_UINT16(1, machine.completed_a());
+    TEST_ASSERT_EQUAL_UINT16(1, machine.completed_b());
+}
+
+TEST_CASE("Case press begun while playing cannot reset after audio ends", "[mediation_state]") {
+    MediationStateMachine machine;
+    machine.Handle(StateEvent(EventType::kBoot, 0));
+    ShortCase(machine, 1, 2);
+    const uint32_t generation = machine.case_generation();
+    AddDurablePair(machine, 3);
+    machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kCase, 10));
+    machine.Handle(StateEvent(EventType::kTick, 3010));
+    machine.Handle(ButtonEvent(EventType::kButtonReleased, Button::kCase, 3011));
+    machine.Handle(CaseEvent(EventType::kAudioStart, generation, 3012));
+    machine.Handle(ButtonEvent(EventType::kButtonPressed, Button::kCase, 3020));
+    machine.Handle(CaseEvent(EventType::kAudioEnd, generation, 3021));
+
+    const auto released = machine.Handle(ButtonEvent(
+        EventType::kButtonReleased, Button::kCase, 3022));
+    TEST_ASSERT_EQUAL_UINT8(1, released.count);
+    AssertAction(released, 0, ActionType::kVibrate, Speaker::kNone,
+                 StatusId::kWaiting, xiaoli::kErrorVibrateMs);
+    TEST_ASSERT_EQUAL_UINT32(generation, machine.case_generation());
+    TEST_ASSERT_EQUAL_UINT16(1, machine.completed_a());
+    TEST_ASSERT_EQUAL_UINT16(1, machine.completed_b());
+}
+
 TEST_CASE("Recoverable errors stop recording map whitelist and recover safely", "[mediation_state]") {
     MediationStateMachine machine;
     machine.Handle(StateEvent(EventType::kBoot, 0));

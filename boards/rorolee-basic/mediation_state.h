@@ -122,6 +122,7 @@ private:
     bool has_case_ = false;
     bool case_button_down_ = false;
     bool case_long_fired_ = false;
+    bool short_press_allowed_at_press_ = false;
     bool end_status_active_ = false;
 };
 
