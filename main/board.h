@@ -17,12 +17,19 @@ public:
     // This board's capabilities
     virtual uint32_t Capabilities() const = 0;
 
+    // Called after Agent Link has started. Implementations must return quickly.
+    virtual void Start() {}
+
     // Agent → Device: agent_link callbacks
     virtual void PlayAudio(const uint8_t* pcm16, size_t bytes) { (void)pcm16; (void)bytes; }
     virtual void AudioEnd() {}
     virtual void ShowText(const char* utf8) { (void)utf8; }
     virtual void Vibrate(uint32_t duration_ms) { (void)duration_ms; }
     virtual void SetLed(uint32_t rgb) { (void)rgb; }   // RGB 0x00RRGGBB; the SDK's led0 endpoint routes here
+    virtual void HandleCustom(uint16_t cmd, const uint8_t* payload, size_t len) {
+        (void)cmd; (void)payload; (void)len;
+    }
+    virtual void HandleAgentState(agent_state_t state) { (void)state; }
 
     // Device → Agent: Status Query & Reporting
     virtual int GetBatteryLevel() { return -1; }

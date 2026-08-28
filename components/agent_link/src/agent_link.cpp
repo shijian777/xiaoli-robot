@@ -540,6 +540,11 @@ esp_err_t agent_link_start(void) {
 
 void agent_link_stop(void) {
     if (s_tx && s_tx->stop) s_tx->stop(s_tx->impl);
+    // A transport stop is also the fail-closed escape hatch for a stream end
+    // that could not be admitted.  Do not let a stale core-side session make
+    // the first stream after reconnect look idempotently open.
+    s_voice_started = false;
+    s_asr_started = false;
     s_state = AGENT_STATE_DISCONNECTED;
 }
 
@@ -759,9 +764,17 @@ esp_err_t agent_link_asr_push(const uint8_t* audio, size_t bytes) {
 }
 esp_err_t agent_link_asr_end(bool complete) {
     if (!s_asr_started) return ESP_OK;
-    s_asr_started = false;
-    if (s_tx && s_tx->stream_end) return s_tx->stream_end(s_tx->impl, AGENT_STREAM_RECORDING, complete, nullptr, 0);
-    return ESP_OK;
+    if (!s_tx || !s_tx->stream_end) {
+        s_asr_started = false;
+        return ESP_OK;
+    }
+    const esp_err_t result = s_tx->stream_end(
+        s_tx->impl, AGENT_STREAM_RECORDING, complete, nullptr, 0);
+    // Keep the core session open when admission fails so the caller can send
+    // an explicit incomplete end.  A transport restart clears both sides if
+    // that abort cannot be queued either.
+    if (result == ESP_OK) s_asr_started = false;
+    return result;
 }
 
 // Data plane: still-image snapshot uplink

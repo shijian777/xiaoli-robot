@@ -47,6 +47,7 @@ idf_component_register(
     SRCS ${SOURCES}
     INCLUDE_DIRS ${INCLUDE_DIRS}
     REQUIRES agent_link esp_driver_gpio esp_driver_spi esp_lcd esp_lcd_sh8501
-             esp_codec_dev esp_driver_i2c esp_driver_i2s ${EXTRA_REQUIRES})
+             esp_codec_dev esp_driver_i2c esp_driver_i2s json nvs_flash
+             esp_timer heap esp_hw_support ${EXTRA_REQUIRES})
 
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-missing-field-initializers)

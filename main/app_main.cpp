@@ -22,11 +22,15 @@ void on_audio_end(void*) { Board::GetInstance().AudioEnd(); }
 void on_show_text(const char* utf8, void*) { Board::GetInstance().ShowText(utf8); }
 void on_haptic(uint32_t duration_ms, void*) { Board::GetInstance().Vibrate(duration_ms); }
 void on_led(uint32_t rgb, void*) { Board::GetInstance().SetLed(rgb); }
+void on_custom(uint16_t cmd, const uint8_t* payload, size_t len, void*) {
+    Board::GetInstance().HandleCustom(cmd, payload, len);
+}
 
 void on_state(agent_state_t state, void*) {
     ESP_LOGI(TAG, "[state] %s",
              state == AGENT_STATE_READY     ? "READY" :
              state == AGENT_STATE_CONNECTED ? "CONNECTED" : "DISCONNECTED");
+    Board::GetInstance().HandleAgentState(state);
 }
 }  // namespace
 
@@ -41,6 +45,7 @@ extern "C" void app_main(void) {
     out.on_show_text = on_show_text;
     out.on_haptic    = on_haptic;
     out.on_led       = on_led;
+    out.on_custom    = on_custom;
 
     agent_link_config_t cfg = {};
     cfg.device_name = board.Name();
@@ -54,6 +59,7 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(agent_link_init(&cfg));     //agent_link initialization
     ESP_ERROR_CHECK(agent_link_start());
+    board.Start();
 
     while (true) {
         if (agent_link_state() == AGENT_STATE_READY) {
