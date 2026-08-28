@@ -443,6 +443,7 @@ class DeviceGateway {
       this.#sendError(connection, 'invalid_frame', false, 'Audio frame was invalid');
       return;
     }
+    if (frame.kind === FrameKind.CONTROL) return;
     if (frame.streamType !== RECORDING_STREAM) {
       this.#sendError(connection, 'invalid_stream_type', false, 'Only recording audio is accepted from a device');
       return;

@@ -54,6 +54,7 @@ export async function startBridge({
     bonjour = bonjourFactory();
     advertisement = bonjour.publish({
       name: '小理本机 Bridge',
+      host: 'xiaoli-bridge.local',
       type: 'xiaoli',
       protocol: 'tcp',
       port: address.port,

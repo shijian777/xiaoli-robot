@@ -179,6 +179,99 @@ test('rejects the wrong token with 4003 and acknowledges a canonical hello', asy
   });
 });
 
+test('requires hello before accepting a binary CONTROL frame', async () => {
+  await withGateway(async ({url}) => {
+    const ws = await openClient(url);
+    ws.send(encodeBinaryFrame({
+      kind: FrameKind.CONTROL,
+      streamType: 0,
+      flags: 0,
+      sequence: 0,
+      payload: Buffer.from([0x01])
+    }));
+
+    const closed = await new Promise((resolve) => {
+      ws.once('close', (code, reason) => resolve({code, reason: reason.toString()}));
+    });
+    assert.deepEqual(closed, {code: 4001, reason: 'hello required'});
+  });
+});
+
+test('silently accepts authenticated CONTROL without mutating state and keeps the socket usable', async () => {
+  let caseStarts = 0;
+  let segmentStarts = 0;
+  let chunks = 0;
+  let segmentEnds = 0;
+  class CountingCases extends CaseManager {
+    startCase(...args) {
+      caseStarts += 1;
+      return super.startCase(...args);
+    }
+    startSegment(...args) {
+      segmentStarts += 1;
+      return super.startSegment(...args);
+    }
+    appendChunk(...args) {
+      chunks += 1;
+      return super.appendChunk(...args);
+    }
+    endSegment(...args) {
+      segmentEnds += 1;
+      return super.endSegment(...args);
+    }
+  }
+  const cases = new CountingCases();
+
+  await withGateway(async ({url}) => {
+    const ws = await openClient(url);
+    const channel = inbox(ws);
+    await authenticate(ws, channel);
+    ws.send(encodeBinaryFrame({
+      kind: FrameKind.CONTROL,
+      streamType: 0,
+      flags: 0,
+      sequence: 0,
+      payload: Buffer.from([0xde, 0xad, 0xbe, 0xef])
+    }));
+
+    await assert.rejects(() => channel.next(100), /timed out waiting for gateway message/);
+    assert.equal(ws.readyState, WebSocket.OPEN);
+    assert.equal(cases.cases.size, 0);
+    assert.equal(cases.segments.size, 0);
+    assert.deepEqual({caseStarts, segmentStarts, chunks, segmentEnds}, {
+      caseStarts: 0,
+      segmentStarts: 0,
+      chunks: 0,
+      segmentEnds: 0
+    });
+
+    ws.send(JSON.stringify(control('case.start', 'post-control-case-start', {caseId: 'post-control-case'})));
+    assert.deepEqual(await nextJson(channel, 'ack'), {
+      v: 1,
+      type: 'ack',
+      messageId: 'post-control-case-start',
+      caseId: 'post-control-case',
+      accepted: true
+    });
+    assert.equal(caseStarts, 1);
+    await closeClient(ws);
+  }, {caseManager: cases});
+});
+
+test('still reports invalid_frame for malformed authenticated binary input', async () => {
+  await withGateway(async ({url}) => {
+    const ws = await openClient(url);
+    const channel = inbox(ws);
+    await authenticate(ws, channel);
+    ws.send(Buffer.from([0x58, 0x4c, 0x01]));
+
+    const error = await nextJson(channel, 'error');
+    assert.equal(error.code, 'invalid_frame');
+    assert.equal(ws.readyState, WebSocket.OPEN);
+    await closeClient(ws);
+  });
+});
+
 test('returns the original ACK for a duplicate messageId and applies it once', async () => {
   let starts = 0;
   class CountingCases extends CaseManager {
@@ -981,6 +1074,7 @@ test('runs Bridge and the fake device through a local mock Agent Stack vertical 
     assert.equal(mock.calls.maxActive, 1);
     assert.deepEqual(advertised, [{
       name: '小理本机 Bridge',
+      host: 'xiaoli-bridge.local',
       type: 'xiaoli',
       protocol: 'tcp',
       port: bridge.address.port,
