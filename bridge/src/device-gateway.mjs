@@ -11,6 +11,7 @@ import {validateDeviceMessage, validateMediatorResult} from './protocol/schemas.
 const RECORDING_STREAM = 2;
 const VOICE_STREAM = 0;
 const MAX_TTS_CHUNK_BYTES = 4096;
+const MAX_TTS_PCM_BYTES = 1_920_000;
 const DEFAULT_BACKPRESSURE_BYTES = 256 * 1024;
 const DEFAULT_BACKPRESSURE_GRACE_MS = 10_000;
 const DEFAULT_HEARTBEAT_MS = 10_000;
@@ -303,6 +304,10 @@ class DeviceGateway {
       this.#connections.delete(connection);
       connection.device?.sockets.delete(connection);
       if (connection.device?.activeRecording?.owner === connection) {
+        const recording = connection.device.activeRecording;
+        this.#failAndForgetRecording(
+          connection.device, recording,
+          'Recording connection closed before durable completion');
         connection.device.activeRecording = null;
       }
       closeResolve();
@@ -344,9 +349,11 @@ class DeviceGateway {
         ackBindings: new Map(),
         segmentAcks: new Map(),
         segmentProgress: new Map(),
+        segmentCommits: new Map(),
         activeRecording: null,
         queue: Promise.resolve(),
         mediatorSessions: new Map(),
+        connectionGeneration: 0,
         currentCaseId: null,
         caseAbortController: null,
         sockets: new Set()
@@ -361,6 +368,8 @@ class DeviceGateway {
     }
     connection.authenticated = true;
     connection.device = device;
+    device.connectionGeneration += 1;
+    connection.deviceGeneration = device.connectionGeneration;
     device.sockets.add(connection);
     const ack = existing ?? {
       v: 1,
@@ -460,13 +469,33 @@ class DeviceGateway {
     const retainedMeta = retainedSegmentMeta(device, message?.segmentId);
     if (frame.sequence !== 0 || !message || !validateDeviceMessage(message) || message.type !== 'speech.start') {
       if (message?.type === 'speech.start' && retainedMeta && !sameSegmentMeta(retainedMeta, message)) {
-        this.#sendError(connection, 'segment_conflict', false, 'Segment metadata conflicts with retained audio');
+        this.#sendError(connection, 'segment_conflict', false, 'Segment metadata conflicts with retained audio', message?.caseId, message?.segmentId);
         return;
       }
-      this.#sendError(connection, 'invalid_speech_start', false, 'Speech start metadata was invalid');
+      this.#sendError(connection, 'invalid_speech_start', false, 'Speech start metadata was invalid', message?.caseId, message?.segmentId);
       return;
     }
     if (!this.#ownedCase(connection, message.caseId)) return;
+    const committing = device.segmentCommits.get(message.segmentId);
+    if (committing) {
+      if (!sameSegmentMeta(committing.meta, message)) {
+        this.#sendError(connection, 'segment_conflict', false,
+          'Segment metadata conflicts with committing audio',
+          message.caseId, message.segmentId);
+        return;
+      }
+      await committing.promise;
+      const completed = device.segmentAcks.get(message.segmentId);
+      if (completed) {
+        device.activeRecording = {
+          owner: connection, replayAck: completed.ack, meta: completed.meta
+        };
+        this.#replayMessage(connection, message);
+        return;
+      }
+      // A failed commit evicts its admission ACK and reopens the exact
+      // failed CaseManager segment below for a from-zero replay.
+    }
     if (device.acks.has(message.messageId)) {
       if (device.messageFingerprints.get(message.messageId) !== messageFingerprint(message)) {
         this.#replayMessage(connection, message);
@@ -474,20 +503,20 @@ class DeviceGateway {
       }
       const binding = device.ackBindings.get(message.messageId);
       if (binding && !sameSegmentMeta(binding, message)) {
-        this.#sendError(connection, 'segment_conflict', false, 'Segment metadata conflicts with retained audio');
+        this.#sendError(connection, 'segment_conflict', false, 'Segment metadata conflicts with retained audio', message.caseId, message.segmentId);
         return;
       }
       const progress = device.segmentProgress.get(message.segmentId);
       const completed = device.segmentAcks.get(message.segmentId);
       if (progress) {
         if (device.activeRecording && device.activeRecording.owner !== connection) {
-          this.#sendError(connection, 'audio_stream_active', true, 'Only one recording stream may be active');
+          this.#sendError(connection, 'audio_stream_active', true, 'Only one recording stream may be active', message.caseId, message.segmentId);
           return;
         }
         device.activeRecording = {owner: connection, progress, meta: progress.meta};
       } else if (completed) {
         if (!sameSegmentMeta(completed.meta, message)) {
-          this.#sendError(connection, 'segment_conflict', false, 'Segment metadata conflicts with retained audio');
+          this.#sendError(connection, 'segment_conflict', false, 'Segment metadata conflicts with retained audio', message.caseId, message.segmentId);
           return;
         }
         device.activeRecording = {owner: connection, replayAck: completed.ack, meta: completed.meta};
@@ -496,13 +525,13 @@ class DeviceGateway {
       return;
     }
     if (device.activeRecording) {
-      this.#sendError(connection, 'audio_stream_active', true, 'Only one recording stream may be active');
+      this.#sendError(connection, 'audio_stream_active', true, 'Only one recording stream may be active', message.caseId, message.segmentId);
       return;
     }
     const completedRecord = device.segmentAcks.get(message.segmentId);
     if (completedRecord) {
       if (!sameSegmentMeta(completedRecord.meta, message)) {
-        this.#sendError(connection, 'segment_conflict', false, 'Segment metadata conflicts with retained audio');
+        this.#sendError(connection, 'segment_conflict', false, 'Segment metadata conflicts with retained audio', message.caseId, message.segmentId);
         return;
       }
       device.activeRecording = {owner: connection, replayAck: completedRecord.ack, meta: completedRecord.meta};
@@ -533,10 +562,10 @@ class DeviceGateway {
       this.#broadcastState(device, 'recording', message.caseId, message.segmentId);
     } catch (error) {
       if (error?.code === 'case_segment_limit_exceeded') {
-        this.#sendError(connection, error.code, false, 'This case already has the maximum number of recordings');
+        this.#sendError(connection, error.code, false, 'This case already has the maximum number of recordings', message.caseId, message.segmentId);
         return;
       }
-      this.#sendError(connection, 'segment_conflict', false, 'Segment could not be started');
+      this.#sendError(connection, 'segment_conflict', false, 'Segment could not be started', message.caseId, message.segmentId);
     }
   }
 
@@ -572,7 +601,7 @@ class DeviceGateway {
   async #endSpeech(connection, frame) {
     const message = parseJson(frame.payload);
     if (!message || !validateDeviceMessage(message) || message.type !== 'speech.end') {
-      this.#sendError(connection, 'invalid_speech_end', false, 'Speech end metadata was invalid');
+      this.#sendError(connection, 'invalid_speech_end', false, 'Speech end metadata was invalid', message?.caseId, message?.segmentId);
       return;
     }
     const device = connection.device;
@@ -598,13 +627,13 @@ class DeviceGateway {
         this.#storeAck(device, message, replay.ack, replay.meta);
         this.#sendJson(connection, replay.ack);
       } else {
-        this.#sendError(connection, 'audio_stream_missing', true, 'No recording stream is active');
+        this.#sendError(connection, 'audio_stream_missing', true, 'No recording stream is active', message.caseId, message.segmentId);
       }
       return;
     }
     if (recording.replayAck) {
       if (message.caseId !== recording.meta.caseId || message.segmentId !== recording.meta.segmentId) {
-        this.#sendError(connection, 'segment_conflict', false, 'Replay completion did not match the active segment');
+        this.#sendError(connection, 'segment_conflict', false, 'Replay completion did not match the active segment', message.caseId, message.segmentId);
         return;
       }
       this.#storeAck(device, message, recording.replayAck, recording.meta);
@@ -626,6 +655,12 @@ class DeviceGateway {
       this.#failRecording(connection, meta.segmentId, 'audio_size_mismatch', 'Recording byte count did not match');
       return;
     }
+
+    // From this point the end handler owns the segment terminal transition.
+    // A socket close may detach delivery, but must not race the durable write
+    // by converting queued audio into an orphaned failed segment.
+    recording.committing = true;
+    const commit = this.#beginSegmentCommit(device, meta);
 
     let completed;
     let transcriptionSegment;
@@ -653,11 +688,13 @@ class DeviceGateway {
       if (this.#stopping || signal.aborted) {
         device.activeRecording = null;
         device.segmentProgress.delete(meta.segmentId);
+        this.#finishSegmentCommit(device, meta.segmentId, commit);
         return;
       }
-      this.#cases.failSegment(meta.segmentId, 'WAV assembly failed');
+      this.#failAndForgetRecording(device, recording, 'WAV assembly failed', true);
       device.activeRecording = null;
-      this.#sendError(connection, 'audio_write_failed', true, 'Recording could not be stored');
+      this.#finishSegmentCommit(device, meta.segmentId, commit);
+      this.#sendError(connection, 'audio_write_failed', true, 'Recording could not be stored', meta.caseId, meta.segmentId);
       this.#logger.error?.('Gateway WAV write failed', {segmentId: meta.segmentId, errorCode: error?.code ?? 'UNKNOWN'});
       return;
     }
@@ -665,6 +702,7 @@ class DeviceGateway {
       await this.#tryRemoveOwnedTemp(wavPath);
       device.activeRecording = null;
       device.segmentProgress.delete(meta.segmentId);
+      this.#finishSegmentCommit(device, meta.segmentId, commit);
       return;
     }
 
@@ -681,6 +719,7 @@ class DeviceGateway {
     device.segmentAcks.set(meta.segmentId, {ack, meta: segmentBinding(meta)});
     device.segmentProgress.delete(meta.segmentId);
     device.activeRecording = null;
+    this.#finishSegmentCommit(device, meta.segmentId, commit);
     this.#sendJson(connection, ack);
     this.#broadcastState(device, 'transcribing', meta.caseId, meta.segmentId);
     if (!this.#enqueue(device, (operationSignal) => this.#transcribe(device, transcriptionSegment, wavPath, operationSignal), meta.caseId)) {
@@ -689,15 +728,47 @@ class DeviceGateway {
   }
 
   #failRecording(connection, segmentId, code, message) {
+    const device = connection.device;
+    const recording = device.activeRecording;
+    const meta = recording?.meta?.segmentId === segmentId
+      ? recording.meta
+      : device.segmentProgress.get(segmentId)?.meta;
+    this.#failAndForgetRecording(device, {meta}, message);
+    device.activeRecording = null;
+    this.#sendError(connection, code, true, message, meta?.caseId, segmentId);
+    this.#broadcastState(device, 'error', meta?.caseId, segmentId);
+  }
+
+  #failAndForgetRecording(device, recording, failure, force = false) {
+    const segmentId = recording?.meta?.segmentId;
+    if (!segmentId || recording?.replayAck || (recording?.committing && !force)) return;
     try {
-      this.#cases.failSegment(segmentId, message);
+      this.#cases.failSegment(segmentId, failure);
     } catch {
-      // The protocol error remains stable even if the segment was already terminal.
+      // The protocol error remains stable even if the segment was terminal.
     }
-    connection.device.activeRecording = null;
-    connection.device.segmentProgress.delete(segmentId);
-    this.#sendError(connection, code, true, message);
-    this.#broadcastState(connection.device, 'error', undefined, segmentId);
+    device.segmentProgress.delete(segmentId);
+    for (const [messageId, binding] of device.ackBindings) {
+      if (binding?.segmentId !== segmentId) continue;
+      device.acks.delete(messageId);
+      device.messageFingerprints.delete(messageId);
+      device.ackBindings.delete(messageId);
+    }
+  }
+
+  #beginSegmentCommit(device, meta) {
+    let resolve;
+    const promise = new Promise((done) => { resolve = done; });
+    const commit = {meta: segmentBinding(meta), promise, resolve};
+    device.segmentCommits.set(meta.segmentId, commit);
+    return commit;
+  }
+
+  #finishSegmentCommit(device, segmentId, commit) {
+    if (device.segmentCommits.get(segmentId) === commit) {
+      device.segmentCommits.delete(segmentId);
+    }
+    commit.resolve();
   }
 
   async #writeDurableWav(pcm, audio, caseId, signal) {
@@ -776,24 +847,35 @@ class DeviceGateway {
     const ack = {v: 1, type: 'ack', messageId: message.messageId, caseId: message.caseId, accepted: true};
     this.#storeAck(device, message, ack);
     this.#sendJson(connection, ack);
-    this.#enqueue(device, (signal) => this.#mediate(device, message.caseId, signal), message.caseId);
+    const deliveryGeneration = connection.deviceGeneration;
+    this.#enqueue(
+      device,
+      (signal) => this.#mediate(device, message.caseId, signal, deliveryGeneration),
+      message.caseId);
   }
 
-  async #mediate(device, caseId, signal) {
-    if (this.#stopping || signal?.aborted) return;
+  async #mediate(device, caseId, signal, deliveryGeneration) {
+    if (this.#stopping || signal?.aborted ||
+        device.connectionGeneration !== deliveryGeneration) return;
     let snapshot;
     try {
       snapshot = this.#cases.snapshot(caseId);
     } catch {
-      this.#broadcastError(device, 'case_not_found', false, 'Case does not exist', caseId);
+      if (device.connectionGeneration === deliveryGeneration) {
+        this.#broadcastError(device, 'case_not_found', false, 'Case does not exist', caseId);
+      }
       return;
     }
     if (snapshot.deviceId !== device.deviceId) {
-      this.#broadcastError(device, 'case_forbidden', false, 'Case belongs to another device', caseId);
+      if (device.connectionGeneration === deliveryGeneration) {
+        this.#broadcastError(device, 'case_forbidden', false, 'Case belongs to another device', caseId);
+      }
       return;
     }
     if (!snapshot.canMediate) {
-      this.#broadcastError(device, 'mediation_not_ready', true, 'Both A and B need saved transcripts', caseId);
+      if (device.connectionGeneration === deliveryGeneration) {
+        this.#broadcastError(device, 'mediation_not_ready', true, 'Both A and B need saved transcripts', caseId);
+      }
       return;
     }
 
@@ -806,9 +888,14 @@ class DeviceGateway {
       if (!validateMediatorResult(result)) {
         throw new Error('mediation result failed canonical validation');
       }
+      if (device.connectionGeneration !== deliveryGeneration) return;
       const pcm = await this.#tts.synthesize(result.spokenText, {signal});
       this.#assertRunning(signal);
-      if (!Buffer.isBuffer(pcm) || pcm.length % 2 !== 0) throw new Error('TTS returned invalid PCM');
+      if (device.connectionGeneration !== deliveryGeneration) return;
+      if (!Buffer.isBuffer(pcm) || pcm.length === 0 ||
+          pcm.length > MAX_TTS_PCM_BYTES || pcm.length % 2 !== 0) {
+        throw new Error('TTS returned invalid PCM');
+      }
       const chunks = Math.ceil(pcm.length / MAX_TTS_CHUNK_BYTES);
       if (chunks > 0x10000) throw new Error('TTS PCM exceeds the stream sequence space');
 
@@ -839,7 +926,8 @@ class DeviceGateway {
       });
       this.#broadcastState(device, 'waiting', caseId);
     } catch (error) {
-      if (this.#stopping || signal?.aborted) return;
+      if (this.#stopping || signal?.aborted ||
+          device.connectionGeneration !== deliveryGeneration) return;
       this.#broadcastError(device, 'mediation_failed', true, 'Mediation or speech synthesis failed', caseId);
       this.#logger.error?.('Gateway mediation failed', {caseId, errorName: error?.name ?? 'Error'});
     }

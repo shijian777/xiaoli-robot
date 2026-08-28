@@ -1291,6 +1291,11 @@ TEST_CASE("Only the exact durable end ACK releases one pending segment",
     xiaoli::PendingSegmentView oldest{};
     TEST_ASSERT_TRUE(store.OldestCompleteUnacked(&oldest));
     TEST_ASSERT_EQUAL_STRING("b", oldest.meta.segment_id);
+
+    TEST_ASSERT_FALSE(store.AbandonComplete(second, oldest.insertion_ordinal + 1));
+    TEST_ASSERT_TRUE(store.AbandonComplete(second, oldest.insertion_ordinal));
+    TEST_ASSERT_EQUAL_UINT8(0, store.CompleteCount());
+    TEST_ASSERT_TRUE(store.HasFreeSlot());
 }
 
 TEST_CASE("Business IDs are boot-epoch unique and require committed storage",
@@ -1345,8 +1350,92 @@ TEST_CASE("Connection replay ledger suppresses immediate resend until reconnect"
     ledger.MarkSent(slot, ordinal);
     TEST_ASSERT_TRUE(ledger.WasSent(slot, ordinal));
     TEST_ASSERT_FALSE(ledger.WasSent(slot, ordinal + 1));
+    ledger.Forget(slot, ordinal + 1);
+    TEST_ASSERT_TRUE(ledger.WasSent(slot, ordinal));
+    ledger.Forget(slot, ordinal);
+    TEST_ASSERT_FALSE(ledger.WasSent(slot, ordinal));
+    ledger.MarkSent(slot, ordinal);
     ledger.Reset();
     TEST_ASSERT_FALSE(ledger.WasSent(slot, ordinal));
+}
+
+TEST_CASE("Coalesced disconnect and ready retains the media cleanup edge",
+          "[mediation_runtime]") {
+    xiaoli::LinkEdgeTracker edges;
+    edges.Notify(xiaoli::LinkLevel::kDisconnected);
+    edges.Notify(xiaoli::LinkLevel::kReady);
+
+    const xiaoli::LinkEdgeSnapshot snapshot = edges.Take();
+    TEST_ASSERT_TRUE(snapshot.disconnect_seen);
+    TEST_ASSERT_EQUAL_UINT32(2, snapshot.epoch);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::LinkLevel::kReady),
+                            static_cast<uint8_t>(snapshot.latest));
+    TEST_ASSERT_FALSE(edges.Take().disconnect_seen);
+
+    // The disconnect cleanup primitives must discard an in-progress capture
+    // and abort a half-written playback before the final READY is accepted.
+    std::array<uint8_t, 8> a{};
+    std::array<uint8_t, 8> b{};
+    xiaoli::PendingAudioStore store;
+    TEST_ASSERT_TRUE(store.InitWithBuffers(a.data(), b.data(), a.size()));
+    xiaoli::SlotId slot = xiaoli::kInvalidSlot;
+    const uint8_t pcm[] = {1, 2, 3, 4};
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.Begin(SegmentMeta(
+            "case", "live", "start", "end", xiaoli::Speaker::kA, 9),
+            &slot)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::StoreResult::kOk),
+        static_cast<uint8_t>(store.Append(slot, pcm, sizeof(pcm))));
+
+    xiaoli::PlaybackSession playback;
+    TEST_ASSERT_TRUE(playback.Begin("case", 9, 8, 16000, 16, 1));
+    TEST_ASSERT_TRUE(playback.ReserveChunk(sizeof(pcm)));
+    TEST_ASSERT_TRUE(playback.MarkWritten(2));
+
+    store.AbortIncomplete(slot);
+    playback.Abort();
+    xiaoli::PendingSegmentView view{};
+    TEST_ASSERT_FALSE(store.OldestCompleteUnacked(&view));
+    TEST_ASSERT_FALSE(playback.active());
+}
+
+TEST_CASE("Mediation readiness probes terminate after a bounded retry budget",
+          "[mediation_runtime]") {
+    xiaoli::MediationProbeBudget budget;
+    for (uint8_t attempt = 0;
+         attempt < xiaoli::MediationProbeBudget::kMaxAttempts; ++attempt) {
+        TEST_ASSERT_TRUE(budget.Take());
+    }
+    TEST_ASSERT_FALSE(budget.Take());
+    budget.Reset();
+    TEST_ASSERT_EQUAL_UINT8(0, budget.attempts());
+    TEST_ASSERT_TRUE(budget.Take());
+}
+
+TEST_CASE("Closed callback admission rejects old and post-close payload epochs",
+          "[mediation_runtime]") {
+    xiaoli::CallbackAdmissionGate admission;
+    uint32_t old_epoch = 0;
+    TEST_ASSERT_FALSE(admission.TryCapture(&old_epoch));
+    admission.Open();
+    TEST_ASSERT_TRUE(admission.TryCapture(&old_epoch));
+    TEST_ASSERT_TRUE(admission.Accepts(old_epoch));
+
+    admission.CloseAndAdvance();
+    TEST_ASSERT_FALSE(admission.Accepts(old_epoch));
+    uint32_t during_restart = 0;
+    TEST_ASSERT_FALSE(admission.TryCapture(&during_restart));
+
+    admission.Open();
+    uint32_t new_epoch = 0;
+    TEST_ASSERT_TRUE(admission.TryCapture(&new_epoch));
+    TEST_ASSERT_NOT_EQUAL(old_epoch, new_epoch);
+    TEST_ASSERT_TRUE(admission.Accepts(new_epoch));
+
+    // Rejecting audio.start quarantines all later PCM until reconnect.
+    admission.Close();
+    TEST_ASSERT_FALSE(admission.Accepts(new_epoch));
+    TEST_ASSERT_FALSE(admission.TryCapture(&during_restart));
 }
 
 TEST_CASE("Complete audio end failures preserve replay while discarded captures may abort",
@@ -1554,6 +1643,27 @@ TEST_CASE("Playback start gate preserves chunks that arrive before state-machine
     TEST_ASSERT_TRUE(playback.MarkWritten(640));
     TEST_ASSERT_TRUE(playback.AcceptEnd("case", 640, 1, true));
     TEST_ASSERT_TRUE(playback.ReadyToFinish(true));
+}
+
+TEST_CASE("Playback callback may stage PCM before owner parses audio start",
+          "[mediation_runtime]") {
+    xiaoli::PlaybackIngressGate gate;
+    xiaoli::PlaybackSession playback;
+    TEST_ASSERT_TRUE(gate.ArmPending());
+    TEST_ASSERT_FALSE(gate.bound());
+    TEST_ASSERT_TRUE(gate.ReserveChunk(320));
+    TEST_ASSERT_TRUE(gate.Bind("case", 640, 16000, 16, 1));
+    TEST_ASSERT_TRUE(gate.bound());
+    TEST_ASSERT_TRUE(gate.ReserveChunk(320));
+    TEST_ASSERT_TRUE(playback.Begin("case", 13, 640, 16000, 16, 1));
+    TEST_ASSERT_TRUE(gate.AdoptInto(playback));
+    TEST_ASSERT_EQUAL_UINT32(640, playback.received_bytes());
+    TEST_ASSERT_EQUAL_UINT32(2, playback.chunk_count());
+
+    TEST_ASSERT_TRUE(gate.ArmPending());
+    TEST_ASSERT_TRUE(gate.ReserveChunk(640));
+    TEST_ASSERT_FALSE(gate.Bind("case", 320, 16000, 16, 1));
+    TEST_ASSERT_TRUE(gate.incomplete());
 }
 
 TEST_CASE("Playback start gate fails closed on staged ingress truncation",

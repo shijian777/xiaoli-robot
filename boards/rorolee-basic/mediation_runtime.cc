@@ -52,6 +52,61 @@ BridgeErrorTarget ClassifyBridgeErrorTarget(
     return BridgeErrorTarget::kStale;
 }
 
+void LinkEdgeTracker::Notify(LinkLevel level) {
+    latest_.store(static_cast<uint8_t>(level), std::memory_order_release);
+    if (level == LinkLevel::kDisconnected) {
+        disconnect_seen_.store(true, std::memory_order_release);
+    }
+    epoch_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+LinkEdgeSnapshot LinkEdgeTracker::Take() {
+    LinkEdgeSnapshot snapshot{};
+    snapshot.disconnect_seen =
+        disconnect_seen_.exchange(false, std::memory_order_acq_rel);
+    snapshot.epoch = epoch_.load(std::memory_order_acquire);
+    snapshot.latest = static_cast<LinkLevel>(
+        latest_.load(std::memory_order_acquire));
+    return snapshot;
+}
+
+bool CallbackAdmissionGate::TryCapture(uint32_t* epoch) const {
+    if (epoch == nullptr || !open()) {
+        return false;
+    }
+    const uint32_t captured = this->epoch();
+    if (!Accepts(captured)) {
+        return false;
+    }
+    *epoch = captured;
+    return true;
+}
+
+bool CallbackAdmissionGate::Accepts(uint32_t epoch) const {
+    return open() && this->epoch() == epoch;
+}
+
+void CallbackAdmissionGate::Open() {
+    open_.store(true, std::memory_order_release);
+}
+
+void CallbackAdmissionGate::Close() {
+    open_.store(false, std::memory_order_release);
+}
+
+void CallbackAdmissionGate::CloseAndAdvance() {
+    Close();
+    epoch_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+bool MediationProbeBudget::Take() {
+    if (attempts_ >= kMaxAttempts) {
+        return false;
+    }
+    ++attempts_;
+    return true;
+}
+
 bool BusinessIdGenerator::Initialize(const uint8_t mac[6],
                                      uint32_t boot_epoch,
                                      bool epoch_committed) {
@@ -173,6 +228,14 @@ void ConnectionReplayLedger::MarkSent(
 void ConnectionReplayLedger::Reset() {
     for (uint64_t& ordinal : sent_ordinal_) {
         ordinal = 0;
+    }
+}
+
+void ConnectionReplayLedger::Forget(
+    SlotId slot, uint64_t insertion_ordinal) {
+    if (slot < kPendingSlotCount && insertion_ordinal != 0 &&
+        sent_ordinal_[slot] == insertion_ordinal) {
+        sent_ordinal_[slot] = 0;
     }
 }
 
@@ -380,28 +443,56 @@ void PlaybackSession::Abort() {
     input_complete_ = false;
 }
 
+bool PlaybackIngressGate::ArmPending() {
+    if (armed_) {
+        return false;
+    }
+    Reset();
+    armed_ = true;
+    return true;
+}
+
 bool PlaybackIngressGate::Arm(const char* case_id, uint32_t expected_bytes,
                               uint32_t sample_rate, uint8_t bits,
                               uint8_t channels) {
-    if (armed_ || !ValidPlaybackStart(case_id, expected_bytes, sample_rate,
-                                      bits, channels)) {
+    if (!ArmPending()) {
+        return false;
+    }
+    if (!Bind(case_id, expected_bytes, sample_rate, bits, channels)) {
+        Reset();
+        return false;
+    }
+    return true;
+}
+
+bool PlaybackIngressGate::Bind(const char* case_id,
+                               uint32_t expected_bytes,
+                               uint32_t sample_rate, uint8_t bits,
+                               uint8_t channels) {
+    if (!ValidPlaybackStart(case_id, expected_bytes, sample_rate, bits,
+                            channels) || incomplete_ || bound_ ||
+        received_bytes_ > expected_bytes) {
+        if (armed_) {
+            incomplete_ = true;
+        }
+        return false;
+    }
+    if (!armed_ && !ArmPending()) {
         return false;
     }
     std::snprintf(case_id_, sizeof(case_id_), "%s", case_id);
     expected_bytes_ = expected_bytes;
     sample_rate_ = sample_rate;
-    received_bytes_ = 0;
-    chunk_count_ = 0;
     bits_ = bits;
     channels_ = channels;
-    armed_ = true;
-    incomplete_ = false;
+    bound_ = true;
     return true;
 }
 
 bool PlaybackIngressGate::ReserveChunk(size_t bytes) {
+    const uint32_t capacity = bound_ ? expected_bytes_ : kMaxPlaybackBytes;
     if (!armed_ || incomplete_ || bytes == 0 || (bytes & 1U) != 0 ||
-        bytes > expected_bytes_ || received_bytes_ > expected_bytes_ - bytes ||
+        bytes > capacity || received_bytes_ > capacity - bytes ||
         chunk_count_ >= 0x10000U) {
         if (armed_) {
             incomplete_ = true;
@@ -423,14 +514,14 @@ bool PlaybackIngressGate::Matches(const char* case_id,
                                   uint32_t expected_bytes,
                                   uint32_t sample_rate, uint8_t bits,
                                   uint8_t channels) const {
-    return armed_ && ValidId(case_id) &&
+    return armed_ && bound_ && ValidId(case_id) &&
            std::strncmp(case_id_, case_id, sizeof(case_id_)) == 0 &&
            expected_bytes_ == expected_bytes && sample_rate_ == sample_rate &&
            bits_ == bits && channels_ == channels;
 }
 
 bool PlaybackIngressGate::AdoptInto(PlaybackSession& playback) {
-    const bool valid = armed_ && !incomplete_ && playback.active() &&
+    const bool valid = armed_ && bound_ && !incomplete_ && playback.active() &&
                        std::strncmp(case_id_, playback.case_id(),
                                     sizeof(case_id_)) == 0 &&
                        expected_bytes_ == playback.expected_bytes();
@@ -453,6 +544,7 @@ void PlaybackIngressGate::Reset() {
     bits_ = 0;
     channels_ = 0;
     armed_ = false;
+    bound_ = false;
     incomplete_ = false;
 }
 

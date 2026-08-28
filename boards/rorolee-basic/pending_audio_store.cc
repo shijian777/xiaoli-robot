@@ -174,6 +174,21 @@ void PendingAudioStore::AbortIncomplete(SlotId slot_id) {
     }
 }
 
+bool PendingAudioStore::AbandonComplete(
+    SlotId slot_id, uint64_t insertion_ordinal) {
+    if (!initialized_ || slot_id >= kPendingSlotCount ||
+        insertion_ordinal == 0) {
+        return false;
+    }
+    Slot& slot = slots_[slot_id];
+    if (slot.state != SlotState::kCompleteUnacked ||
+        slot.insertion_ordinal != insertion_ordinal) {
+        return false;
+    }
+    Release(slot);
+    return true;
+}
+
 bool PendingAudioStore::Get(SlotId slot_id, PendingSegmentView* view) const {
     if (!initialized_ || view == nullptr || slot_id >= kPendingSlotCount) {
         return false;

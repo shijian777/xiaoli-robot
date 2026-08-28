@@ -75,6 +75,7 @@ public:
     StoreResult Append(SlotId slot, const uint8_t* pcm, size_t bytes);
     StoreResult MarkLocallyComplete(SlotId slot);
     void AbortIncomplete(SlotId slot);
+    bool AbandonComplete(SlotId slot, uint64_t insertion_ordinal);
 
     bool Get(SlotId slot, PendingSegmentView* view) const;
     bool OldestCompleteUnacked(PendingSegmentView* view) const;

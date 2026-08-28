@@ -794,6 +794,136 @@ test('an exact speech.start retry after reconnect restores retained progress wit
   }, {asrService});
 });
 
+test('socket close during durable commit does not orphan or fail the committing segment', async () => {
+  const renameStarted = deferred();
+  const releaseRename = deferred();
+  const fileSystem = {
+    ...realFs,
+    async rename(...args) {
+      renameStarted.resolve();
+      await releaseRename.promise;
+      return realFs.rename(...args);
+    }
+  };
+  await withGateway(async ({gateway, url, cases}) => {
+    const first = await openClient(url);
+    const firstChannel = inbox(first);
+    await authenticate(first, firstChannel);
+    first.send(JSON.stringify(control('case.start', 'commit-close-case-start', {caseId: 'commit-close-case'})));
+    await nextJson(firstChannel, 'ack');
+    const start = startFrame({messageId: 'commit-close-start', caseId: 'commit-close-case', segmentId: 'commit-close-a', speaker: 'A'});
+    const end = endFrame({messageId: 'commit-close-end', caseId: 'commit-close-case', segmentId: 'commit-close-a', bytes: 4, lastSequence: 0});
+    const pcm = Buffer.from([1, 0, 2, 0]);
+    first.send(start);
+    await nextJson(firstChannel, 'ack');
+    first.send(streamFrame(FrameKind.STREAM_CHUNK, 0, pcm));
+    first.send(end);
+    await settleWithin(renameStarted.promise);
+    await closeClient(first);
+
+    const second = await openClient(url);
+    const channel = inbox(second);
+    await authenticate(second, channel);
+    second.send(JSON.stringify(control('case.start', 'commit-close-case-start', {caseId: 'commit-close-case'})));
+    await nextJson(channel, 'ack');
+    second.send(start);
+    let replayStartSettled = false;
+    const replayStart = nextJson(channel, 'ack').then((message) => {
+      replayStartSettled = true;
+      return message;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(replayStartSettled, false);
+
+    releaseRename.resolve();
+    assert.equal((await replayStart).type, 'ack');
+    await gateway.waitForIdle();
+    assert.equal(cases.snapshot('commit-close-case').speakers.A[0].state, 'saved');
+    second.send(streamFrame(FrameKind.STREAM_CHUNK, 0, pcm));
+    second.send(end);
+    const durable = await nextJson(channel, 'ack');
+    assert.equal(durable.messageId, 'commit-close-end');
+    assert.equal(durable.durable, true);
+    await closeClient(second);
+  }, {gatewayOptions: {fileSystem}});
+});
+
+test('a recording orphaned by disconnect is terminal and does not block replacement A and B transcripts', async () => {
+  await withGateway(async ({gateway, url, cases}) => {
+    const first = await openClient(url);
+    const firstChannel = inbox(first);
+    await authenticate(first, firstChannel);
+    first.send(JSON.stringify(control('case.start', 'orphan-case-start', {caseId: 'orphan-case'})));
+    await nextJson(firstChannel, 'ack');
+    first.send(startFrame({messageId: 'orphan-start', caseId: 'orphan-case', segmentId: 'orphan-a', speaker: 'A'}));
+    await nextJson(firstChannel, 'ack');
+    first.send(streamFrame(FrameKind.STREAM_CHUNK, 0, Buffer.from([9, 0])));
+    await closeClient(first);
+
+    const second = await openClient(url);
+    const channel = inbox(second);
+    await authenticate(second, channel);
+    assert.equal(cases.snapshot('orphan-case').speakers.A[0].state, 'failed');
+    second.send(JSON.stringify(control('case.start', 'orphan-case-start', {caseId: 'orphan-case'})));
+    await nextJson(channel, 'ack');
+    for (const [segmentId, speaker] of [['replacement-a', 'A'], ['replacement-b', 'B']]) {
+      second.send(startFrame({messageId: `${segmentId}-start`, caseId: 'orphan-case', segmentId, speaker}));
+      await nextJson(channel, 'ack');
+      second.send(streamFrame(FrameKind.STREAM_CHUNK, 0, Buffer.from([1, 0, 2, 0])));
+      second.send(endFrame({messageId: `${segmentId}-end`, caseId: 'orphan-case', segmentId, bytes: 4, lastSequence: 0}));
+      assert.equal((await nextJson(channel, 'ack')).durable, true);
+      await nextJson(channel, 'transcript.saved');
+    }
+    await gateway.waitForIdle();
+    assert.equal(cases.snapshot('orphan-case').canMediate, true);
+    await closeClient(second);
+  });
+});
+
+test('retryable WAV persistence failure accepts exact replay and eventually returns durable ACK', async () => {
+  let failRename = true;
+  const fileSystem = {
+    ...realFs,
+    async rename(...args) {
+      if (failRename) {
+        failRename = false;
+        throw Object.assign(new Error('injected rename failure'), {code: 'EIO'});
+      }
+      return realFs.rename(...args);
+    }
+  };
+  await withGateway(async ({gateway, url, cases}) => {
+    const ws = await openClient(url);
+    const channel = inbox(ws);
+    await authenticate(ws, channel);
+    ws.send(JSON.stringify(control('case.start', 'retry-write-case-start', {caseId: 'retry-write-case'})));
+    await nextJson(channel, 'ack');
+    const start = startFrame({messageId: 'retry-write-start', caseId: 'retry-write-case', segmentId: 'retry-write-a', speaker: 'A'});
+    const end = endFrame({messageId: 'retry-write-end', caseId: 'retry-write-case', segmentId: 'retry-write-a', bytes: 4, lastSequence: 0});
+    const pcm = Buffer.from([1, 0, 2, 0]);
+    ws.send(start);
+    await nextJson(channel, 'ack');
+    ws.send(streamFrame(FrameKind.STREAM_CHUNK, 0, pcm));
+    ws.send(end);
+    const failure = await nextJson(channel, 'error');
+    assert.equal(failure.code, 'audio_write_failed');
+    assert.equal(failure.caseId, 'retry-write-case');
+    assert.equal(failure.segmentId, 'retry-write-a');
+
+    ws.send(start);
+    await nextJson(channel, 'ack');
+    ws.send(streamFrame(FrameKind.STREAM_CHUNK, 0, pcm));
+    ws.send(end);
+    const durable = await nextJson(channel, 'ack');
+    assert.equal(durable.messageId, 'retry-write-end');
+    assert.equal(durable.durable, true);
+    await nextJson(channel, 'transcript.saved');
+    await gateway.waitForIdle();
+    assert.equal(cases.snapshot('retry-write-case').speakers.A[0].state, 'saved');
+    await closeClient(ws);
+  }, {gatewayOptions: {fileSystem}});
+});
+
 test('an exact completed-segment replay end releases the replay stream for the next recording', async () => {
   await withGateway(async ({gateway, url}) => {
     const ws = await openClient(url);
@@ -888,6 +1018,127 @@ test('rejects mediation until queued transcription has saved both A and B', asyn
     assert.equal(error.retryable, true);
     await closeClient(ws);
   });
+});
+
+test('reconnect drops the old mediation delivery and plays only the replacement request', async () => {
+  const cases = new CaseManager();
+  cases.startCase('device-1', 'generation-case');
+  for (const [segmentId, speaker, transcript] of [
+    ['generation-a', 'A', 'A 陈述'],
+    ['generation-b', 'B', 'B 陈述']
+  ]) {
+    cases.startSegment({caseId: 'generation-case', segmentId, speaker, audio});
+    cases.appendChunk(segmentId, 0, Buffer.from([1, 0]));
+    cases.endSegment(segmentId);
+    cases.saveTranscript(segmentId, transcript);
+  }
+  const firstStarted = deferred();
+  const releaseFirst = deferred();
+  const makeResult = (spokenText) => ({
+    conflictSummary: '双方有分歧。',
+    aPosition: 'A 的立场。',
+    bPosition: 'B 的立场。',
+    aCanImprove: 'A 可改进。',
+    bCanImprove: 'B 可改进。',
+    commonGround: '存在共同点。',
+    suggestions: ['继续沟通。'],
+    spokenText
+  });
+  let mediationCalls = 0;
+  let ttsCalls = 0;
+  const mediatorService = {
+    async mediate() {
+      mediationCalls += 1;
+      if (mediationCalls === 1) {
+        firstStarted.resolve();
+        await releaseFirst.promise;
+        return makeResult('旧连接结果');
+      }
+      return makeResult('新连接结果');
+    }
+  };
+  const ttsService = {
+    async synthesize(text) {
+      ttsCalls += 1;
+      assert.equal(text, '新连接结果');
+      return Buffer.from([2, 0, 3, 0]);
+    }
+  };
+
+  await withGateway(async ({gateway, url}) => {
+    const first = await openClient(url);
+    const firstChannel = inbox(first);
+    await authenticate(first, firstChannel);
+    first.send(JSON.stringify(control('case.start', 'generation-case-start', {caseId: 'generation-case'})));
+    await nextJson(firstChannel, 'ack');
+    first.send(JSON.stringify(control('mediate.request', 'generation-m1', {caseId: 'generation-case'})));
+    await nextJson(firstChannel, 'ack');
+    await settleWithin(firstStarted.promise);
+    await closeClient(first);
+
+    const second = await openClient(url);
+    const channel = inbox(second);
+    await authenticate(second, channel);
+    second.send(JSON.stringify(control('case.start', 'generation-case-start', {caseId: 'generation-case'})));
+    await nextJson(channel, 'ack');
+    second.send(JSON.stringify(control('mediate.request', 'generation-m2', {caseId: 'generation-case'})));
+    await nextJson(channel, 'ack');
+    releaseFirst.resolve();
+
+    const chunks = [];
+    for (;;) {
+      const message = await channel.next();
+      if (message.isBinary) chunks.push(decodeBinaryFrame(message.value).payload);
+      else if (message.value.type === 'audio.end') break;
+      else if (message.value.type === 'error') assert.fail(message.value.code);
+    }
+    assert.deepEqual(Buffer.concat(chunks), Buffer.from([2, 0, 3, 0]));
+    await gateway.waitForIdle();
+    assert.equal(mediationCalls, 2);
+    assert.equal(ttsCalls, 1);
+    await closeClient(second);
+  }, {caseManager: cases, mediatorService, ttsService});
+});
+
+test('rejects empty or over-capacity TTS PCM before publishing audio.start', async (t) => {
+  for (const [name, voice] of [
+    ['empty', Buffer.alloc(0)],
+    ['over-capacity', Buffer.alloc(1_920_002)]
+  ]) {
+    await t.test(name, async () => {
+      const cases = new CaseManager();
+      const caseId = `tts-bound-${name}`;
+      cases.startCase('device-1', caseId);
+      for (const [segmentId, speaker] of [[`${name}-a`, 'A'], [`${name}-b`, 'B']]) {
+        cases.startSegment({caseId, segmentId, speaker, audio});
+        cases.appendChunk(segmentId, 0, Buffer.from([1, 0]));
+        cases.endSegment(segmentId);
+        cases.saveTranscript(segmentId, `${speaker} 陈述`);
+      }
+      const result = {
+        conflictSummary: '双方有分歧。', aPosition: 'A 的立场。',
+        bPosition: 'B 的立场。', aCanImprove: 'A 可改进。',
+        bCanImprove: 'B 可改进。', commonGround: '存在共同点。',
+        suggestions: ['继续沟通。'], spokenText: '请继续沟通。'
+      };
+      await withGateway(async ({url}) => {
+        const ws = await openClient(url);
+        const channel = inbox(ws);
+        await authenticate(ws, channel);
+        ws.send(JSON.stringify(control('case.start', `${name}-case-start`, {caseId})));
+        await nextJson(channel, 'ack');
+        ws.send(JSON.stringify(control('mediate.request', `${name}-mediate`, {caseId})));
+        await nextJson(channel, 'ack');
+        const error = await nextJson(channel, 'error');
+        assert.equal(error.code, 'mediation_failed');
+        await closeClient(ws);
+      }, {
+        caseManager: cases,
+        mediatorService: {async mediate() { return result; }},
+        ttsService: {async synthesize() { return voice; }}
+      });
+    });
+  }
 });
 
 test('serializes ASR, replays the original segment ACK, and streams canonical TTS PCM in 4096-byte chunks', async () => {

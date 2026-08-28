@@ -62,6 +62,19 @@ export class CaseManager {
       if (!sameMeta(existing, normalized)) {
         throw new Error(`segment ${normalized.segmentId} conflicts with existing metadata`);
       }
+      // A pre-durable transport/storage failure is terminal for that attempt,
+      // but firmware deliberately retains the exact segment and IDs until a
+      // durable ACK.  Reopening the same metadata is therefore a recovery,
+      // not a new business segment.
+      if (existing.state === 'failed') {
+        existing.chunks.clear();
+        existing.receivedBytes = 0;
+        existing.state = 'receiving';
+        existing.pcm = null;
+        existing.audioReleased = false;
+        existing.transcript = null;
+        existing.failure = null;
+      }
       return snapshotSegment(existing);
     }
 

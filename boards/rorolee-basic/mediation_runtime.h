@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -28,6 +29,65 @@ enum class BridgeErrorTarget : uint8_t {
 BridgeErrorTarget ClassifyBridgeErrorTarget(const char* error_segment_id,
                                              const char* active_segment_id,
                                              const char* replay_segment_id);
+
+enum class LinkLevel : uint8_t {
+    kDisconnected,
+    kOther,
+    kReady,
+};
+
+struct LinkEdgeSnapshot {
+    uint32_t epoch = 0;
+    LinkLevel latest = LinkLevel::kDisconnected;
+    bool disconnect_seen = false;
+};
+
+// Agent callbacks are edge notifications, not just a latest-value signal. A
+// sticky disconnect bit prevents DISCONNECTED -> READY from hiding the media
+// cleanup boundary when both callbacks arrive before the owner task runs.
+class LinkEdgeTracker {
+public:
+    void Notify(LinkLevel level);
+    LinkEdgeSnapshot Take();
+
+private:
+    std::atomic<uint8_t> latest_{
+        static_cast<uint8_t>(LinkLevel::kDisconnected)};
+    std::atomic<uint32_t> epoch_{0};
+    std::atomic<bool> disconnect_seen_{false};
+};
+
+class CallbackAdmissionGate {
+public:
+    bool TryCapture(uint32_t* epoch) const;
+    bool Accepts(uint32_t epoch) const;
+    void Open();
+    void Close();
+    void CloseAndAdvance();
+
+    bool open() const {
+        return open_.load(std::memory_order_acquire);
+    }
+    uint32_t epoch() const {
+        return epoch_.load(std::memory_order_acquire);
+    }
+
+private:
+    std::atomic<uint32_t> epoch_{1};
+    std::atomic<bool> open_{false};
+};
+
+class MediationProbeBudget {
+public:
+    static constexpr uint8_t kMaxAttempts = 3;
+
+    bool Take();
+    void Reset() { attempts_ = 0; }
+    uint8_t attempts() const { return attempts_; }
+
+private:
+    uint8_t attempts_ = 0;
+};
 
 class BusinessIdGenerator {
 public:
@@ -74,6 +134,7 @@ class ConnectionReplayLedger {
 public:
     bool WasSent(SlotId slot, uint64_t insertion_ordinal) const;
     void MarkSent(SlotId slot, uint64_t insertion_ordinal);
+    void Forget(SlotId slot, uint64_t insertion_ordinal);
     void Reset();
 
 private:
@@ -146,8 +207,11 @@ private:
 
 class PlaybackIngressGate {
 public:
+    bool ArmPending();
     bool Arm(const char* case_id, uint32_t expected_bytes,
              uint32_t sample_rate, uint8_t bits, uint8_t channels);
+    bool Bind(const char* case_id, uint32_t expected_bytes,
+              uint32_t sample_rate, uint8_t bits, uint8_t channels);
     bool ReserveChunk(size_t bytes);
     void FailIngress();
     bool Matches(const char* case_id, uint32_t expected_bytes,
@@ -157,6 +221,7 @@ public:
     void Reset();
 
     bool armed() const { return armed_; }
+    bool bound() const { return bound_; }
     bool incomplete() const { return incomplete_; }
     uint32_t received_bytes() const { return received_bytes_; }
     uint32_t chunk_count() const { return chunk_count_; }
@@ -170,6 +235,7 @@ private:
     uint8_t bits_ = 0;
     uint8_t channels_ = 0;
     bool armed_ = false;
+    bool bound_ = false;
     bool incomplete_ = false;
 };
 
