@@ -78,22 +78,29 @@ export async function runFakeDevice({
       message.messageId === mediateMessageId && message.caseId === caseId);
 
     const chunks = [];
-    let audioStarted = false;
+    let audioStart;
+    let receivedBytes = 0;
     for (;;) {
       const incoming = await messages.next();
       if (incoming.isBinary) {
-        if (!audioStarted) throw new Error('Bridge sent PCM before audio.start');
+        if (!audioStart) throw new Error('Bridge sent PCM before the matching audio.start');
         const frame = decodeVoiceChunk(incoming.value, chunks.length);
         chunks.push(frame.payload);
+        receivedBytes += frame.payload.length;
         continue;
       }
       const message = incoming.value;
       if (message.type === 'error') throw new Error(`Bridge error: ${message.code}`);
       if (message.type === 'audio.start' && message.caseId === caseId) {
-        audioStarted = true;
+        if (audioStart) throw new Error('Bridge sent more than one matching audio.start');
+        assertVoiceStart(message, caseId);
+        audioStart = message;
         continue;
       }
-      if (message.type === 'audio.end' && message.caseId === caseId) break;
+      if (message.type === 'audio.end' && message.caseId === caseId) {
+        assertVoiceEnd(message, audioStart, receivedBytes, chunks.length);
+        break;
+      }
     }
 
     const pcm = Buffer.concat(chunks);
@@ -214,10 +221,28 @@ async function waitForJson(messages, predicate) {
 
 function decodeVoiceChunk(payload, expectedSequence) {
   const frame = decodeBinaryFrame(payload);
-  if (frame.kind !== FrameKind.STREAM_CHUNK || frame.streamType !== 0 || frame.sequence !== expectedSequence || frame.payload.length > 4096) {
+  if (frame.kind !== FrameKind.STREAM_CHUNK || frame.streamType !== 0 || frame.flags !== 0 ||
+      frame.sequence !== expectedSequence || frame.payload.length > 4096) {
     throw new Error('Bridge sent an invalid voice chunk');
   }
   return frame;
+}
+
+function assertVoiceStart(message, caseId) {
+  if (message.caseId !== caseId || message.audio?.sampleRate !== AUDIO.sampleRate ||
+      message.audio?.bits !== AUDIO.bits || message.audio?.channels !== AUDIO.channels ||
+      !Number.isInteger(message.bytes) || message.bytes < 0 || message.bytes % 2 !== 0) {
+    throw new Error('Bridge sent an invalid matching audio.start format');
+  }
+}
+
+function assertVoiceEnd(message, start, receivedBytes, chunkCount) {
+  if (!start) throw new Error('Bridge sent matching audio.end before audio.start');
+  const expectedLastSequence = chunkCount - 1;
+  if (chunkCount === 0 || message.complete !== true || message.bytes !== receivedBytes ||
+      start.bytes !== receivedBytes || message.lastSequence !== expectedLastSequence) {
+    throw new Error('Bridge sent inconsistent audio.end completion metadata');
+  }
 }
 
 function assertNonEmptyString(value, name) {

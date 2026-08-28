@@ -103,6 +103,10 @@ async function nextJson(channel, type) {
   }
 }
 
+function serializedCaseFromPrompt(prompt) {
+  return prompt.split('\n').find((line) => line.startsWith('{'));
+}
+
 async function authenticate(ws, channel, candidateToken = token, deviceId = 'device-1') {
   ws.send(JSON.stringify(control('hello', 'hello-1', {
     deviceId,
@@ -254,6 +258,183 @@ test('rejects cross-device speech and mediation before segment, file, ASR, or me
   });
 });
 
+test('releases CaseManager raw audio as soon as the durable WAV is staged', async () => {
+  const asrStarted = deferred();
+  const asrService = {
+    async transcribe(_wavPath, {signal} = {}) {
+      asrStarted.resolve();
+      return new Promise((resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(signal.reason), {once: true});
+      });
+    }
+  };
+  await withGateway(async ({url, cases}) => {
+    const ws = await openClient(url);
+    const channel = inbox(ws);
+    await authenticate(ws, channel);
+    ws.send(JSON.stringify(control('case.start', 'release-case-start', {caseId: 'release-case'})));
+    await nextJson(channel, 'ack');
+    ws.send(startFrame({messageId: 'release-start', caseId: 'release-case', segmentId: 'release-a', speaker: 'A'}));
+    await nextJson(channel, 'ack');
+    ws.send(streamFrame(FrameKind.STREAM_CHUNK, 0, Buffer.from([1, 0, 2, 0])));
+    ws.send(endFrame({messageId: 'release-end', caseId: 'release-case', segmentId: 'release-a', bytes: 4, lastSequence: 0}));
+    await nextJson(channel, 'ack');
+    await settleWithin(asrStarted.promise);
+
+    assert.throws(() => cases.endSegment('release-a'), /released|no assembled PCM/);
+    await closeClient(ws);
+  }, {asrService});
+});
+
+test('starting a new case aborts old work, forgets case sessions, and removes its durable WAV', async () => {
+  const asrStarted = deferred();
+  const oldCaseAborted = deferred();
+  const forgotten = [];
+  let asrCalls = 0;
+  const asrService = {
+    async transcribe(_wavPath, {signal} = {}) {
+      asrCalls += 1;
+      asrStarted.resolve();
+      return new Promise((resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          oldCaseAborted.resolve();
+          reject(signal.reason);
+        }, {once: true});
+      });
+    },
+    forgetCase(caseId) { forgotten.push(caseId); }
+  };
+  await withGateway(async ({gateway, url, tempDir, cases}) => {
+    const ws = await openClient(url);
+    const channel = inbox(ws);
+    await authenticate(ws, channel);
+    ws.send(JSON.stringify(control('case.start', 'old-case-start', {caseId: 'old-case'})));
+    await nextJson(channel, 'ack');
+    ws.send(startFrame({messageId: 'old-start', caseId: 'old-case', segmentId: 'old-a', speaker: 'A'}));
+    await nextJson(channel, 'ack');
+    ws.send(streamFrame(FrameKind.STREAM_CHUNK, 0, Buffer.from([1, 0, 2, 0])));
+    ws.send(endFrame({messageId: 'old-end', caseId: 'old-case', segmentId: 'old-a', bytes: 4, lastSequence: 0}));
+    await nextJson(channel, 'ack');
+    await settleWithin(asrStarted.promise);
+    ws.send(startFrame({messageId: 'old-queued-start', caseId: 'old-case', segmentId: 'old-b', speaker: 'B'}));
+    await nextJson(channel, 'ack');
+    ws.send(streamFrame(FrameKind.STREAM_CHUNK, 0, Buffer.from([3, 0, 4, 0])));
+    ws.send(endFrame({messageId: 'old-queued-end', caseId: 'old-case', segmentId: 'old-b', bytes: 4, lastSequence: 0}));
+    await nextJson(channel, 'ack');
+
+    ws.send(JSON.stringify(control('case.start', 'new-case-start', {caseId: 'new-case'})));
+    await nextJson(channel, 'ack');
+
+    await settleWithin(oldCaseAborted.promise);
+    assert.equal(await gateway.waitForIdle({timeoutMs: 500}), true);
+    assert.equal(asrCalls, 1);
+    assert.deepEqual(forgotten, ['old-case']);
+    assert.throws(() => cases.snapshot('old-case'), /unknown case/);
+    assert.deepEqual(await readdir(tempDir), []);
+    ws.send(JSON.stringify(control('mediate.request', 'late-old-mediate', {caseId: 'old-case'})));
+    assert.equal((await nextJson(channel, 'error')).code, 'case_not_found');
+    await closeClient(ws);
+  }, {asrService});
+});
+
+test('evicting a case forgets its mediator session before the case id is reused', async () => {
+  const mediation = {
+    conflictSummary: '双方对安排有分歧。',
+    aPosition: 'A 希望提前计划。',
+    bPosition: 'B 希望保留弹性。',
+    aCanImprove: 'A 可以说明优先级。',
+    bCanImprove: 'B 可以主动确认时间。',
+    commonGround: '双方都希望顺利完成。',
+    suggestions: ['共同列出时间表。'],
+    spokenText: '请共同列出时间表。'
+  };
+  const created = [];
+  const used = [];
+  await withGateway(async ({gateway, url, cases}) => {
+    const ws = await openClient(url);
+    const channel = inbox(ws);
+    await authenticate(ws, channel);
+
+    const startAndPopulate = async (messageId, suffix) => {
+      ws.send(JSON.stringify(control('case.start', messageId, {caseId: 'reused-case'})));
+      await nextJson(channel, 'ack');
+      for (const [speaker, text] of [['A', 'A 陈述'], ['B', 'B 陈述']]) {
+        const segmentId = `${speaker.toLowerCase()}-${suffix}`;
+        cases.startSegment({caseId: 'reused-case', segmentId, speaker, audio});
+        cases.appendChunk(segmentId, 0, Buffer.from([1, 0]));
+        cases.endSegment(segmentId);
+        cases.saveTranscript(segmentId, text);
+      }
+    };
+    const mediate = async (messageId) => {
+      ws.send(JSON.stringify(control('mediate.request', messageId, {caseId: 'reused-case'})));
+      await nextJson(channel, 'ack');
+      await nextJson(channel, 'audio.end');
+      await gateway.waitForIdle();
+    };
+
+    await startAndPopulate('first-reused-start', 'first');
+    await mediate('first-reused-mediate');
+    ws.send(JSON.stringify(control('case.start', 'intervening-start', {caseId: 'intervening-case'})));
+    await nextJson(channel, 'ack');
+    await startAndPopulate('second-reused-start', 'second');
+    await mediate('second-reused-mediate');
+
+    assert.deepEqual(created, ['reused-case', 'reused-case']);
+    assert.deepEqual(used, ['mediator-session-1', 'mediator-session-2']);
+    await closeClient(ws);
+  }, {
+    createMediatorSession: async (caseId) => {
+      created.push(caseId);
+      return `mediator-session-${created.length}`;
+    },
+    mediatorService: {async mediate(_snapshot, sessionId) { used.push(sessionId); return mediation; }},
+    ttsService: {async synthesize() { return Buffer.from([1, 0]); }}
+  });
+});
+
+test('reports the stable audio size limit code before accepting overflow', async () => {
+  await withGateway(async ({url}) => {
+    const ws = await openClient(url);
+    const channel = inbox(ws);
+    await authenticate(ws, channel);
+    ws.send(JSON.stringify(control('case.start', 'limit-case-start', {caseId: 'limit-case'})));
+    await nextJson(channel, 'ack');
+    ws.send(startFrame({messageId: 'limit-start', caseId: 'limit-case', segmentId: 'limit-a', speaker: 'A'}));
+    await nextJson(channel, 'ack');
+    for (let sequence = 0; sequence < 30; sequence += 1) {
+      ws.send(streamFrame(FrameKind.STREAM_CHUNK, sequence, Buffer.alloc(64_000)));
+    }
+    ws.send(streamFrame(FrameKind.STREAM_CHUNK, 30, Buffer.alloc(2)));
+
+    const error = await nextJson(channel, 'error');
+    assert.equal(error.code, 'audio_size_limit_exceeded');
+    assert.equal(error.message, 'Recording audio exceeded its allowed duration');
+    await closeClient(ws);
+  });
+});
+
+test('reports the stable case segment limit code for the sixty-fifth segment', async () => {
+  const cases = new CaseManager();
+  cases.startCase('device-1', 'full-case');
+  for (let index = 0; index < 64; index += 1) {
+    cases.startSegment({caseId: 'full-case', segmentId: `existing-${index}`, speaker: index % 2 ? 'B' : 'A', audio});
+  }
+  await withGateway(async ({url}) => {
+    const ws = await openClient(url);
+    const channel = inbox(ws);
+    await authenticate(ws, channel);
+    ws.send(JSON.stringify(control('case.start', 'full-case-start', {caseId: 'full-case'})));
+    await nextJson(channel, 'ack');
+    ws.send(startFrame({messageId: 'overflow-segment-start', caseId: 'full-case', segmentId: 'sixty-fifth', speaker: 'A'}));
+
+    const error = await nextJson(channel, 'error');
+    assert.equal(error.code, 'case_segment_limit_exceeded');
+    assert.equal(error.message, 'This case already has the maximum number of recordings');
+    await closeClient(ws);
+  }, {caseManager: cases});
+});
+
 test('shutdown waits for in-flight STREAM_END routing and blocks its post-stop WAV and ASR continuation', async () => {
   const renameStarted = deferred();
   const releaseRename = deferred();
@@ -327,6 +508,57 @@ test('shutdown aborts never-resolving ASR, closes clients, and removes its durab
     assert.equal(await closed, 1001);
     assert.deepEqual(await readdir(tempDir), []);
   }, {asrService});
+});
+
+test('default cancellation grace covers child termination and retries every owned temp cleanup within five seconds', async () => {
+  const asrStarted = deferred();
+  let childSettled = false;
+  let wavRemoveAttempts = 0;
+  const fileSystem = {
+    ...realFs,
+    async rm(candidate, options) {
+      if (String(candidate).endsWith('.wav') && ++wavRemoveAttempts <= 2) {
+        throw Object.assign(new Error('temporarily locked'), {code: 'EBUSY'});
+      }
+      return realFs.rm(candidate, options);
+    }
+  };
+  const asrService = {
+    async transcribe(_wavPath, {signal} = {}) {
+      asrStarted.resolve();
+      return new Promise((resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          const timer = setTimeout(() => {
+            childSettled = true;
+            reject(signal.reason);
+          }, 2_100);
+          timer.unref?.();
+        }, {once: true});
+      });
+    }
+  };
+  await withGateway(async ({gateway, url, tempDir}) => {
+    const ws = await openClient(url);
+    const channel = inbox(ws);
+    await authenticate(ws, channel);
+    ws.send(JSON.stringify(control('case.start', 'grace-case-start', {caseId: 'grace-case'})));
+    await nextJson(channel, 'ack');
+    ws.send(startFrame({messageId: 'grace-start', caseId: 'grace-case', segmentId: 'grace-a', speaker: 'A'}));
+    await nextJson(channel, 'ack');
+    ws.send(streamFrame(FrameKind.STREAM_CHUNK, 0, Buffer.from([1, 0, 2, 0])));
+    ws.send(endFrame({messageId: 'grace-end', caseId: 'grace-case', segmentId: 'grace-a', bytes: 4, lastSequence: 0}));
+    await nextJson(channel, 'ack');
+    await settleWithin(asrStarted.promise);
+
+    const startedAt = Date.now();
+    await gateway.shutdown();
+    const elapsed = Date.now() - startedAt;
+    assert.equal(childSettled, true);
+    assert.ok(elapsed >= 2_500, `shutdown returned too early after ${elapsed}ms`);
+    assert.ok(elapsed < 5_000, `shutdown exceeded its five-second budget at ${elapsed}ms`);
+    assert.ok(wavRemoveAttempts >= 3);
+    assert.deepEqual(await readdir(tempDir), []);
+  }, {asrService, gatewayOptions: {fileSystem}});
 });
 
 test('shutdown aborts never-resolving TTS and completes without post-stop playback', async () => {
@@ -422,6 +654,88 @@ test('reports audio_sequence_gap and does not transcribe a segment with a missin
     await gateway.waitForIdle();
     assert.deepEqual(transcripts, []);
     assert.equal(cases.snapshot('case-1').speakers.A[0].state, 'failed');
+    await closeClient(ws);
+  });
+});
+
+test('an exact speech.start retry after reconnect restores retained progress without duplicating chunks', async () => {
+  let transcriptions = 0;
+  let receivedPcm;
+  const asrService = {
+    async transcribe(wavPath) {
+      transcriptions += 1;
+      receivedPcm = parsePcmWav(await readFile(wavPath)).pcm;
+      await rm(wavPath);
+      return '断线续传完成';
+    }
+  };
+  await withGateway(async ({gateway, url}) => {
+    const first = await openClient(url);
+    const firstChannel = inbox(first);
+    await authenticate(first, firstChannel);
+    first.send(JSON.stringify(control('case.start', 'resume-case-start', {caseId: 'resume-case'})));
+    await nextJson(firstChannel, 'ack');
+    const retryableStart = startFrame({messageId: 'resume-start', caseId: 'resume-case', segmentId: 'resume-a', speaker: 'A'});
+    first.send(retryableStart);
+    const originalStartAck = await nextJson(firstChannel, 'ack');
+    const firstChunk = Buffer.from([1, 0, 2, 0]);
+    first.send(streamFrame(FrameKind.STREAM_CHUNK, 0, firstChunk));
+    await closeClient(first);
+
+    const second = await openClient(url);
+    const secondChannel = inbox(second);
+    await authenticate(second, secondChannel);
+    second.send(retryableStart);
+    assert.deepEqual(await nextJson(secondChannel, 'ack'), originalStartAck);
+    second.send(streamFrame(FrameKind.STREAM_CHUNK, 0, firstChunk));
+    const secondChunk = Buffer.from([3, 0, 4, 0]);
+    second.send(streamFrame(FrameKind.STREAM_CHUNK, 1, secondChunk));
+    second.send(endFrame({messageId: 'resume-end', caseId: 'resume-case', segmentId: 'resume-a', bytes: 8, lastSequence: 1}));
+    assert.equal((await nextJson(secondChannel, 'ack')).durable, true);
+    await nextJson(secondChannel, 'transcript.saved');
+    await gateway.waitForIdle();
+
+    assert.equal(transcriptions, 1);
+    assert.deepEqual(receivedPcm, Buffer.concat([firstChunk, secondChunk]));
+    await closeClient(second);
+  }, {asrService});
+});
+
+test('segment replay rejects changed format, speaker, and case instead of returning an old ACK', async () => {
+  await withGateway(async ({url}) => {
+    const ws = await openClient(url);
+    const channel = inbox(ws);
+    await authenticate(ws, channel);
+    ws.send(JSON.stringify(control('case.start', 'binding-case-start', {caseId: 'binding-case'})));
+    await nextJson(channel, 'ack');
+    ws.send(startFrame({messageId: 'binding-start', caseId: 'binding-case', segmentId: 'bound-segment', speaker: 'A'}));
+    await nextJson(channel, 'ack');
+    ws.send(streamFrame(FrameKind.STREAM_CHUNK, 0, Buffer.from([1, 0])));
+    ws.send(endFrame({messageId: 'binding-end', caseId: 'binding-case', segmentId: 'bound-segment', bytes: 2, lastSequence: 0}));
+    const durableAck = await nextJson(channel, 'ack');
+    await nextJson(channel, 'transcript.saved');
+
+    const changedFormat = control('speech.start', 'changed-format', {
+      caseId: 'binding-case',
+      segmentId: 'bound-segment',
+      speaker: 'A',
+      audio: {sampleRate: 8000, bits: 16, channels: 1}
+    });
+    ws.send(streamFrame(FrameKind.STREAM_START, 0, Buffer.from(JSON.stringify(changedFormat))));
+    const formatConflict = await nextJson(channel, 'error');
+    assert.equal(formatConflict.code, 'segment_conflict');
+
+    ws.send(startFrame({messageId: 'changed-speaker', caseId: 'binding-case', segmentId: 'bound-segment', speaker: 'B'}));
+    const speakerConflict = await nextJson(channel, 'error');
+    assert.equal(speakerConflict.code, 'segment_conflict');
+    assert.notDeepEqual(speakerConflict, durableAck);
+
+    ws.send(JSON.stringify(control('case.start', 'replacement-case-start', {caseId: 'replacement-case'})));
+    await nextJson(channel, 'ack');
+    ws.send(startFrame({messageId: 'changed-case', caseId: 'replacement-case', segmentId: 'bound-segment', speaker: 'A'}));
+    const caseConflict = await nextJson(channel, 'error');
+    assert.equal(caseConflict.code, 'segment_conflict');
+    assert.notDeepEqual(caseConflict, durableAck);
     await closeClient(ws);
   });
 });
@@ -537,7 +851,7 @@ test('serializes ASR, replays the original segment ACK, and streams canonical TT
 });
 
 async function startMockAgentStack() {
-  const calls = {sessions: [], turns: [], active: 0, maxActive: 0};
+  const calls = {sessions: [], turns: [], mediationPayloads: [], active: 0, maxActive: 0};
   const mediation = {
     conflictSummary: '双方对时间安排有不同想法。',
     aPosition: 'A 希望提前确定。',
@@ -560,21 +874,33 @@ async function startMockAgentStack() {
       const input = JSON.parse(body.toString('utf8'));
       calls.sessions.push(input.agentId);
       response.writeHead(200, {'content-type': 'application/json'});
-      response.end(JSON.stringify({sessionId: input.agentId === 'asr-agent' ? 'asr-session' : 'mediator-session'}));
+      response.end(JSON.stringify({session: {
+        sessionId: input.agentId === 'asr-agent' ? 'asr-session' : 'mediator-session'
+      }}));
       return;
     }
-    if (request.method === 'POST' && /^\/api\/sessions\/[^/]+\/turns$/.test(request.url)) {
+    if (request.method === 'POST' && /^\/api\/sessions\/[^/]+\/turns(?:\/audio)?$/.test(request.url)) {
       const sessionId = request.url.split('/')[3];
       calls.active += 1;
       calls.maxActive = Math.max(calls.maxActive, calls.active);
       const isAsr = sessionId === 'asr-session';
+      assert.equal(request.url, isAsr
+        ? '/api/sessions/asr-session/turns/audio'
+        : '/api/sessions/mediator-session/turns');
+      if (!isAsr) {
+        const input = JSON.parse(body.toString('utf8'));
+        assert.deepEqual(Object.keys(input), ['input']);
+        assert.deepEqual(Object.keys(input.input), ['type', 'text']);
+        assert.equal(input.input.type, 'text');
+        calls.mediationPayloads.push(serializedCaseFromPrompt(input.input.text));
+      }
       calls.turns.push(isAsr ? `asr-${++asrNumber}` : 'mediator');
       await new Promise((resolve) => setTimeout(resolve, 5));
       const assistantMessage = isAsr
         ? JSON.stringify({transcript: asrNumber === 1 ? 'A 的本地模拟陈述' : 'B 的本地模拟陈述', unclear: false})
         : JSON.stringify(mediation);
       response.writeHead(200, {'content-type': 'application/x-ndjson'});
-      response.end(`${JSON.stringify({type: 'assistant_message', message: assistantMessage})}\n${JSON.stringify({type: 'turn_finished', payload: {status: 'succeeded'}})}\n`);
+      response.end(`${JSON.stringify({event: 'assistant_message', payload: {text: assistantMessage}})}\n${JSON.stringify({event: 'turn_finished', payload: {status: 'succeeded'}})}\n`);
       calls.active -= 1;
       return;
     }
@@ -643,6 +969,15 @@ test('runs Bridge and the fake device through a local mock Agent Stack vertical 
     assert.deepEqual(parsePcmWav(await readFile(outputPath)).pcm, voice);
     assert.deepEqual(mock.calls.sessions, ['asr-agent', 'mediator-agent']);
     assert.deepEqual(mock.calls.turns, ['asr-1', 'asr-2', 'mediator']);
+    assert.equal(mock.calls.mediationPayloads.length, 1);
+    const mediationInput = JSON.parse(mock.calls.mediationPayloads[0]);
+    assert.match(mediationInput.caseId, /^fake-case-/);
+    assert.equal(mock.calls.mediationPayloads[0], JSON.stringify({
+      caseId: mediationInput.caseId,
+      A: [{index: 1, text: 'A 的本地模拟陈述'}],
+      B: [{index: 1, text: 'B 的本地模拟陈述'}],
+      requirements: {neutral: true, noWinner: true, language: 'zh-CN'}
+    }));
     assert.equal(mock.calls.maxActive, 1);
     assert.deepEqual(advertised, [{
       name: '小理本机 Bridge',
@@ -685,6 +1020,7 @@ test('fake device preserves an early transcript event while waiting for the next
           ws.send(JSON.stringify({v: 1, type: 'ack', messageId: message.messageId, caseId: 'other-case', accepted: true}));
           ws.send(JSON.stringify({v: 1, type: 'ack', messageId: message.messageId, caseId: message.caseId, accepted: true}));
           ws.send(JSON.stringify({v: 1, type: 'audio.start', caseId: 'other-case', audio, bytes: voice.length}));
+          ws.send(JSON.stringify({v: 1, type: 'audio.end', caseId: 'other-case', bytes: 0, lastSequence: 0, complete: true}));
           ws.send(JSON.stringify({v: 1, type: 'audio.start', caseId: message.caseId, audio, bytes: voice.length}));
           ws.send(encodeBinaryFrame({kind: FrameKind.STREAM_CHUNK, streamType: 0, flags: 0, sequence: 0, payload: voice}));
           ws.send(JSON.stringify({v: 1, type: 'audio.end', caseId: message.caseId, bytes: voice.length, lastSequence: 0, complete: true}));
@@ -714,6 +1050,125 @@ test('fake device preserves an early transcript event while waiting for the next
   } finally {
     for (const client of wss.clients) client.terminate();
     await new Promise((resolve) => wss.close(resolve));
+    await rm(directory, {recursive: true, force: true});
+  }
+});
+
+async function withFakePlaybackServer(playback, run) {
+  const wss = new WebSocketServer({host: '127.0.0.1', port: 0, path: '/device'});
+  await new Promise((resolve, reject) => {
+    wss.once('listening', resolve);
+    wss.once('error', reject);
+  });
+  wss.on('connection', (ws) => {
+    const speakers = new Map();
+    ws.on('message', (data, isBinary) => {
+      if (!isBinary) {
+        const message = JSON.parse(data.toString('utf8'));
+        if (message.type === 'hello') {
+          ws.send(JSON.stringify({v: 1, type: 'hello.ack', messageId: message.messageId, deviceId: message.deviceId, protocol: 1}));
+        } else if (message.type === 'case.start') {
+          ws.send(JSON.stringify({v: 1, type: 'ack', messageId: message.messageId, caseId: message.caseId, accepted: true}));
+        } else if (message.type === 'mediate.request') {
+          ws.send(JSON.stringify({v: 1, type: 'ack', messageId: message.messageId, caseId: message.caseId, accepted: true}));
+          playback(ws, message.caseId);
+        }
+        return;
+      }
+      const frame = decodeBinaryFrame(data);
+      if (frame.kind === FrameKind.STREAM_START) {
+        const message = JSON.parse(frame.payload.toString('utf8'));
+        speakers.set(message.segmentId, message.speaker);
+        ws.send(JSON.stringify({v: 1, type: 'ack', messageId: message.messageId, caseId: message.caseId, segmentId: message.segmentId, accepted: true}));
+      } else if (frame.kind === FrameKind.STREAM_END) {
+        const message = JSON.parse(frame.payload.toString('utf8'));
+        ws.send(JSON.stringify({v: 1, type: 'ack', messageId: message.messageId, caseId: message.caseId, segmentId: message.segmentId, bytes: message.bytes, durable: true}));
+        ws.send(JSON.stringify({
+          v: 1,
+          type: 'transcript.saved',
+          caseId: message.caseId,
+          segmentId: message.segmentId,
+          speaker: speakers.get(message.segmentId)
+        }));
+      }
+    });
+  });
+  const address = wss.address();
+  try {
+    await run(`ws://127.0.0.1:${address.port}/device`);
+  } finally {
+    for (const client of wss.clients) client.terminate();
+    await new Promise((resolve) => wss.close(resolve));
+  }
+}
+
+test('fake device rejects duplicate or wrong-format matching audio.start events', async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'xiaoli-fake-start-oracle-'));
+  const voice = Buffer.from([1, 0, 2, 0]);
+  try {
+    await t.test('duplicate matching start', async () => {
+      await withFakePlaybackServer((ws, caseId) => {
+        const start = {v: 1, type: 'audio.start', caseId, audio, bytes: voice.length};
+        ws.send(JSON.stringify(start));
+        ws.send(JSON.stringify(start));
+        ws.send(encodeBinaryFrame({kind: FrameKind.STREAM_CHUNK, streamType: 0, flags: 0, sequence: 0, payload: voice}));
+        ws.send(JSON.stringify({v: 1, type: 'audio.end', caseId, bytes: voice.length, lastSequence: 0, complete: true}));
+      }, async (url) => {
+        await assert.rejects(() => runFakeDevice({url, token, outputPath: path.join(directory, 'duplicate.wav')}), /audio\.start|exactly one|duplicate/i);
+      });
+    });
+    await t.test('wrong matching format', async () => {
+      await withFakePlaybackServer((ws, caseId) => {
+        ws.send(JSON.stringify({v: 1, type: 'audio.start', caseId, audio: {...audio, sampleRate: 8000}, bytes: voice.length}));
+        ws.send(encodeBinaryFrame({kind: FrameKind.STREAM_CHUNK, streamType: 0, flags: 0, sequence: 0, payload: voice}));
+        ws.send(JSON.stringify({v: 1, type: 'audio.end', caseId, bytes: voice.length, lastSequence: 0, complete: true}));
+      }, async (url) => {
+        await assert.rejects(() => runFakeDevice({url, token, outputPath: path.join(directory, 'format.wav')}), /audio\.start|format|16000/i);
+      });
+    });
+  } finally {
+    await rm(directory, {recursive: true, force: true});
+  }
+});
+
+test('fake device rejects audio.end metadata inconsistent with received PCM', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'xiaoli-fake-end-oracle-'));
+  const voice = Buffer.from([1, 0, 2, 0]);
+  try {
+    await withFakePlaybackServer((ws, caseId) => {
+      ws.send(JSON.stringify({v: 1, type: 'audio.start', caseId, audio, bytes: voice.length}));
+      ws.send(encodeBinaryFrame({kind: FrameKind.STREAM_CHUNK, streamType: 0, flags: 0, sequence: 0, payload: voice}));
+      ws.send(JSON.stringify({v: 1, type: 'audio.end', caseId, bytes: voice.length + 2, lastSequence: 4, complete: false}));
+    }, async (url) => {
+      await assert.rejects(() => runFakeDevice({url, token, outputPath: path.join(directory, 'bad-end.wav')}), /audio\.end|completion|metadata/i);
+    });
+  } finally {
+    await rm(directory, {recursive: true, force: true});
+  }
+});
+
+test('fake device rejects discontinuous or oversized voice chunks', async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'xiaoli-fake-chunk-oracle-'));
+  try {
+    await t.test('discontinuous sequence', async () => {
+      const voice = Buffer.from([1, 0, 2, 0]);
+      await withFakePlaybackServer((ws, caseId) => {
+        ws.send(JSON.stringify({v: 1, type: 'audio.start', caseId, audio, bytes: voice.length}));
+        ws.send(encodeBinaryFrame({kind: FrameKind.STREAM_CHUNK, streamType: 0, flags: 0, sequence: 1, payload: voice}));
+      }, async (url) => {
+        await assert.rejects(() => runFakeDevice({url, token, outputPath: path.join(directory, 'gap.wav')}), /voice chunk|sequence/i);
+      });
+    });
+    await t.test('oversized payload', async () => {
+      const voice = Buffer.alloc(4_098);
+      await withFakePlaybackServer((ws, caseId) => {
+        ws.send(JSON.stringify({v: 1, type: 'audio.start', caseId, audio, bytes: voice.length}));
+        ws.send(encodeBinaryFrame({kind: FrameKind.STREAM_CHUNK, streamType: 0, flags: 0, sequence: 0, payload: voice}));
+      }, async (url) => {
+        await assert.rejects(() => runFakeDevice({url, token, outputPath: path.join(directory, 'oversized.wav')}), /voice chunk|4096|invalid/i);
+      });
+    });
+  } finally {
     await rm(directory, {recursive: true, force: true});
   }
 });

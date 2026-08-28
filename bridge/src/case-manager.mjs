@@ -2,8 +2,21 @@ import { assertApprovedPcmFormat } from './audio/wav.mjs';
 
 const ACTIVE_STATES = new Set(['receiving', 'queued', 'transcribing']);
 const TERMINAL_STATES = new Set(['saved', 'failed']);
+export const MAX_PCM_BYTES_PER_SEGMENT = 1_920_000;
+export const MAX_SEGMENTS_PER_CASE = 64;
+
+export class CaseResourceLimitError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = 'CaseResourceLimitError';
+    this.code = code;
+  }
+}
 
 export class CaseManager {
+  #segmentBindings = new Map();
+  #currentCases = new Map();
+
   constructor() {
     this.cases = new Map();
     this.segments = new Map();
@@ -20,17 +33,30 @@ export class CaseManager {
       return snapshotCase(existing, this.segments);
     }
 
+    const previousCaseId = this.#currentCases.get(deviceId);
+    if (previousCaseId && previousCaseId !== caseId) this.#evictCase(previousCaseId);
+
     const caseRecord = {
       deviceId,
       caseId,
       speakers: {A: [], B: []}
     };
     this.cases.set(caseId, caseRecord);
+    this.#currentCases.set(deviceId, caseId);
     return snapshotCase(caseRecord, this.segments);
+  }
+
+  currentCaseId(deviceId) {
+    assertIdentifier(deviceId, 'deviceId');
+    return this.#currentCases.get(deviceId);
   }
 
   startSegment(meta) {
     const normalized = normalizeMeta(meta);
+    const binding = this.#segmentBindings.get(normalized.segmentId);
+    if (binding && !sameMeta(binding, normalized)) {
+      throw new Error(`segment ${normalized.segmentId} conflicts with existing metadata`);
+    }
     const existing = this.segments.get(normalized.segmentId);
     if (existing) {
       if (!sameMeta(existing, normalized)) {
@@ -40,15 +66,21 @@ export class CaseManager {
     }
 
     const caseRecord = this.#requireCase(normalized.caseId);
+    if (caseRecord.speakers.A.length + caseRecord.speakers.B.length >= MAX_SEGMENTS_PER_CASE) {
+      throw new CaseResourceLimitError('case_segment_limit_exceeded', 'Case has reached the segment limit');
+    }
     const segment = {
       ...normalized,
       chunks: new Map(),
+      receivedBytes: 0,
       state: 'receiving',
       pcm: null,
+      audioReleased: false,
       transcript: null,
       failure: null
     };
     this.segments.set(segment.segmentId, segment);
+    this.#segmentBindings.set(segment.segmentId, normalized);
     caseRecord.speakers[segment.speaker].push(segment.segmentId);
     return snapshotSegment(segment);
   }
@@ -71,12 +103,16 @@ export class CaseManager {
     if (segment.state !== 'receiving') {
       throw new Error(`segment ${segmentId} is not receiving audio`);
     }
+    if (segment.receivedBytes + pcm.length > MAX_PCM_BYTES_PER_SEGMENT) {
+      throw new CaseResourceLimitError('audio_size_limit_exceeded', 'Recording audio exceeds the 60-second limit');
+    }
 
     const expected = segment.chunks.size;
     if (sequence !== expected) {
       throw new Error(`missing audio sequence ${expected}`);
     }
     segment.chunks.set(sequence, Buffer.from(pcm));
+    segment.receivedBytes += pcm.length;
     return snapshotSegment(segment);
   }
 
@@ -87,6 +123,15 @@ export class CaseManager {
       segment.state = 'queued';
     }
     return completedSegment(segment);
+  }
+
+  releaseAudio(segmentId) {
+    const segment = this.#requireSegment(segmentId);
+    if (segment.state === 'receiving') {
+      throw new Error(`segment ${segmentId} is still receiving audio`);
+    }
+    releaseSegmentAudio(segment);
+    return snapshotSegment(segment);
   }
 
   beginTranscription(segmentId) {
@@ -115,6 +160,7 @@ export class CaseManager {
     }
     segment.transcript = transcript;
     segment.state = 'saved';
+    releaseSegmentAudio(segment);
     return snapshotSegment(segment);
   }
 
@@ -131,6 +177,7 @@ export class CaseManager {
     }
     segment.failure = failure;
     segment.state = 'failed';
+    releaseSegmentAudio(segment);
     return snapshotSegment(segment);
   }
 
@@ -155,6 +202,18 @@ export class CaseManager {
     }
     return segment;
   }
+
+  #evictCase(caseId) {
+    const caseRecord = this.cases.get(caseId);
+    if (!caseRecord) return;
+    for (const segmentId of [...caseRecord.speakers.A, ...caseRecord.speakers.B]) {
+      const segment = this.segments.get(segmentId);
+      if (segment) releaseSegmentAudio(segment);
+      this.segments.delete(segmentId);
+    }
+    this.cases.delete(caseId);
+    if (this.#currentCases.get(caseRecord.deviceId) === caseId) this.#currentCases.delete(caseRecord.deviceId);
+  }
 }
 
 function normalizeMeta(meta) {
@@ -167,16 +226,16 @@ function normalizeMeta(meta) {
     throw new RangeError('speaker must be A or B');
   }
   assertApprovedPcmFormat(meta.audio);
-  return {
+  return Object.freeze({
     caseId: meta.caseId,
     segmentId: meta.segmentId,
     speaker: meta.speaker,
-    audio: {
+    audio: Object.freeze({
       sampleRate: meta.audio.sampleRate,
       bits: meta.audio.bits,
       channels: meta.audio.channels
-    }
-  };
+    })
+  });
 }
 
 function sameMeta(segment, meta) {
@@ -221,12 +280,18 @@ function assertEvenPcm(pcm) {
 
 function completedSegment(segment) {
   if (!segment.pcm) {
-    throw new Error(`segment ${segment.segmentId} has no assembled PCM`);
+    throw new Error(`segment ${segment.segmentId} has no assembled PCM or its raw audio was released`);
   }
   return {
     ...snapshotSegment(segment),
     pcm: Buffer.from(segment.pcm)
   };
+}
+
+function releaseSegmentAudio(segment) {
+  segment.chunks.clear();
+  segment.pcm = null;
+  segment.audioReleased = true;
 }
 
 function snapshotCase(caseRecord, segments) {

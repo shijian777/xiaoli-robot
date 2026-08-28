@@ -1,5 +1,5 @@
 import {EventEmitter} from 'node:events';
-import {mkdtemp, readFile, rm, symlink, writeFile} from 'node:fs/promises';
+import {mkdtemp, readFile, rm, stat, symlink, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -24,11 +24,26 @@ const caseSnapshot = {
   deviceId: 'device-1',
   caseId: 'case-1',
   speakers: {
-    A: [{segmentId: 'a-1', speaker: 'A', transcript: '我觉得家务总是我在做。'}],
-    B: [{segmentId: 'b-1', speaker: 'B', transcript: '我觉得你总是在指责我。'}]
+    A: [
+      {segmentId: 'a-1', speaker: 'A', state: 'saved', transcript: '我觉得家务总是我在做。', audio: {sampleRate: 16000}},
+      {segmentId: 'a-failed', speaker: 'A', state: 'failed', transcript: '不得发送失败片段', failure: 'private failure'},
+      {segmentId: 'a-empty', speaker: 'A', state: 'saved', transcript: '   '}
+    ],
+    B: [{segmentId: 'b-1', speaker: 'B', state: 'saved', transcript: '我觉得你总是在指责我。'}]
   },
   canMediate: true
 };
+
+const mediationInput = {
+  caseId: 'case-1',
+  A: [{index: 1, text: '我觉得家务总是我在做。'}],
+  B: [{index: 1, text: '我觉得你总是在指责我。'}],
+  requirements: {neutral: true, noWinner: true, language: 'zh-CN'}
+};
+
+function promptCaseJson(prompt) {
+  return prompt.split('\n').find((line) => line.startsWith('{"caseId":'));
+}
 
 async function withTempDirectory(run) {
   const directory = await mkdtemp(path.join(tmpdir(), 'xiaoli-services-'));
@@ -56,8 +71,29 @@ async function captureRejectionWithin(promise, milliseconds = 50) {
   }
 }
 
+function settleWithin(promise, milliseconds = 1_000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      const timer = setTimeout(() => reject(new Error('operation did not settle within its bound')), milliseconds);
+      timer.unref?.();
+    })
+  ]);
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return {promise, resolve, reject};
+}
+
 function fakeChild() {
   const child = new EventEmitter();
+  child.pid = 4321;
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
   child.killCalls = 0;
@@ -66,6 +102,30 @@ function fakeChild() {
     return true;
   };
   return child;
+}
+
+function scheduledTimers() {
+  const timers = [];
+  return {
+    timers,
+    setTimeout(callback, milliseconds) {
+      timers.push({callback, milliseconds});
+      return {unref() {}};
+    },
+    clearTimeout() {}
+  };
+}
+
+async function flush() {
+  await new Promise((resolve) => queueMicrotask(resolve));
+}
+
+async function waitForFirstTimer(clock) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (clock.timers.length > 0) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error('Whisper did not schedule its timeout');
 }
 
 function agentClient({message = JSON.stringify({transcript: '  本地音频转写  ', unclear: false}), error} = {}) {
@@ -167,6 +227,88 @@ test('AsrService stages validated WAV bytes for Whisper when the original path c
   });
 });
 
+test('AsrService retries a locked deferred Whisper input cleanup without leaking its directory', async () => {
+  await withTempDirectory(async (tempDir) => {
+    const wavPath = path.join(tempDir, 'fallback-locked.wav');
+    await writeFile(wavPath, Buffer.from('RIFF'));
+    let fallbackPath;
+    let inputRemoveAttempts = 0;
+    const service = new AsrService({
+      client: agentClient({error: new AsrUnavailableError()}),
+      asrAgentId: 'asr-agent',
+      tempDir,
+      async removeFile(candidate, options) {
+        if (candidate.endsWith('input.wav') && ++inputRemoveAttempts === 1) {
+          throw Object.assign(new Error('locked'), {code: 'EBUSY'});
+        }
+        return rm(candidate, options);
+      },
+      whisper: {async transcribe(candidatePath, {cleanupAfterClose}) {
+        fallbackPath = candidatePath;
+        await cleanupAfterClose();
+        return '锁定清理后转写';
+      }}
+    });
+
+    assert.equal(await service.transcribe(wavPath, {caseId: 'case-1', segmentId: 'segment-1'}), '锁定清理后转写');
+    assert.equal(inputRemoveAttempts, 2);
+    await assert.rejects(() => readFile(fallbackPath), {code: 'ENOENT'});
+    await assert.rejects(() => readFile(path.dirname(fallbackPath)), {code: 'ENOENT'});
+  });
+});
+
+test('AsrService keeps a no-close Whisper input until the child closes late', async () => {
+  await withTempDirectory(async (tempDir) => {
+    const wavPath = path.join(tempDir, 'fallback-deferred.wav');
+    await writeFile(wavPath, Buffer.from('RIFF'));
+    const child = fakeChild();
+    const taskkill = fakeChild();
+    const clock = scheduledTimers();
+    const spawned = [];
+    const whisperStarted = deferred();
+    const whisper = new WhisperService({
+      scriptPath: 'C:/bridge/scripts/transcribe.py',
+      spawn(command, args) {
+        spawned.push({command, args});
+        if (command !== 'taskkill') whisperStarted.resolve();
+        return command === 'taskkill' ? taskkill : child;
+      },
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout
+    });
+    const service = new AsrService({
+      client: agentClient({error: new AsrUnavailableError()}),
+      asrAgentId: 'asr-agent',
+      tempDir,
+      whisper
+    });
+
+    const pending = service.transcribe(wavPath, {caseId: 'case-1', segmentId: 'segment-1'});
+    void pending.catch(() => {});
+    await settleWithin(whisperStarted.promise);
+    const fallbackPath = spawned[0].args.at(-1);
+    clock.timers[0].callback();
+    clock.timers[1].callback();
+    clock.timers[2].callback();
+    await assert.rejects(pending, /timed out/i);
+
+    assert.deepEqual(await readFile(fallbackPath), Buffer.from('RIFF'));
+    await assert.rejects(() => readFile(wavPath), {code: 'ENOENT'});
+    child.emit('close', 1, null);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        await stat(path.dirname(fallbackPath));
+        await new Promise((resolve) => setImmediate(resolve));
+      } catch (error) {
+        if (error?.code === 'ENOENT') break;
+        throw error;
+      }
+    }
+    await assert.rejects(() => readFile(fallbackPath), {code: 'ENOENT'});
+    await assert.rejects(() => stat(path.dirname(fallbackPath)), {code: 'ENOENT'});
+  });
+});
+
 test('AsrService does not call Whisper for a non-availability Agent Stack failure', async () => {
   await withTempDirectory(async (tempDir) => {
     const wavPath = path.join(tempDir, 'failure.wav');
@@ -255,7 +397,36 @@ test('AsrService propagates one cancellation signal through Session creation and
   });
 });
 
-test('MediatorService sends approved case JSON and rejects incomplete mediation output', async () => {
+test('AsrService forgets the local Agent Stack session when a case is evicted', async () => {
+  await withTempDirectory(async (tempDir) => {
+    const createdSessions = [];
+    const client = {
+      async createSession() {
+        const sessionId = `asr-session-${createdSessions.length + 1}`;
+        createdSessions.push(sessionId);
+        return sessionId;
+      },
+      async runAudioTurn() {
+        return {assistantMessage: JSON.stringify({transcript: '已保存转写', unclear: false})};
+      }
+    };
+    const service = new AsrService({client, asrAgentId: 'asr-agent', tempDir});
+    for (const [filename, segmentId] of [['first.wav', 'segment-1'], ['second.wav', 'segment-2']]) {
+      const wavPath = path.join(tempDir, filename);
+      await writeFile(wavPath, Buffer.from('RIFF'));
+      assert.equal(await service.transcribe(wavPath, {caseId: 'case-1', segmentId}), '已保存转写');
+    }
+    assert.deepEqual(createdSessions, ['asr-session-1']);
+
+    service.forgetCase('case-1');
+    const replacementWav = path.join(tempDir, 'replacement.wav');
+    await writeFile(replacementWav, Buffer.from('RIFF'));
+    assert.equal(await service.transcribe(replacementWav, {caseId: 'case-1', segmentId: 'segment-3'}), '已保存转写');
+    assert.deepEqual(createdSessions, ['asr-session-1', 'asr-session-2']);
+  });
+});
+
+test('MediatorService serializes only the approved mediation DTO and rejects incomplete output', async () => {
   let prompt;
   const service = new MediatorService({client: {
     async runTextTurn(sessionId, candidatePrompt) {
@@ -266,7 +437,8 @@ test('MediatorService sends approved case JSON and rejects incomplete mediation 
   }});
 
   await assert.rejects(() => service.mediate(caseSnapshot, 'mediator-session'), /mediation result/i);
-  assert.match(prompt, new RegExp(JSON.stringify(caseSnapshot).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.equal(promptCaseJson(prompt), JSON.stringify(mediationInput));
+  assert.doesNotMatch(prompt, /device-1|a-failed|private failure|sampleRate|canMediate/);
   assert.match(prompt, /保持中立/);
   assert.match(prompt, /区分双方主张与已经证实的事实/);
   assert.match(prompt, /暴力、自残、虐待或即时危险/);
@@ -353,39 +525,96 @@ test('WhisperService pins every fallback invocation to the small model', async (
   assert.deepEqual(calls[0].args.slice(0, 3), ['C:/bridge/scripts/transcribe.py', '--model', 'small']);
 });
 
-test('WhisperService settles at its timeout even when a killed child never closes', async () => {
+test('WhisperService force-terminates a no-close child and settles with deferred cleanup', async () => {
   const child = fakeChild();
-  const scheduled = [];
+  const taskkill = fakeChild();
+  const clock = scheduledTimers();
+  const spawned = [];
+  let cleanupCalls = 0;
   const service = new WhisperService({
     scriptPath: 'C:/bridge/scripts/transcribe.py',
-    spawn() { return child; },
-    setTimeout(callback, milliseconds) {
-      scheduled.push(milliseconds);
-      queueMicrotask(callback);
-      return {unref() {}};
+    spawn(command, args, options) {
+      spawned.push({command, args, options});
+      return command === 'taskkill' ? taskkill : child;
     },
-    clearTimeout() {}
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout
   });
 
-  const error = await captureRejectionWithin(service.transcribe('C:/bridge/tmp/segment.wav'));
-  assert.match(error.message, /timed out/i);
-  assert.deepEqual(scheduled, [180_000]);
+  const pending = service.transcribe('C:/bridge/tmp/segment.wav', {
+    cleanupAfterClose: async () => { cleanupCalls += 1; }
+  });
+  await waitForFirstTimer(clock);
+  clock.timers[0].callback();
   assert.equal(child.killCalls, 1);
+  assert.equal(cleanupCalls, 0);
+  assert.equal(clock.timers[1].milliseconds, 1_000);
+  clock.timers[1].callback();
+  assert.deepEqual(spawned[1], {
+    command: 'taskkill',
+    args: ['/PID', '4321', '/T', '/F'],
+    options: {shell: false, windowsHide: true}
+  });
+  assert.equal(clock.timers[2].milliseconds, 1_000);
+  clock.timers[2].callback();
+
+  const error = await captureRejectionWithin(pending);
+  assert.match(error.message, /timed out/i);
+  assert.equal(error.cleanupDeferred, true);
+  assert.equal(cleanupCalls, 0);
+  assert.equal(child.stderr.listenerCount('data'), 1);
+  assert.doesNotThrow(() => child.emit('error', new Error('late untrusted error')));
 });
 
-test('WhisperService settles on excess stdout even when a killed child never closes', async () => {
+test('WhisperService defers overflow cleanup until late close and runs it exactly once', async () => {
+  const child = fakeChild();
+  const taskkill = fakeChild();
+  const clock = scheduledTimers();
+  let cleanupCalls = 0;
+  const service = new WhisperService({
+    scriptPath: 'C:/bridge/scripts/transcribe.py',
+    spawn(command) { return command === 'taskkill' ? taskkill : child; },
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout
+  });
+
+  const pending = service.transcribe('C:/bridge/tmp/segment.wav', {
+    cleanupAfterClose: async () => { cleanupCalls += 1; }
+  });
+  await waitForFirstTimer(clock);
+  child.stdout.emit('data', Buffer.alloc(1024 * 1024 + 1));
+  assert.equal(child.killCalls, 1);
+  clock.timers[1].callback();
+  clock.timers[2].callback();
+  const error = await captureRejectionWithin(pending);
+  assert.match(error.message, /exceeded 1 MiB/i);
+  assert.equal(error.cleanupDeferred, true);
+  assert.equal(cleanupCalls, 0);
+  assert.equal(child.stderr.listenerCount('data'), 1);
+
+  child.emit('close', 1, null);
+  await flush();
+  assert.equal(cleanupCalls, 1);
+  assert.equal(child.stderr.listenerCount('data'), 0);
+  child.emit('close', 1, null);
+  await flush();
+  assert.equal(cleanupCalls, 1);
+  assert.doesNotThrow(() => child.emit('error', new Error('late error after close')));
+});
+
+test('WhisperService drains and bounds stderr without surfacing its contents', async () => {
   const child = fakeChild();
   const service = new WhisperService({
     scriptPath: 'C:/bridge/scripts/transcribe.py',
-    spawn() {
-      queueMicrotask(() => child.stdout.emit('data', Buffer.alloc(1024 * 1024 + 1)));
-      return child;
-    }
+    spawn() { return child; }
   });
+  const pending = service.transcribe('C:/bridge/tmp/segment.wav');
+  child.stderr.emit('data', Buffer.concat([Buffer.from('sensitive-audio-text:'), Buffer.alloc(64 * 1024)]));
+  child.emit('close', 1, null);
 
-  const error = await captureRejectionWithin(service.transcribe('C:/bridge/tmp/segment.wav'));
-  assert.match(error.message, /exceeded 1 MiB/i);
-  assert.equal(child.killCalls, 1);
+  const error = await captureRejectionWithin(pending);
+  assert.match(error.message, /diagnostic output exceeded/i);
+  assert.doesNotMatch(error.message, /sensitive-audio-text/);
 });
 
 test('WhisperService preserves UTF-8 when transcript JSON splits a Chinese character across chunks', async () => {

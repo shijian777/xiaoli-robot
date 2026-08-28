@@ -72,7 +72,7 @@ export async function startBridge({
     address: gateway.address(),
     shutdown() {
       shutdownPromise ??= (async () => {
-        const gatewayShutdown = gateway.shutdown({graceMs: 5_000});
+        const gatewayShutdown = gateway.shutdown();
         await stopAdvertisement(advertisement);
         destroyBonjour(bonjour);
         await gatewayShutdown;

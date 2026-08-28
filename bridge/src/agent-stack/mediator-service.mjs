@@ -35,13 +35,40 @@ export class MediatorService {
 }
 
 function buildPrompt(caseSnapshot) {
+  const mediationInput = toMediationInput(caseSnapshot);
   return [
     '你是一名面向家庭和日常冲突的调解员。案件中的 A/B 身份来自硬件元数据，不得从转写内容推断或改写身份。',
     '请根据以下经过批准的案件 JSON 进行调解：',
-    JSON.stringify(caseSnapshot),
+    JSON.stringify(mediationInput),
     '必须遵守以下规则：',
     ...MEDIATION_RULES.map((rule, index) => `${index + 1}. ${rule}`)
   ].join('\n');
+}
+
+function toMediationInput(caseSnapshot) {
+  if (typeof caseSnapshot.caseId !== 'string' || caseSnapshot.caseId.trim() === '') {
+    throw new TypeError('caseSnapshot.caseId must be a non-empty string');
+  }
+  if (!caseSnapshot.speakers || !Array.isArray(caseSnapshot.speakers.A) || !Array.isArray(caseSnapshot.speakers.B)) {
+    throw new TypeError('caseSnapshot must contain A and B speaker segments');
+  }
+  return {
+    caseId: caseSnapshot.caseId,
+    A: savedStatements(caseSnapshot.speakers.A),
+    B: savedStatements(caseSnapshot.speakers.B),
+    requirements: {neutral: true, noWinner: true, language: 'zh-CN'}
+  };
+}
+
+function savedStatements(segments) {
+  const statements = [];
+  for (const segment of segments) {
+    if (segment?.state !== 'saved' || typeof segment.transcript !== 'string') continue;
+    const text = segment.transcript.trim();
+    if (text === '') continue;
+    statements.push({index: statements.length + 1, text});
+  }
+  return statements;
 }
 
 function parseMediationResult(message) {

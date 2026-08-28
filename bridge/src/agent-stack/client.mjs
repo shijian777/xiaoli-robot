@@ -61,13 +61,6 @@ function abortError() {
   return new DOMException('This operation was aborted', 'AbortError');
 }
 
-function eventMessage(event) {
-  for (const value of [event.message, event.content, event.text, event.data?.message, event.data?.content, event.data?.text]) {
-    if (typeof value === 'string') return value;
-  }
-  return undefined;
-}
-
 /**
  * Small Agent Stack transport. Turn POSTs are never retried: without a
  * server-issued idempotency guarantee, replaying one could duplicate effects.
@@ -108,7 +101,7 @@ export class AgentStackClient {
       signal
     });
     const body = await this.#jsonResponse(response);
-    const sessionId = body.sessionId ?? body.id ?? body.session?.id;
+    const sessionId = body.session?.sessionId;
     if (typeof sessionId !== 'string' || sessionId === '') throw new Error('Agent Stack create-session response did not include a session id');
     return sessionId;
   }
@@ -127,7 +120,8 @@ export class AgentStackClient {
   }
 
   async #runTurn(sessionId, options, audio, signal) {
-    const response = await this.#request(`/api/sessions/${encodeURIComponent(sessionId)}/turns`, {
+    const suffix = audio ? '/turns/audio' : '/turns';
+    const response = await this.#request(`/api/sessions/${encodeURIComponent(sessionId)}${suffix}`, {
       method: 'POST',
       ...options,
       signal
@@ -145,17 +139,17 @@ export class AgentStackClient {
     for await (const rawEvent of readTurnEvents(response.body)) {
       const event = this.#sanitize(rawEvent);
       events.push(event);
-      if (event.type === 'assistant_message') {
+      if (event.event === 'assistant_message') {
         assistantMessageCount += 1;
-        assistantMessage = eventMessage(event);
+        assistantMessage = event.payload?.text;
       }
-      if (event.type === 'turn_error') {
+      if (event.event === 'turn_error') {
         turnError = {
-          code: typeof event.code === 'string' ? event.code : 'UNKNOWN',
-          message: typeof event.message === 'string' ? event.message : 'Agent Stack turn failed'
+          code: typeof event.payload?.code === 'string' ? event.payload.code : 'UNKNOWN',
+          message: typeof event.payload?.message === 'string' ? event.payload.message : 'Agent Stack turn failed'
         };
       }
-      if (event.type === 'turn_finished') finished = event;
+      if (event.event === 'turn_finished') finished = event;
     }
 
     if (assistantMessageCount !== 1 || typeof assistantMessage !== 'string' || finished?.payload?.status !== 'succeeded') {

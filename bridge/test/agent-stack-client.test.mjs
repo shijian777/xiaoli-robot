@@ -78,11 +78,19 @@ test('sends authenticated project-scoped discovery, session, text, and WAV multi
 
     if (request.method === 'GET' && request.url === '/api/console/projects') return sendJson(response, {projects: [{id: 'project_test'}]});
     if (request.method === 'GET' && request.url === '/api/agents') return sendJson(response, {agents: [{id: 'agent-1'}]});
-    if (request.method === 'POST' && request.url === '/api/sessions') return sendJson(response, {id: 'session-1'});
+    if (request.method === 'POST' && request.url === '/api/sessions') {
+      return sendJson(response, {session: {sessionId: 'session-1'}});
+    }
     if (request.method === 'POST' && request.url === '/api/sessions/session-1/turns') {
       return sendTurnEvents(response, [
-        {type: 'assistant_message', message: 'hello'},
-        {type: 'turn_finished', payload: {status: 'succeeded'}}
+        {event: 'assistant_message', payload: {text: 'hello'}},
+        {event: 'turn_finished', payload: {status: 'succeeded'}}
+      ]);
+    }
+    if (request.method === 'POST' && request.url === '/api/sessions/session-1/turns/audio') {
+      return sendTurnEvents(response, [
+        {event: 'assistant_message', payload: {text: 'audio hello'}},
+        {event: 'turn_finished', payload: {status: 'succeeded'}}
       ]);
     }
     response.writeHead(404).end();
@@ -94,12 +102,12 @@ test('sends authenticated project-scoped discovery, session, text, and WAV multi
     assert.deepEqual(await api.runTextTurn('session-1', 'Say hello'), {
       assistantMessage: 'hello',
       events: [
-        {type: 'assistant_message', message: 'hello'},
-        {type: 'turn_finished', payload: {status: 'succeeded'}}
+        {event: 'assistant_message', payload: {text: 'hello'}},
+        {event: 'turn_finished', payload: {status: 'succeeded'}}
       ],
       status: 'succeeded'
     });
-    assert.equal((await api.runAudioTurn('session-1', Buffer.from([82, 73, 70, 70]), 'utterance.wav')).assistantMessage, 'hello');
+    assert.equal((await api.runAudioTurn('session-1', Buffer.from([82, 73, 70, 70]), 'utterance.wav')).assistantMessage, 'audio hello');
   });
 
   for (const request of requests) {
@@ -107,10 +115,23 @@ test('sends authenticated project-scoped discovery, session, text, and WAV multi
     assert.equal(request.headers['x-agent9-project-id'], 'project_test');
   }
   assert.deepEqual(JSON.parse(requests[2].body.toString('utf8')), {agentId: 'agent-1'});
+  assert.deepEqual(requests.map(({method, path}) => ({method, path})), [
+    {method: 'GET', path: '/api/console/projects'},
+    {method: 'GET', path: '/api/agents'},
+    {method: 'POST', path: '/api/sessions'},
+    {method: 'POST', path: '/api/sessions/session-1/turns'},
+    {method: 'POST', path: '/api/sessions/session-1/turns/audio'}
+  ]);
   assert.deepEqual(JSON.parse(requests[3].body.toString('utf8')), {input: {type: 'text', text: 'Say hello'}});
   assert.match(requests[4].headers['content-type'], /^multipart\/form-data; boundary=/);
   assert.match(requests[4].body.toString('latin1'), /name="file"; filename="utterance\.wav"/);
   assert.match(requests[4].body.toString('latin1'), /Content-Type: audio\/wav/);
+});
+
+test('requires the official nested create-session response', async () => {
+  await withServer((_request, response) => sendJson(response, {sessionId: 'legacy-session'}), async (baseUrl) => {
+    await assert.rejects(() => client(baseUrl).createSession('agent-1'), /session id/i);
+  });
 });
 
 test('retries a discovery GET once after a retryable response but does not retry a Turn POST', async () => {
@@ -143,8 +164,12 @@ test('maps audio 501 and active-turn 409 to non-retryable client errors without 
   let attempts = 0;
   await withServer((request, response) => {
     attempts += 1;
+    if (request.url === '/api/sessions/session-1/turns/audio') {
+      response.writeHead(501).end();
+      return;
+    }
     if (request.url === '/api/sessions/session-1/turns') {
-      response.writeHead(request.headers['content-type']?.startsWith('multipart/') ? 501 : 409).end();
+      response.writeHead(409).end();
       return;
     }
     response.writeHead(404).end();
@@ -168,8 +193,8 @@ test('rejects a turn without exactly one successful assistant terminal event and
   await withServer((request, response) => {
     if (request.url === '/api/sessions/session-1/turns') {
       return sendTurnEvents(response, [
-        {type: 'turn_error', code: 'MODEL_DOWN', message: `upstream rejected ${credential}`},
-        {type: 'turn_finished', payload: {status: 'failed'}}
+        {event: 'turn_error', payload: {code: 'MODEL_DOWN', message: `upstream rejected ${credential}`}},
+        {event: 'turn_finished', payload: {status: 'failed'}}
       ]);
     }
     response.writeHead(404).end();
@@ -190,8 +215,8 @@ test('aborts an in-flight Agent Stack Turn through the caller signal', async () 
     if (request.url === '/api/sessions/session-1/turns') {
       requestStarted();
       setTimeout(() => sendTurnEvents(response, [
-        {type: 'assistant_message', message: 'too late'},
-        {type: 'turn_finished', payload: {status: 'succeeded'}}
+        {event: 'assistant_message', payload: {text: 'too late'}},
+        {event: 'turn_finished', payload: {status: 'succeeded'}}
       ]), 50);
     }
   }, async (baseUrl) => {

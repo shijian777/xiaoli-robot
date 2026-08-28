@@ -7,9 +7,9 @@ test('reads fragmented NDJSON events, skips heartbeat lines, and accepts a final
   const stream = new ReadableStream({
     start(controller) {
       for (const chunk of [
-        '{"type":"assistant_',
-        'message","message":"first"}\n\n {\"type\":\"turn_',
-        'started\"}\n{"type":"turn_finished","payload":{"status":"succeeded"}}'
+        '{"event":"assistant_',
+        'message","payload":{"text":"first"}}\n\n {\"event\":\"turn_',
+        'started\",\"payload\":{}}\n{"event":"turn_finished","payload":{"status":"succeeded"}}'
       ]) controller.enqueue(encoder.encode(chunk));
       controller.close();
     }
@@ -19,9 +19,9 @@ test('reads fragmented NDJSON events, skips heartbeat lines, and accepts a final
   for await (const event of readTurnEvents(stream)) events.push(event);
 
   assert.deepEqual(events, [
-    {type: 'assistant_message', message: 'first'},
-    {type: 'turn_started'},
-    {type: 'turn_finished', payload: {status: 'succeeded'}}
+    {event: 'assistant_message', payload: {text: 'first'}},
+    {event: 'turn_started', payload: {}},
+    {event: 'turn_finished', payload: {status: 'succeeded'}}
   ]);
 });
 

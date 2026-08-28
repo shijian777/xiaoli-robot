@@ -15,6 +15,8 @@ const transcriptSchema = {
 };
 
 const validateTranscript = new Ajv({allErrors: true, strict: true}).compile(transcriptSchema);
+const CLEANUP_RETRY_DELAY_MS = 50;
+const CLEANUP_ATTEMPTS = 3;
 
 /**
  * Transcribes Bridge-owned WAV files and removes them after the final result.
@@ -24,9 +26,10 @@ export class AsrService {
   #asrAgentId;
   #tempDir;
   #whisper;
+  #removeFile;
   #sessions = new Map();
 
-  constructor({client, asrAgentId, tempDir, whisper} = {}) {
+  constructor({client, asrAgentId, tempDir, whisper, removeFile = fs.rm} = {}) {
     if (!client || typeof client.createSession !== 'function' || typeof client.runAudioTurn !== 'function') {
       throw new TypeError('AsrService requires an Agent Stack client');
     }
@@ -39,10 +42,12 @@ export class AsrService {
     if (whisper && typeof whisper.transcribe !== 'function') {
       throw new TypeError('whisper must provide transcribe()');
     }
+    if (typeof removeFile !== 'function') throw new TypeError('removeFile must be a function');
     this.#client = client;
     this.#asrAgentId = asrAgentId;
     this.#tempDir = path.resolve(tempDir);
     this.#whisper = whisper;
+    this.#removeFile = removeFile;
   }
 
   async transcribe(wavPath, {caseId, segmentId, signal} = {}) {
@@ -60,10 +65,16 @@ export class AsrService {
       } catch (error) {
         if (error instanceof AsrUnavailableError && this.#whisper) {
           const fallbackWav = await stageFallbackWav(wav, bridgeWav);
+          let cleanupPromise;
+          let cleanupDeferred = false;
+          const cleanupAfterClose = () => cleanupPromise ??= removeFallbackWav(fallbackWav, this.#removeFile);
           try {
-            return await this.#whisper.transcribe(fallbackWav.path, {signal});
+            return await this.#whisper.transcribe(fallbackWav.path, {signal, cleanupAfterClose});
+          } catch (fallbackError) {
+            cleanupDeferred = fallbackError?.cleanupDeferred === true;
+            throw fallbackError;
           } finally {
-            await removeFallbackWav(fallbackWav);
+            if (!cleanupDeferred) await cleanupAfterClose();
           }
         }
         throw error;
@@ -75,6 +86,11 @@ export class AsrService {
         await removeBridgeWav(bridgeWav);
       }
     }
+  }
+
+  forgetCase(caseId) {
+    assertIdentifier(caseId, 'caseId');
+    this.#sessions.delete(caseId);
   }
 
   async #sessionFor(caseId, signal) {
@@ -179,12 +195,24 @@ async function stageFallbackWav(wav, bridgeWav) {
   }
 }
 
-async function removeFallbackWav(fallbackWav) {
+async function removeFallbackWav(fallbackWav, removeFile = fs.rm) {
   try {
     await assertPrivateFallbackDirectory(fallbackWav);
-    await fs.rm(fallbackWav.path, {force: true});
+    await removeWithRetry(removeFile, fallbackWav.path, {force: true});
   } finally {
     await removeFallbackDirectory(fallbackWav);
+  }
+}
+
+async function removeWithRetry(removeFile, candidate, options) {
+  for (let attempt = 0; attempt < CLEANUP_ATTEMPTS; attempt += 1) {
+    try {
+      await removeFile(candidate, options);
+      return;
+    } catch (error) {
+      if (attempt === CLEANUP_ATTEMPTS - 1 || !isLikelyWindowsFileLock(error)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, CLEANUP_RETRY_DELAY_MS));
+    }
   }
 }
 
@@ -226,6 +254,10 @@ function isContainedBy(parent, candidate) {
 
 function isContainedByOrEqual(parent, candidate) {
   return parent === candidate || isContainedBy(parent, candidate);
+}
+
+function isLikelyWindowsFileLock(error) {
+  return error?.code === 'EBUSY' || error?.code === 'EACCES' || error?.code === 'EPERM';
 }
 
 function extractTranscript(message) {
