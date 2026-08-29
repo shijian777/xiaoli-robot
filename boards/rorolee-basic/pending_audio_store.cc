@@ -7,6 +7,14 @@
 namespace xiaoli {
 namespace {
 
+void* AllocatePsram(size_t bytes, uint32_t capabilities) {
+    return heap_caps_malloc(bytes, capabilities);
+}
+
+void ReleaseHeapMemory(void* memory) {
+    heap_caps_free(memory);
+}
+
 bool TerminatedNonEmpty(const char* value, size_t capacity) {
     return value != nullptr && value[0] != '\0' &&
            std::memchr(value, '\0', capacity) != nullptr;
@@ -24,7 +32,7 @@ PendingAudioStore::~PendingAudioStore() {
     }
     for (SlotId slot_id = 0; slot_id < kPendingSlotCount; ++slot_id) {
         Slot& slot = slots_[slot_id];
-        heap_caps_free(slot.pcm);
+        release_owned_(slot.pcm);
         slot.pcm = nullptr;
     }
 }
@@ -40,22 +48,36 @@ void PendingAudioStore::Reset() {
 }
 
 bool PendingAudioStore::InitProduction() {
+    return InitProduction({&AllocatePsram, &ReleaseHeapMemory});
+}
+
+bool PendingAudioStore::InitProduction(PendingAudioMemoryOps memory) {
     if (initialized_) {
         return true;
     }
+    if (memory.allocate == nullptr || memory.release == nullptr) {
+        return false;
+    }
     uint8_t* first = static_cast<uint8_t*>(
-        heap_caps_malloc(kMaxPcmBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        memory.allocate(kMaxPcmBytes,
+                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     uint8_t* second = static_cast<uint8_t*>(
-        heap_caps_malloc(kMaxPcmBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        memory.allocate(kMaxPcmBytes,
+                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (first == nullptr || second == nullptr) {
-        heap_caps_free(first);
-        heap_caps_free(second);
+        if (first != nullptr) {
+            memory.release(first);
+        }
+        if (second != nullptr) {
+            memory.release(second);
+        }
         return false;
     }
     slots_[0].pcm = first;
     slots_[1].pcm = second;
     capacity_ = kMaxPcmBytes;
     owns_buffers_ = true;
+    release_owned_ = memory.release;
     initialized_ = true;
     Reset();
     return true;

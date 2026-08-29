@@ -34,14 +34,21 @@
 namespace {
 
 constexpr uint16_t kBridgeCustomCommand = 0x7e;
-constexpr size_t kCaptureSamples = AUDIO_SAMPLE_RATE / 50;
-constexpr size_t kCaptureBytes = kCaptureSamples * sizeof(int16_t);
+constexpr size_t kCaptureBytes = xiaoli::kPcmCaptureFrameBytes;
+constexpr size_t kCaptureSamples = kCaptureBytes / sizeof(int16_t);
+static_assert(kCaptureBytes % sizeof(int16_t) == 0);
 constexpr size_t kBridgeQueueDepth = 16;
 constexpr size_t kPlaybackNoticeDepth = 4;
-constexpr size_t kPlaybackStorageBytes = xiaoli::kMaxPlaybackBytes + 1;
+constexpr size_t kPlaybackStorageBytes = xiaoli::kPlaybackStorageBytes;
 constexpr uint64_t kMediationProbeDelayMs = 1500;
 constexpr uint64_t kMediationResponseTimeoutMs = 10000;
 constexpr uint64_t kPlaybackResetTimeoutMs = 250;
+// TX uses six 240-frame DMA descriptors at 16 kHz (90 ms maximum queued
+// audio). Waiting beyond that bound guarantees the final PCM has left I2S;
+// the session/transport epoch is revalidated afterwards before ACK creation.
+constexpr uint32_t kPlaybackHardwareDrainGuardMs = 120;
+constexpr uint64_t kPlaybackAckTimeoutMs = 5000;
+constexpr uint64_t kPlaybackReconnectTimeoutMs = 15000;
 
 uint64_t NowMs() {
     return static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
@@ -131,6 +138,9 @@ public:
     void PlayAudio(const uint8_t* pcm16, size_t bytes) override {
         if (play_buf_ == nullptr || playback_buffer_mutex_ == nullptr ||
             pcm16 == nullptr || bytes == 0) {
+            return;
+        }
+        if (suppress_replayed_audio_.load(std::memory_order_acquire)) {
             return;
         }
 
@@ -365,6 +375,7 @@ private:
     }
 
     bool RequestPlaybackReset(bool report_error, bool advance_callback_epoch) {
+        playback_ack_.AbortPlayback();
         if (play_buf_ == nullptr || play_task_ == nullptr ||
             playback_io_mutex_ == nullptr ||
             playback_buffer_mutex_ == nullptr) {
@@ -548,10 +559,14 @@ private:
         }
 
         while (true) {
+            // Promote a completed hardware drain to a durable in-RAM receipt
+            // before consuming a disconnect edge. Cleanup can then preserve
+            // that exact messageId for the next authenticated connection.
+            DrainPlaybackNotices();
             DrainBridgeIngressFault();
             ReconcileAgentState();
             DrainBridgeMessages();
-            DrainPlaybackNotices();
+            MaybeRetryPlaybackAck(NowMs());
             DrainPendingHaptic();
             SampleButtons();
             ApplyDeferredCompleteFaultIfIdle();
@@ -588,7 +603,8 @@ private:
             xiaoli::Event event = batch.items[index];
             if (event.type == xiaoli::EventType::kButtonReleased &&
                 event.button == xiaoli::Button::kCase) {
-                event.allow_new_case = !capture_store_.HasCompleteUnacked();
+                event.allow_new_case = !capture_store_.HasCompleteUnacked() &&
+                    !playback_ack_.active() && !playback_ack_.pending();
             }
             ApplyActions(state_machine_.Handle(event));
         }
@@ -649,7 +665,8 @@ private:
     }
 
     bool StartNewCase(uint32_t generation) {
-        if (!ids_ok_ || generation == 0 || capture_store_.HasCompleteUnacked()) {
+        if (!ids_ok_ || generation == 0 || capture_store_.HasCompleteUnacked() ||
+            playback_ack_.active() || playback_ack_.pending()) {
             FeedError(capture_store_.HasCompleteUnacked()
                           ? xiaoli::ErrorReason::kAudioCapacity
                           : xiaoli::ErrorReason::kMediationFailed);
@@ -703,15 +720,77 @@ private:
             std::strlen(case_.start_json));
     }
 
+    esp_err_t SendPendingPlaybackAck() {
+        if (!link_ready_ || !playback_ack_.needs_send()) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        char json[xiaoli::kPlaybackPlayedJsonCapacity] = {};
+        if (!playback_ack_.BuildJson(json, sizeof(json))) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        const esp_err_t sent = agent_link_push_event(
+            AGENT_EVT_CUSTOM, reinterpret_cast<const uint8_t*>(json),
+            std::strlen(json));
+        if (sent != ESP_OK) {
+            return sent;
+        }
+        if (!playback_ack_.MarkSent()) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        playback_ack_deadline_ms_ = NowMs() + kPlaybackAckTimeoutMs;
+        return ESP_OK;
+    }
+
+    void MaybeRetryPlaybackAck(uint64_t now_ms) {
+        if (!playback_ack_.pending() || playback_ack_deadline_ms_ == 0 ||
+            now_ms < playback_ack_deadline_ms_) {
+            return;
+        }
+        ESP_LOGW(TAG, "audio.played ACK timed out; reconnecting for replay");
+        RestartLinkPreservingCompleteAudio();
+    }
+
+    void BeginReplaySuppression(const xiaoli::BridgeMessage& message) {
+        std::snprintf(suppressed_replay_case_id_,
+                      sizeof(suppressed_replay_case_id_), "%s",
+                      message.case_id);
+        std::snprintf(suppressed_replay_mediation_id_,
+                      sizeof(suppressed_replay_mediation_id_), "%s",
+                      message.mediation_message_id);
+        suppress_replayed_audio_.store(true, std::memory_order_release);
+    }
+
+    bool MatchesReplaySuppression(
+            const xiaoli::BridgeMessage& message) const {
+        return suppress_replayed_audio_.load(std::memory_order_acquire) &&
+            SameId(message.case_id, suppressed_replay_case_id_) &&
+            SameId(message.mediation_message_id,
+                   suppressed_replay_mediation_id_);
+    }
+
+    void ClearReplaySuppression() {
+        suppress_replayed_audio_.store(false, std::memory_order_release);
+        suppressed_replay_case_id_[0] = '\0';
+        suppressed_replay_mediation_id_[0] = '\0';
+    }
+
+    void ResendPlayedForSuppressedReplay() {
+        if (SendPendingPlaybackAck() != ESP_OK) {
+            RestartLinkPreservingCompleteAudio();
+        }
+    }
+
     bool StartRecording(xiaoli::Speaker speaker) {
         if (!ids_ok_ || !codec_ok_ || !capture_store_ok_ || !case_.active ||
             !case_.registered || !link_ready_ || replay_.active ||
-            active_slot_ != xiaoli::kInvalidSlot) {
+            active_slot_ != xiaoli::kInvalidSlot || playback_ack_.active() ||
+            playback_ack_.pending()) {
             FeedError(!capture_store_.HasFreeSlot()
                           ? xiaoli::ErrorReason::kAudioCapacity
                           : xiaoli::ErrorReason::kNetworkUnavailable);
             return false;
         }
+        capture_upload_.Reset();
         xiaoli::PendingSegmentMeta meta{};
         if (!ids_.NextSegment(case_.case_id, meta.segment_id,
                               sizeof(meta.segment_id)) ||
@@ -747,13 +826,17 @@ private:
             FeedError(xiaoli::ErrorReason::kAudioCapacity);
             return false;
         }
-        if (agent_link_asr_start(meta.start_json) != ESP_OK) {
-            capture_store_.AbortIncomplete(slot);
-            FeedError(xiaoli::ErrorReason::kNetworkUnavailable, true);
-            return false;
+        if constexpr (!xiaoli::kDeferCaptureUploadUntilStop) {
+            if (agent_link_asr_start(meta.start_json) != ESP_OK) {
+                capture_store_.AbortIncomplete(slot);
+                FeedError(xiaoli::ErrorReason::kNetworkUnavailable, true);
+                return false;
+            }
         }
         if (codec_.StartMic() != ESP_OK) {
-            CloseAsrStreamFailClosed(false);
+            if constexpr (!xiaoli::kDeferCaptureUploadUntilStop) {
+                CloseAsrStreamFailClosed(false);
+            }
             capture_store_.AbortIncomplete(slot);
             FeedError(xiaoli::ErrorReason::kRecordingIncomplete, true);
             return false;
@@ -771,20 +854,21 @@ private:
         if (active_slot_ == xiaoli::kInvalidSlot) {
             return;
         }
-        if (!link_ready_ || agent_link_state() != AGENT_STATE_READY) {
-            AbortActiveRecording();
-            FeedError(xiaoli::ErrorReason::kNetworkUnavailable);
-            return;
+        if constexpr (!xiaoli::kDeferCaptureUploadUntilStop) {
+            if (!link_ready_ || agent_link_state() != AGENT_STATE_READY) {
+                AbortActiveRecording();
+                FeedError(xiaoli::ErrorReason::kNetworkUnavailable);
+                return;
+            }
         }
-        int16_t pcm[kCaptureSamples] = {};
         size_t got = 0;
-        if (codec_.ReadPcm(pcm, kCaptureSamples, &got) != ESP_OK ||
+        if (codec_.ReadPcm(capture_pcm_, kCaptureSamples, &got) != ESP_OK ||
             got != kCaptureSamples) {
             AbortActiveRecording();
             FeedError(xiaoli::ErrorReason::kRecordingIncomplete, true);
             return;
         }
-        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(pcm);
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(capture_pcm_);
         const xiaoli::StoreResult appended =
             capture_store_.Append(active_slot_, bytes, kCaptureBytes);
         if (appended != xiaoli::StoreResult::kOk) {
@@ -795,15 +879,69 @@ private:
                       true);
             return;
         }
-        if (agent_link_asr_push(bytes, kCaptureBytes) != ESP_OK) {
-            AbortActiveRecording();
-            FeedError(xiaoli::ErrorReason::kNetworkUnavailable, true);
-            return;
-        }
         ++recording_frames_;
+        if constexpr (!xiaoli::kDeferCaptureUploadUntilStop) {
+            if (!capture_upload_.AppendCaptureFrame(bytes, kCaptureBytes)) {
+                AbortActiveRecording();
+                FeedError(xiaoli::ErrorReason::kRecordingIncomplete, true);
+                return;
+            }
+            if (capture_upload_.full() && !PushPendingCaptureBatch()) {
+                AbortActiveRecording();
+                FeedError(xiaoli::ErrorReason::kNetworkUnavailable, true);
+            }
+        }
+    }
+
+    bool PushPendingCaptureBatch() {
+        if (capture_upload_.bytes() == 0) {
+            return true;
+        }
+        if (agent_link_asr_push(capture_upload_.data(),
+                                capture_upload_.bytes()) != ESP_OK) {
+            return false;
+        }
+        capture_upload_.CommitSent();
+        return true;
+    }
+
+    bool FlushPendingCaptureTail() {
+        if (capture_upload_.bytes() == 0) {
+            return true;
+        }
+        const uint64_t started_ms = NowMs();
+        uint32_t retry_count = 0;
+        while (true) {
+            const esp_err_t result = agent_link_asr_push(
+                capture_upload_.data(), capture_upload_.bytes());
+            const bool link_ready =
+                link_ready_ && agent_link_state() == AGENT_STATE_READY;
+            const xiaoli::TailFlushAction action =
+                capture_upload_.HandleTailPushResult(
+                    result, link_ready, NowMs() - started_ms);
+            if (action == xiaoli::TailFlushAction::kDone) {
+                if (retry_count != 0) {
+                    ESP_LOGI(TAG, "final PCM queued after %u retries (%llu ms)",
+                             static_cast<unsigned>(retry_count),
+                             static_cast<unsigned long long>(NowMs() - started_ms));
+                }
+                return true;
+            }
+            if (action == xiaoli::TailFlushAction::kFail) {
+                ESP_LOGW(TAG,
+                         "final PCM queue failed err=%s retries=%u elapsed=%llu ms",
+                         esp_err_to_name(result),
+                         static_cast<unsigned>(retry_count),
+                         static_cast<unsigned long long>(NowMs() - started_ms));
+                return false;
+            }
+            ++retry_count;
+            vTaskDelay(1);
+        }
     }
 
     void AbortActiveRecording() {
+        capture_upload_.Reset();
         if (active_slot_ == xiaoli::kInvalidSlot) {
             return;
         }
@@ -822,6 +960,13 @@ private:
         const xiaoli::SlotId slot = active_slot_;
         xiaoli::PendingSegmentView view{};
         (void)codec_.StopMic();
+        if constexpr (!xiaoli::kDeferCaptureUploadUntilStop) {
+            if (recording_frames_ != 0 && !FlushPendingCaptureTail()) {
+                AbortActiveRecording();
+                FeedError(xiaoli::ErrorReason::kNetworkUnavailable, true);
+                return false;
+            }
+        }
         if (recording_frames_ == 0 || !capture_store_.Get(slot, &view) ||
             view.bytes == 0 ||
             capture_store_.MarkLocallyComplete(slot) !=
@@ -831,13 +976,16 @@ private:
             active_slot_ = xiaoli::kInvalidSlot;
             active_speaker_ = xiaoli::Speaker::kNone;
             recording_frames_ = 0;
+            capture_upload_.Reset();
             FeedError(xiaoli::ErrorReason::kRecordingIncomplete);
             return false;
         }
-        const bool ended = CloseAsrStreamFailClosed(true);
+        const bool ended = xiaoli::kDeferCaptureUploadUntilStop ||
+                           CloseAsrStreamFailClosed(true);
         active_slot_ = xiaoli::kInvalidSlot;
         active_speaker_ = xiaoli::Speaker::kNone;
         recording_frames_ = 0;
+        capture_upload_.Reset();
         ESP_LOGI(TAG, "recording locally complete case=%s segment=%s bytes=%u",
                  view.meta.case_id, view.meta.segment_id,
                  static_cast<unsigned>(view.bytes));
@@ -845,12 +993,18 @@ private:
             FeedError(xiaoli::ErrorReason::kNetworkUnavailable);
             return false;
         }
-        replay_ledger_.MarkSent(slot, view.insertion_ordinal);
+        if constexpr (!xiaoli::kDeferCaptureUploadUntilStop) {
+            replay_ledger_.MarkSent(slot, view.insertion_ordinal);
+        } else {
+            ESP_LOGI(TAG, "recording queued for deferred upload segment=%s",
+                     view.meta.segment_id);
+        }
         return true;
     }
 
     bool RequestMediation(uint32_t generation) {
-        if (!case_.active || generation != case_.generation) {
+        if (!case_.active || generation != case_.generation ||
+            playback_ack_.active() || playback_ack_.pending()) {
             FeedError(xiaoli::ErrorReason::kNetworkUnavailable);
             return false;
         }
@@ -893,6 +1047,9 @@ private:
             RestartLinkPreservingCompleteAudio();
             return false;
         }
+        std::snprintf(mediation_inflight_message_id_,
+                      sizeof(mediation_inflight_message_id_), "%s",
+                      message_id);
         mediation_request_inflight_ = true;
         mediation_probe_deadline_ms_ =
             NowMs() + kMediationResponseTimeoutMs;
@@ -1000,12 +1157,20 @@ private:
             link_ready_ = true;
             mediation_request_inflight_ = false;
             ResetReplayConnectionMarks();
+            bool send_failed = false;
             if (case_.active) {
                 if (SendCaseStart() != ESP_OK) {
-                    RestartLinkPreservingCompleteAudio();
+                    send_failed = true;
                 }
             } else {
                 FeedRecovered();
+            }
+            if (!send_failed && playback_ack_.needs_send() &&
+                SendPendingPlaybackAck() != ESP_OK) {
+                send_failed = true;
+            }
+            if (send_failed) {
+                RestartLinkPreservingCompleteAudio();
             }
             return;
         }
@@ -1023,6 +1188,9 @@ private:
     }
 
     void CleanupObservedDisconnect() {
+        playback_ack_.OnDisconnected();
+        playback_ack_deadline_ms_ = 0;
+        ClearReplaySuppression();
         AdvanceBridgeCallbackEpoch();
         link_ready_ = false;
         case_.registered = false;
@@ -1030,6 +1198,10 @@ private:
         DiscardActiveRecordingLocally();
         replay_ = {};
         CancelPlaybackIngress();
+        if (playback_ack_.pending()) {
+            playback_ack_deadline_ms_ =
+                NowMs() + kPlaybackReconnectTimeoutMs;
+        }
         if (!mediation_request_pending_) {
             FeedError(xiaoli::ErrorReason::kNetworkUnavailable);
         }
@@ -1150,6 +1322,15 @@ private:
         if (!case_.active || !SameId(message.case_id, case_.case_id)) {
             return;
         }
+        if (message.has_accepted && message.segment_id[0] == '\0' &&
+            playback_ack_.ApplyAck(message.case_id, message.message_id,
+                                   message.accepted)) {
+            playback_ack_deadline_ms_ = 0;
+            ESP_LOGI(TAG, "audio.played acknowledged case=%s",
+                     message.case_id);
+            FeedRecovered();
+            return;
+        }
         if (message.has_accepted && message.accepted &&
             SameId(message.message_id, case_.start_message_id) &&
             message.segment_id[0] == '\0') {
@@ -1219,6 +1400,35 @@ private:
             SignalBridgeIngressFault();
             return;
         }
+        if (MatchesReplaySuppression(message)) {
+            CancelPlaybackIngress();
+            if (playback_ack_.RequestResend(
+                    message.case_id, message.mediation_message_id)) {
+                ResendPlayedForSuppressedReplay();
+            }
+            return;
+        }
+        if (suppress_replayed_audio_.load(std::memory_order_acquire)) {
+            ClearReplaySuppression();
+            CancelPlaybackIngress();
+            SignalBridgeIngressFault();
+            return;
+        }
+        if (playback_ack_.RequestResend(
+                message.case_id, message.mediation_message_id)) {
+            BeginReplaySuppression(message);
+            CancelPlaybackIngress();
+            ResendPlayedForSuppressedReplay();
+            return;
+        }
+        if (!mediation_request_inflight_ ||
+            !SameId(message.mediation_message_id,
+                    mediation_inflight_message_id_)) {
+            CancelPlaybackIngress();
+            SignalBridgeIngressFault();
+            FeedError(xiaoli::ErrorReason::kMediationFailed, true);
+            return;
+        }
         if (state_machine_.state() != xiaoli::MediationState::kMediating ||
             play_buf_ == nullptr || play_task_ == nullptr) {
             CancelPlaybackIngress();
@@ -1251,9 +1461,17 @@ private:
             FeedError(xiaoli::ErrorReason::kMediationFailed, true);
             return;
         }
+        if (!playback_ack_.Begin(message.case_id,
+                                 message.mediation_message_id)) {
+            CancelPlaybackIngress();
+            SignalBridgeIngressFault();
+            FeedError(xiaoli::ErrorReason::kMediationFailed, true);
+            return;
+        }
         active_playback_session_epoch_ = session_epoch;
         mediation_request_pending_ = false;
         mediation_request_inflight_ = false;
+        mediation_inflight_message_id_[0] = '\0';
         mediation_probe_deadline_ms_ = 0;
         xiaoli::Event event{};
         event.type = xiaoli::EventType::kAudioStart;
@@ -1266,6 +1484,34 @@ private:
 
     void ApplyAudioEnd(const xiaoli::BridgeMessage& message) {
         if (!case_.active || !SameId(message.case_id, case_.case_id)) {
+            return;
+        }
+        if (MatchesReplaySuppression(message)) {
+            CancelPlaybackIngress();
+            ClearReplaySuppression();
+            if (playback_ack_.RequestResend(
+                    message.case_id, message.mediation_message_id)) {
+                ResendPlayedForSuppressedReplay();
+            }
+            return;
+        }
+        if (suppress_replayed_audio_.load(std::memory_order_acquire)) {
+            ClearReplaySuppression();
+            CancelPlaybackIngress();
+            SignalBridgeIngressFault();
+            return;
+        }
+        if (playback_ack_.RequestResend(
+                message.case_id, message.mediation_message_id)) {
+            CancelPlaybackIngress();
+            ResendPlayedForSuppressedReplay();
+            return;
+        }
+        if (!playback_ack_.AcceptEnd(message.case_id,
+                                     message.mediation_message_id)) {
+            CancelPlaybackIngress();
+            SignalBridgeIngressFault();
+            FeedError(xiaoli::ErrorReason::kMediationFailed, true);
             return;
         }
         portENTER_CRITICAL(&playback_mux_);
@@ -1593,6 +1839,9 @@ private:
         // before restarting the link. AbortIncomplete deliberately leaves a
         // slot untouched once MarkLocallyComplete() has succeeded, so this is
         // also safe on the complete-end admission failure path.
+        playback_ack_.OnDisconnected();
+        playback_ack_deadline_ms_ = 0;
+        ClearReplaySuppression();
         AdvanceBridgeCallbackEpoch();
         DiscardActiveRecordingLocally();
         link_ready_ = false;
@@ -1604,6 +1853,10 @@ private:
         if (restarted != ESP_OK) {
             ESP_LOGE(TAG, "link restart failed after protocol fault: %s",
                      esp_err_to_name(restarted));
+        }
+        if (playback_ack_.pending()) {
+            playback_ack_deadline_ms_ =
+                NowMs() + kPlaybackReconnectTimeoutMs;
         }
     }
 
@@ -1620,6 +1873,7 @@ private:
     }
 
     void DiscardActiveRecordingLocally() {
+        capture_upload_.Reset();
         if (active_slot_ == xiaoli::kInvalidSlot) {
             return;
         }
@@ -1756,20 +2010,42 @@ private:
                 }
 
                 xSemaphoreTake(playback_io_mutex_, portMAX_DELAY);
-                const bool empty =
+                bool empty =
                     xStreamBufferBytesAvailable(play_buf_) == 0;
                 portENTER_CRITICAL(&playback_mux_);
-                const bool current = playback_.active() &&
+                bool current = playback_.active() &&
                     playback_io_epoch_.AcceptWrite(
                         lease,
                         bridge_callback_admission_.Accepts(
                             lease.callback_epoch));
-                const bool drained = current &&
+                const bool ready_for_hardware_drain = current &&
                     playback_.ReadyToFinish(empty);
                 const uint32_t finished_generation = playback_.case_generation();
+                portEXIT_CRITICAL(&playback_mux_);
+
+                if (ready_for_hardware_drain) {
+                    vTaskDelay(pdMS_TO_TICKS(kPlaybackHardwareDrainGuardMs));
+                }
+                const bool hardware_drained = ready_for_hardware_drain;
+
+                portENTER_CRITICAL(&playback_mux_);
+                empty = xStreamBufferBytesAvailable(play_buf_) == 0;
+                current = current && playback_.active() &&
+                    playback_io_epoch_.AcceptWrite(
+                        lease,
+                        bridge_callback_admission_.Accepts(
+                            lease.callback_epoch));
+                const bool drained = ready_for_hardware_drain &&
+                    hardware_drained && current &&
+                    playback_.ReadyToFinish(empty);
                 if (drained) {
                     playback_.Finish();
                     playback_io_epoch_.InvalidateSession();
+                } else if (ready_for_hardware_drain && current) {
+                    play_abort_report_error_ = true;
+                    play_abort_generation_ = finished_generation;
+                    play_abort_session_epoch_ = lease.session_epoch;
+                    (void)playback_io_epoch_.RequestReset();
                 }
                 portEXIT_CRITICAL(&playback_mux_);
                 xSemaphoreGive(playback_io_mutex_);
@@ -1802,6 +2078,15 @@ private:
             }
             active_playback_session_epoch_ = 0;
             if (!notice.drained) {
+                playback_ack_.AbortPlayback();
+                FeedError(xiaoli::ErrorReason::kMediationFailed, true);
+                continue;
+            }
+            char played_message_id[xiaoli::kIdCapacity] = {};
+            if (!ids_.NextMessage(played_message_id,
+                                  sizeof(played_message_id)) ||
+                !playback_ack_.MarkDrained(played_message_id)) {
+                playback_ack_.AbortPlayback();
                 FeedError(xiaoli::ErrorReason::kMediationFailed, true);
                 continue;
             }
@@ -1810,6 +2095,9 @@ private:
             event.now_ms = NowMs();
             event.case_generation = notice.case_generation;
             ApplyActions(state_machine_.Handle(event));
+            if (SendPendingPlaybackAck() != ESP_OK) {
+                RestartLinkPreservingCompleteAudio();
+            }
         }
     }
 
@@ -1912,15 +2200,20 @@ private:
     xiaoli::ConnectionReplayLedger replay_ledger_;
     xiaoli::CompleteFaultDeferral complete_fault_deferral_;
     xiaoli::TranscriptTracker transcript_tracker_;
+    xiaoli::PlaybackAckTracker playback_ack_;
     xiaoli::SlotId active_slot_ = xiaoli::kInvalidSlot;
     xiaoli::Speaker active_speaker_ = xiaoli::Speaker::kNone;
     uint32_t recording_frames_ = 0;
+    int16_t capture_pcm_[kCaptureSamples] = {};
+    xiaoli::PcmUploadBatch capture_upload_;
     bool mediation_request_pending_ = false;
     bool mediation_request_inflight_ = false;
+    char mediation_inflight_message_id_[xiaoli::kIdCapacity] = {};
     uint32_t mediation_pending_generation_ = 0;
     uint64_t mediation_probe_deadline_ms_ = 0;
     xiaoli::MediationProbeBudget mediation_probe_budget_;
     uint64_t recoverable_error_deadline_ms_ = 0;
+    uint64_t playback_ack_deadline_ms_ = 0;
 
     TaskHandle_t mediation_task_ = nullptr;
     TaskHandle_t play_task_ = nullptr;
@@ -1949,6 +2242,9 @@ private:
     xiaoli::PlaybackIoEpoch playback_io_epoch_;
     uint32_t playback_ingress_epoch_ = 0;
     uint32_t active_playback_session_epoch_ = 0;
+    std::atomic<bool> suppress_replayed_audio_{false};
+    char suppressed_replay_case_id_[xiaoli::kIdCapacity] = {};
+    char suppressed_replay_mediation_id_[xiaoli::kIdCapacity] = {};
     bool play_abort_report_error_ = false;
     uint32_t play_abort_generation_ = 0;
     uint32_t play_abort_session_epoch_ = 0;

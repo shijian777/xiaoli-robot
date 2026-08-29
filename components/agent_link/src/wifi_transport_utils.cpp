@@ -5,15 +5,38 @@
 #include <limits>
 #include <utility>
 
+#include "sdkconfig.h"
+#include "agent_link.h"
 #include "cJSON.h"
+#include "esp_crt_bundle.h"
 #include "protocol.h"
+#include "wifi_endpoint.h"
 #include "wifi_wire.h"
 
 namespace xiaoli::wifi {
+
+#if !CONFIG_MBEDTLS_HAVE_TIME_DATE
+#error "Public WSS requires CONFIG_MBEDTLS_HAVE_TIME_DATE for certificate validity checks"
+#endif
 namespace {
 
 bool AddString(cJSON* object, const char* name, const std::string& value) {
     return cJSON_AddStringToObject(object, name, value.c_str()) != nullptr;
+}
+
+bool CopyPreferred(char* dst, size_t capacity, const char* compiled_value,
+                   const char* stored_value) {
+    const char* src = (compiled_value != nullptr && compiled_value[0] != '\0')
+                          ? compiled_value
+                          : stored_value;
+    if (src == nullptr) src = "";
+    const size_t len = strnlen(src, capacity);
+    if (len >= capacity) {
+        dst[0] = '\0';
+        return false;
+    }
+    memcpy(dst, src, len + 1);
+    return true;
 }
 
 bool JsonString(cJSON* object, const char* name, std::string& output) {
@@ -143,6 +166,25 @@ bool IsMatchingHelloAck(const uint8_t* data, size_t len,
                     JsonNumberEquals(root, "protocol", 1);
     cJSON_Delete(root);
     return ok;
+}
+
+bool BuildEffectiveProvisioningSettings(
+    const struct agent_wifi_config_s* compiled,
+    const al_prov_settings_t& stored,
+    al_prov_settings_t& effective) {
+    effective = {};
+    const bool sizes_ok =
+        CopyPreferred(effective.ssid, sizeof effective.ssid,
+                      compiled ? compiled->ssid : nullptr, stored.ssid) &&
+        CopyPreferred(effective.password, sizeof effective.password,
+                      compiled ? compiled->password : nullptr, stored.password) &&
+        CopyPreferred(effective.endpoint, sizeof effective.endpoint,
+                      compiled ? compiled->endpoint : nullptr, stored.endpoint) &&
+        CopyPreferred(effective.device_token, sizeof effective.device_token,
+                      compiled ? compiled->token : nullptr, stored.device_token);
+    return sizes_ok && effective.ssid[0] != '\0' &&
+           al_wifi_endpoint_valid(effective.endpoint) &&
+           al_wifi_device_token_valid(effective.device_token);
 }
 
 esp_err_t EncodeControl(const uint8_t* frame, size_t len, OutboundMessage& output) {
@@ -424,26 +466,44 @@ void VoiceRxTracker::Reset() {
     next_chunk_ = 0;
 }
 
+esp_err_t ConfigureWebSocketSecurity(const char* endpoint,
+                                     esp_websocket_client_config_t& config) {
+    ParsedEndpoint parsed;
+    if (!ParseEndpoint(endpoint, parsed)) return ESP_ERR_INVALID_ARG;
+    config.crt_bundle_attach = parsed.scheme == EndpointScheme::kWss
+                                   ? esp_crt_bundle_attach
+                                   : nullptr;
+    config.skip_cert_common_name_check = false;
+    return ESP_OK;
+}
+
+bool EndpointRequiresTrustedTime(const char* endpoint) {
+    ParsedEndpoint parsed;
+    return ParseEndpoint(endpoint, parsed) && parsed.scheme == EndpointScheme::kWss;
+}
+
+bool IsTrustedTlsTime(int64_t unix_seconds) {
+    // A reset ESP starts near the Unix epoch. 2024 is deliberately well before
+    // every certificate used by this firmware while still rejecting unset clocks.
+    constexpr int64_t kEarliestTrustedUnixTime = 1704067200;
+    return unix_seconds >= kEarliestTrustedUnixTime;
+}
+
+bool EndpointNeedsTimeSync(const char* endpoint, int64_t unix_seconds) {
+    return EndpointRequiresTrustedTime(endpoint) && !IsTrustedTlsTime(unix_seconds);
+}
+
 esp_err_t ResolveEndpoint(const char* endpoint, EndpointResolver resolver,
                           void* context, std::string& resolved) {
     resolved.clear();
-    if (endpoint == nullptr || strncmp(endpoint, "ws://", 5) != 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    const char* authority = endpoint + 5;
-    const char* path = strchr(authority, '/');
-    if (path == nullptr || strcmp(path, "/device") != 0 || path == authority) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    const char* colon = static_cast<const char*>(memchr(authority, ':', path - authority));
-    const char* host_end = colon ? colon : path;
-    const std::string host(authority, host_end);
-    if (host.size() < 7 || host.compare(host.size() - 6, 6, ".local") != 0) {
+    ParsedEndpoint parsed;
+    if (!ParseEndpoint(endpoint, parsed)) return ESP_ERR_INVALID_ARG;
+    if (!parsed.local_hostname) {
         resolved = endpoint;
         return ESP_OK;
     }
     if (resolver == nullptr) return ESP_ERR_INVALID_ARG;
-    const std::string query = host.substr(0, host.size() - 6);
+    const std::string query = parsed.host.substr(0, parsed.host.size() - 6);
     if (query.empty()) return ESP_ERR_INVALID_ARG;
     uint32_t ipv4 = 0;
     esp_err_t result = resolver(query.c_str(), 2000, &ipv4, context);
@@ -459,8 +519,11 @@ esp_err_t ResolveEndpoint(const char* endpoint, EndpointResolver resolver,
     snprintf(address, sizeof(address), "%u.%u.%u.%u", a, b, c, d);
     resolved = "ws://";
     resolved += address;
-    if (colon != nullptr) resolved.append(colon, path);
-    resolved += path;
+    if (!parsed.port.empty()) {
+        resolved += ':';
+        resolved += parsed.port;
+    }
+    resolved += "/device";
     return ESP_OK;
 }
 

@@ -9,6 +9,11 @@ namespace {
 constexpr const char* TAG = "agent_link.app";
 
 #if CONFIG_AGENT_LINK_TRANSPORT_WIFI
+static_assert(sizeof(CONFIG_AGENT_LINK_WIFI_ENDPOINT) == 1,
+              "Production firmware must obtain the Bridge endpoint from provisioning");
+static_assert(sizeof(CONFIG_AGENT_LINK_WIFI_DEVICE_TOKEN) == 1,
+              "Production firmware must obtain the device token from provisioning");
+
 const agent_wifi_config_t kWifiConfig = {
     .ssid = nullptr,
     .password = nullptr,

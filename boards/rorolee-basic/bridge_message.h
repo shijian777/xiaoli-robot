@@ -38,6 +38,7 @@ struct BridgeMessage {
     char message_id[kIdCapacity] = {};
     char case_id[kIdCapacity] = {};
     char segment_id[kIdCapacity] = {};
+    char mediation_message_id[kIdCapacity] = {};
     char code[kBridgeCodeCapacity] = {};
     Speaker speaker = Speaker::kNone;
     BridgeState state = BridgeState::kNone;

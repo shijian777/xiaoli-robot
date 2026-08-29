@@ -9,5 +9,5 @@ idf_component_register(
         "."
         "../../../components/agent_link/src"
         "../../../boards/rorolee-basic"
-    PRIV_REQUIRES unity agent_link json heap esp_driver_gpio
+    PRIV_REQUIRES unity agent_link json heap esp_driver_gpio esp_http_server esp_websocket_client
 )

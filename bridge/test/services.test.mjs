@@ -8,6 +8,9 @@ import {AsrUnavailableError} from '../src/agent-stack/client.mjs';
 import {AsrService} from '../src/agent-stack/asr-service.mjs';
 import {MediatorService} from '../src/agent-stack/mediator-service.mjs';
 import {WhisperService} from '../src/fallback/whisper-service.mjs';
+import {pcmToWav} from '../src/audio/wav.mjs';
+import {startBridge} from '../src/server.mjs';
+import * as serverModule from '../src/server.mjs';
 
 const mediation = {
   conflictSummary: '双方对家务分工有不同看法。',
@@ -144,7 +147,66 @@ function agentClient({message = JSON.stringify({transcript: '  本地音频转�
   };
 }
 
-test('AsrService accepts one fenced transcript object and removes its bridge WAV', async () => {
+test('AsrService leaves its Bridge-owned input WAV for the Gateway job owner on success', async () => {
+  await withTempDirectory(async (tempDir) => {
+    const wavPath = path.join(tempDir, 'owner-success.wav');
+    const wav = Buffer.from('RIFF');
+    await writeFile(wavPath, wav);
+    const service = new AsrService({client: agentClient(), asrAgentId: 'asr-agent', tempDir});
+
+    assert.equal(await service.transcribe(wavPath, {
+      caseId: 'case-1', segmentId: 'segment-1'
+    }), '本地音频转写');
+    assert.deepEqual(await readFile(wavPath), wav);
+  });
+});
+
+test('AsrService leaves its Bridge-owned input WAV for retry after provider failure', async () => {
+  await withTempDirectory(async (tempDir) => {
+    const wavPath = path.join(tempDir, 'owner-failure.wav');
+    const wav = Buffer.from('RIFF');
+    await writeFile(wavPath, wav);
+    const service = new AsrService({
+      client: agentClient({error: new Error('provider unavailable')}),
+      asrAgentId: 'asr-agent',
+      tempDir
+    });
+
+    await assert.rejects(() => service.transcribe(wavPath, {
+      caseId: 'case-1', segmentId: 'segment-1'
+    }), /provider unavailable/);
+    assert.deepEqual(await readFile(wavPath), wav);
+  });
+});
+
+test('AsrService leaves its Bridge-owned input WAV when cancellation interrupts the provider', async () => {
+  await withTempDirectory(async (tempDir) => {
+    const wavPath = path.join(tempDir, 'owner-cancel.wav');
+    const wav = pcmToWav(Buffer.from([1, 0]), {sampleRate: 16000, bits: 16, channels: 1});
+    await writeFile(wavPath, wav);
+    const started = deferred();
+    const service = new AsrService({
+      tempDir,
+      rtasr: {async transcribe(_pcm, {signal}) {
+        started.resolve();
+        return new Promise((resolve, reject) => signal.addEventListener(
+          'abort', () => reject(signal.reason), {once: true}
+        ));
+      }}
+    });
+    const controller = new AbortController();
+    const pending = service.transcribe(wavPath, {
+      caseId: 'case-1', segmentId: 'segment-1', signal: controller.signal
+    });
+    await started.promise;
+    controller.abort(new Error('cancelled by owner'));
+
+    await assert.rejects(pending, /cancelled by owner/);
+    assert.deepEqual(await readFile(wavPath), wav);
+  });
+});
+
+test('AsrService accepts one fenced transcript object and leaves its bridge WAV to the owner', async () => {
   await withTempDirectory(async (tempDir) => {
     for (const fence of ['```json', '```']) {
       const wavPath = path.join(tempDir, `${fence.length}.wav`);
@@ -153,12 +215,170 @@ test('AsrService accepts one fenced transcript object and removes its bridge WAV
       const service = new AsrService({client, asrAgentId: 'asr-agent', tempDir});
 
       assert.equal(await service.transcribe(wavPath, {caseId: 'case-1', segmentId: 'segment-1'}), '本地音频转写');
-      await assert.rejects(() => readFile(wavPath), {code: 'ENOENT'});
+      assert.deepEqual(await readFile(wavPath), Buffer.from('RIFF'));
     }
   });
 });
 
-test('AsrService rejects malformed or empty transcripts and still removes the bridge WAV', async () => {
+test('AsrService sends approved PCM to Xfyun before Agent Stack and leaves its bridge WAV to the owner', async () => {
+  await withTempDirectory(async (tempDir) => {
+    const pcm = Buffer.from([1, 0, 2, 0, 3, 0, 4, 0]);
+    const wavPath = path.join(tempDir, 'xfyun-primary.wav');
+    await writeFile(wavPath, pcmToWav(pcm, {sampleRate: 16000, bits: 16, channels: 1}));
+    const controller = new AbortController();
+    let receivedSignal;
+    const service = new AsrService({
+      tempDir,
+      rtasr: {
+        async transcribe(receivedPcm, {signal}) {
+          assert.deepEqual(receivedPcm, pcm);
+          receivedSignal = signal;
+          return '  讯飞最终文字  ';
+        }
+      }
+    });
+
+    assert.equal(await service.transcribe(wavPath, {
+      caseId: 'case-1', segmentId: 'segment-1', signal: controller.signal
+    }), '讯飞最终文字');
+    assert.equal(receivedSignal, controller.signal);
+    assert.ok((await readFile(wavPath)).length > 44);
+  });
+});
+
+test('AsrService surfaces an Xfyun failure without calling Agent Stack or Whisper', async () => {
+  await withTempDirectory(async (tempDir) => {
+    const pcm = Buffer.from([1, 0, 2, 0]);
+    const wavPath = path.join(tempDir, 'xfyun-failure.wav');
+    await writeFile(wavPath, pcmToWav(pcm, {sampleRate: 16000, bits: 16, channels: 1}));
+    const xfyunError = new Error('sanitized Xfyun failure');
+    let agentCalls = 0;
+    let whisperCalls = 0;
+    const service = new AsrService({
+      client: {
+        async createSession() { agentCalls += 1; return 'asr-session'; },
+        async runAudioTurn() { agentCalls += 1; return {assistantMessage: 'unused'}; }
+      },
+      asrAgentId: 'asr-agent',
+      tempDir,
+      whisper: {async transcribe() { whisperCalls += 1; return 'unused'; }},
+      rtasr: {
+        async transcribe() { throw xfyunError; }
+      }
+    });
+
+    await assert.rejects(
+      () => service.transcribe(wavPath, {caseId: 'case-1', segmentId: 'segment-1'}),
+      (error) => error === xfyunError
+    );
+    assert.equal(agentCalls, 0);
+    assert.equal(whisperCalls, 0);
+    assert.ok((await readFile(wavPath)).length > 44);
+  });
+});
+
+test('AsrService rejects an empty Xfyun result without calling Agent Stack or Whisper', async () => {
+  await withTempDirectory(async (tempDir) => {
+    const wavPath = path.join(tempDir, 'xfyun-empty.wav');
+    await writeFile(wavPath, pcmToWav(Buffer.from([1, 0]), {sampleRate: 16000, bits: 16, channels: 1}));
+    let agentCalls = 0;
+    let whisperCalls = 0;
+    const service = new AsrService({
+      client: {
+        async createSession() { agentCalls += 1; return 'unused'; },
+        async runAudioTurn() { agentCalls += 1; return {assistantMessage: 'unused'}; }
+      },
+      asrAgentId: 'asr-agent',
+      tempDir,
+      whisper: {async transcribe() { whisperCalls += 1; return 'unused'; }},
+      rtasr: {async transcribe() { return '   '; }}
+    });
+
+    await assert.rejects(
+      () => service.transcribe(wavPath, {caseId: 'case-1', segmentId: 'segment-1'}),
+      /Xfyun.*empty/i
+    );
+    assert.equal(agentCalls, 0);
+    assert.equal(whisperCalls, 0);
+    assert.ok((await readFile(wavPath)).length > 44);
+  });
+});
+
+test('AsrService still requires Agent Stack ASR dependencies when Xfyun is absent', () => {
+  assert.throws(() => new AsrService({tempDir: 'tmp'}), /Agent Stack client/);
+  assert.throws(() => new AsrService({
+    tempDir: 'tmp',
+    client: {async createSession() {}, async runAudioTurn() {}}
+  }), /asrAgentId/);
+});
+
+test('startBridge accepts Xfyun-only ASR with an Agent Stack client that has no audio methods', async () => {
+  await withTempDirectory(async (tempDir) => {
+    const bonjour = {
+      publish() { return {stop(callback) { callback?.(); }}; },
+      destroy(callback) { callback?.(); }
+    };
+    const bridge = await startBridge({
+      config: {
+        baseUrl: 'https://agent-stack.test',
+        uak: 'synthetic-uak',
+        projectId: 'project-test',
+        asrAgentId: null,
+        mediatorAgentId: 'mediator-test',
+        deviceToken: 'device-test-token',
+        host: '127.0.0.1',
+        port: 0,
+        pythonBin: 'must-not-be-used',
+        whisperModel: 'small',
+        tempDir,
+        xfyunRtasr: {appId: 'synthetic-app', apiKey: 'synthetic-key'}
+      },
+      client: {
+        async createSession() { return 'mediator-session'; },
+        async runTextTurn() { return {assistantMessage: JSON.stringify(mediation)}; }
+      },
+      rtasrClient: {async transcribe() { return '讯飞转写'; }},
+      ttsService: {async synthesize() { return Buffer.from([1, 0]); }},
+      bonjourFactory: () => bonjour,
+      logger: {info() {}, warn() {}, error() {}}
+    });
+    await bridge.shutdown();
+  });
+});
+
+test('startBridge preserves an injected Xfyun client as the ASR mode selector', async () => {
+  await withTempDirectory(async (tempDir) => {
+    const bonjour = {
+      publish() { return {stop(callback) { callback?.(); }}; },
+      destroy(callback) { callback?.(); }
+    };
+    const bridge = await startBridge({
+      config: {
+        baseUrl: 'https://agent-stack.test',
+        uak: 'synthetic-uak',
+        projectId: 'project-test',
+        asrAgentId: null,
+        mediatorAgentId: 'mediator-test',
+        deviceToken: 'device-test-token',
+        host: '127.0.0.1',
+        port: 0,
+        tempDir,
+        xfyunRtasr: null
+      },
+      client: {
+        async createSession() { return 'mediator-session'; },
+        async runTextTurn() { return {assistantMessage: JSON.stringify(mediation)}; }
+      },
+      rtasrClient: {async transcribe() { return '注入的讯飞转写'; }},
+      ttsService: {async synthesize() { return Buffer.from([1, 0]); }},
+      bonjourFactory: () => bonjour,
+      logger: {info() {}, warn() {}, error() {}}
+    });
+    await bridge.shutdown();
+  });
+});
+
+test('AsrService rejects malformed or empty transcripts and leaves the bridge WAV for retry', async () => {
   await withTempDirectory(async (tempDir) => {
     for (const [index, message] of [
       JSON.stringify({transcript: 'text'}),
@@ -170,7 +390,7 @@ test('AsrService rejects malformed or empty transcripts and still removes the br
       const service = new AsrService({client: agentClient({message}), asrAgentId: 'asr-agent', tempDir});
 
       await assert.rejects(() => service.transcribe(wavPath, {caseId: 'case-1', segmentId: 'segment-1'}), /transcript/i);
-      await assert.rejects(() => readFile(wavPath), {code: 'ENOENT'});
+      assert.deepEqual(await readFile(wavPath), Buffer.from('RIFF'));
     }
   });
 });
@@ -196,7 +416,7 @@ test('AsrService calls Whisper exactly once only when Agent Stack ASR is unavail
 
     assert.equal(await service.transcribe(wavPath, {caseId: 'case-1', segmentId: 'segment-1'}), '离线转写');
     assert.equal(fallbackCalls, 1);
-    await assert.rejects(() => readFile(wavPath), {code: 'ENOENT'});
+    assert.deepEqual(await readFile(wavPath), Buffer.from('RIFF'));
     await assert.rejects(() => readFile(fallbackPath), {code: 'ENOENT'});
   });
 });
@@ -221,7 +441,7 @@ test('AsrService stages validated WAV bytes for Whisper when the original path c
     });
 
     assert.equal(await service.transcribe(wavPath, {caseId: 'case-1', segmentId: 'segment-1'}), '离线转写');
-    await assert.rejects(() => readFile(wavPath), {code: 'ENOENT'});
+    assert.deepEqual(await readFile(wavPath), Buffer.from('replaced WAV bytes'));
     await assert.rejects(() => readFile(fallbackPath), {code: 'ENOENT'});
     await assert.rejects(() => readFile(path.dirname(fallbackPath)), {code: 'ENOENT'});
   });
@@ -293,7 +513,7 @@ test('AsrService keeps a no-close Whisper input until the child closes late', as
     await assert.rejects(pending, /timed out/i);
 
     assert.deepEqual(await readFile(fallbackPath), Buffer.from('RIFF'));
-    await assert.rejects(() => readFile(wavPath), {code: 'ENOENT'});
+    assert.deepEqual(await readFile(wavPath), Buffer.from('RIFF'));
     child.emit('close', 1, null);
     for (let attempt = 0; attempt < 100; attempt += 1) {
       try {
@@ -323,7 +543,7 @@ test('AsrService does not call Whisper for a non-availability Agent Stack failur
 
     await assert.rejects(() => service.transcribe(wavPath, {caseId: 'case-1', segmentId: 'segment-1'}), /network failure/);
     assert.equal(fallbackCalls, 0);
-    await assert.rejects(() => readFile(wavPath), {code: 'ENOENT'});
+    assert.deepEqual(await readFile(wavPath), Buffer.from('RIFF'));
   });
 });
 
@@ -393,7 +613,7 @@ test('AsrService propagates one cancellation signal through Session creation and
     assert.equal(await service.transcribe(wavPath, {
       caseId: 'case-1', segmentId: 'segment-1', signal: controller.signal
     }), '可取消转写');
-    await assert.rejects(() => readFile(wavPath), {code: 'ENOENT'});
+    assert.deepEqual(await readFile(wavPath), Buffer.from('RIFF'));
   });
 });
 
@@ -442,16 +662,69 @@ test('MediatorService serializes only the approved mediation DTO and rejects inc
   assert.match(prompt, /保持中立/);
   assert.match(prompt, /区分双方主张与已经证实的事实/);
   assert.match(prompt, /暴力、自残、虐待或即时危险/);
+  const orderedGuidance = [
+    '总结冲突',
+    '双方立场、情绪和需求',
+    '各自可改进',
+    '可能存在的误会',
+    '共同点',
+    '可执行步骤',
+    '简短、中立的 spokenText'
+  ];
+  let previousGuidanceIndex = -1;
+  for (const guidance of orderedGuidance) {
+    const guidanceIndex = prompt.indexOf(guidance);
+    assert.ok(guidanceIndex > previousGuidanceIndex, `${guidance} must appear in the approved order`);
+    previousGuidanceIndex = guidanceIndex;
+  }
+  const outputShape = prompt.split('\n').find((line) => line.startsWith('{"conflictSummary":"non-empty string"'));
+  assert.equal(typeof outputShape, 'string');
+  assert.deepEqual(JSON.parse(outputShape), {
+    conflictSummary: 'non-empty string',
+    aPosition: 'non-empty string',
+    bPosition: 'non-empty string',
+    aCanImprove: 'non-empty string',
+    bCanImprove: 'non-empty string',
+    commonGround: 'non-empty string',
+    suggestions: ['non-empty string'],
+    spokenText: 'non-empty string, max 100 characters'
+  });
+  assert.match(prompt, /suggestions.*至少.*一个.*非空字符串/);
+  assert.match(prompt, /spokenText.*100/);
 });
 
-test('MediatorService rejects spoken text above 700 Chinese characters', async () => {
+test('MediatorService rejects an aggregate prompt above 32000 characters before the text Turn', async () => {
+  let turnCalls = 0;
+  const oversized = structuredClone(caseSnapshot);
+  oversized.speakers.A = [{state: 'saved', transcript: 'private-marker'.repeat(1_300)}];
+  oversized.speakers.B = [{state: 'saved', transcript: 'private-marker'.repeat(1_300)}];
   const service = new MediatorService({client: {
     async runTextTurn() {
-      return {assistantMessage: JSON.stringify({...mediation, spokenText: '中'.repeat(701)})};
+      turnCalls += 1;
+      return {assistantMessage: JSON.stringify(mediation)};
     }
   }});
 
-  await assert.rejects(() => service.mediate(caseSnapshot, 'mediator-session'), /mediation result/i);
+  await assert.rejects(
+    () => service.mediate(oversized, 'mediator-session'),
+    (error) => /32000-character prompt limit/.test(error.message) && !/private-marker/.test(error.message)
+  );
+  assert.equal(turnCalls, 0);
+});
+
+test('MediatorService accepts 100 spoken characters and rejects 101', async () => {
+  for (const [length, accepted] of [[100, true], [101, false]]) {
+    const service = new MediatorService({client: {
+      async runTextTurn() {
+        return {assistantMessage: JSON.stringify({...mediation, spokenText: '中'.repeat(length)})};
+      }
+    }});
+    if (accepted) {
+      assert.equal((await service.mediate(caseSnapshot, 'mediator-session')).spokenText.length, 100);
+    } else {
+      await assert.rejects(() => service.mediate(caseSnapshot, 'mediator-session'), /mediation result/i);
+    }
+  }
 });
 
 test('MediatorService returns a canonical valid mediation result', async () => {
@@ -462,6 +735,33 @@ test('MediatorService returns a canonical valid mediation result', async () => {
   }});
 
   assert.deepEqual(await service.mediate(caseSnapshot, 'mediator-session'), mediation);
+});
+
+test('MediatorService accepts exactly one complete JSON or unlabelled code fence', async () => {
+  for (const openingFence of ['```json', '```']) {
+    const service = new MediatorService({client: {
+      async runTextTurn() {
+        return {assistantMessage: `${openingFence}\n${JSON.stringify(mediation)}\n${'```'}`};
+      }
+    }});
+
+    assert.deepEqual(await service.mediate(caseSnapshot, 'mediator-session'), mediation);
+  }
+});
+
+test('MediatorService rejects prose, partial fences, multiple fences, and trailing content', async () => {
+  const validJson = JSON.stringify(mediation);
+  for (const message of [
+    `Here is the result:\n${validJson}`,
+    `${'```json'}\n${validJson}`,
+    `${'```json'}\n${validJson}\n${'```'}\nextra`,
+    `${'```json'}\n${validJson}\n${'```'}\n${'```json'}\n${validJson}\n${'```'}`
+  ]) {
+    const service = new MediatorService({client: {
+      async runTextTurn() { return {assistantMessage: message}; }
+    }});
+    await assert.rejects(() => service.mediate(caseSnapshot, 'mediator-session'), /valid JSON/i);
+  }
 });
 
 test('MediatorService propagates the cancellation signal to its text Turn', async () => {
@@ -685,4 +985,77 @@ test('WhisperService kills its child and rejects when the caller aborts', async 
   child.emit('close', 1, null);
   await assert.rejects(pending, {name: 'AbortError'});
   assert.equal(child.killCalls, 1);
+});
+
+test('startBridge skips Bonjour entirely when mDNS is disabled', async () => {
+  await withTempDirectory(async (tempDir) => {
+    let bonjourFactoryCalls = 0;
+    const bridge = await startBridge({
+      config: {
+        baseUrl: 'https://agent-stack.test',
+        uak: 'synthetic-uak',
+        projectId: 'project-test',
+        asrAgentId: 'asr-test',
+        mediatorAgentId: 'mediator-test',
+        deviceToken: 'device-test-token',
+        host: '127.0.0.1',
+        port: 0,
+        tempDir,
+        mdnsEnabled: false,
+        xfyunRtasr: null
+      },
+      asrService: {async transcribe() { return 'unused'; }},
+      mediatorService: {async mediate() { return mediation; }},
+      ttsService: {async synthesize() { return Buffer.from([1, 0]); }},
+      client: {async createSession() { return 'unused'; }},
+      bonjourFactory() {
+        bonjourFactoryCalls += 1;
+        throw new Error('Bonjour must not be constructed when disabled');
+      },
+      logger: {info() {}, warn() {}, error() {}}
+    });
+    try {
+      assert.equal(bonjourFactoryCalls, 0);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+});
+
+test('registerGracefulShutdown handles SIGTERM and SIGINT through one shutdown', async () => {
+  assert.equal(typeof serverModule.registerGracefulShutdown, 'function');
+  const handlers = new Map();
+  const exits = [];
+  const cleared = [];
+  let shutdownCalls = 0;
+  const timer = {name: 'hard-stop'};
+  serverModule.registerGracefulShutdown({
+    runtime: {async shutdown() { shutdownCalls += 1; }},
+    processRef: {once(signal, handler) { handlers.set(signal, handler); }},
+    exit(code) { exits.push(code); },
+    setTimer(callback, delay) {
+      assert.equal(delay, 6_000);
+      return timer;
+    },
+    clearTimer(value) { cleared.push(value); }
+  });
+
+  handlers.get('SIGTERM')();
+  handlers.get('SIGINT')();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(shutdownCalls, 1);
+  assert.deepEqual(cleared, [timer]);
+  assert.deepEqual(exits, [0]);
+});
+
+test('runBridgeMain registers normal signal shutdown and propagates a runtime fatal', async () => {
+  const fatal = Object.assign(new Error('persistent state unavailable'), {code: 'EIO'});
+  const runtime = {fatal: Promise.resolve(fatal), async shutdown() {}};
+  let registeredRuntime;
+
+  await assert.rejects(() => serverModule.runBridgeMain({
+    startBridgeFn: async () => runtime,
+    registerGracefulShutdownFn({runtime: candidate}) { registeredRuntime = candidate; }
+  }), (error) => error === fatal);
+  assert.equal(registeredRuntime, runtime);
 });

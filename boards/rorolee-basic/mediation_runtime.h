@@ -4,13 +4,46 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "esp_err.h"
 #include "pending_audio_store.h"
 
 namespace xiaoli {
 
-inline constexpr size_t kPcmFrameBytes = 640;
-inline constexpr size_t kMaxPlaybackBytes = 1'920'000;
+// Keep microphone reads and button polling at 20 ms, while batching five
+// capture frames into each 100 ms Wi-Fi upload to protect the bounded queue.
+inline constexpr size_t kPcmCaptureFrameBytes = 640;
+inline constexpr size_t kPcmUploadBatchBytes = 3200;
+static_assert(kPcmUploadBatchBytes == 5 * kPcmCaptureFrameBytes);
+// The Bridge transcribes only after it owns a complete WAV. Spooling the
+// capture in PSRAM first prevents a slow Wi-Fi/WebSocket send from aborting
+// the microphone path, then the existing replay pump uploads at link speed.
+inline constexpr bool kDeferCaptureUploadUntilStop = true;
+inline constexpr uint64_t kTailFlushRetryBudgetMs = 250;
+inline constexpr size_t kMaxPlaybackBytes = kPlaybackPcmBytes;
 inline constexpr size_t kMaxTrackedSegments = 64;
+
+enum class TailFlushAction : uint8_t {
+    kDone,
+    kRetry,
+    kFail,
+};
+
+class PcmUploadBatch {
+public:
+    bool AppendCaptureFrame(const uint8_t* pcm, size_t bytes);
+    TailFlushAction HandleTailPushResult(esp_err_t result, bool link_ready,
+                                         uint64_t elapsed_ms);
+    void CommitSent();
+    void Reset();
+
+    const uint8_t* data() const { return data_; }
+    size_t bytes() const { return bytes_; }
+    bool full() const { return bytes_ == kPcmUploadBatchBytes; }
+
+private:
+    uint8_t data_[kPcmUploadBatchBytes] = {};
+    size_t bytes_ = 0;
+};
 
 enum class AsrEndFailureAction : uint8_t {
     kRetryIncompleteEnd,
@@ -230,6 +263,41 @@ private:
 };
 
 uint32_t ClampHapticDuration(uint32_t duration_ms);
+
+inline constexpr size_t kPlaybackPlayedJsonCapacity = 320;
+
+// Tracks one playback receipt until the Bridge confirms it. A receipt can
+// only be created after matching audio.start/audio.end metadata and a real
+// local PCM drain. Pending receipts survive transport reconnects in RAM and
+// keep the same messageId for idempotent replay.
+class PlaybackAckTracker {
+public:
+    bool Begin(const char* case_id, const char* mediation_message_id);
+    bool AcceptEnd(const char* case_id, const char* mediation_message_id);
+    bool MarkDrained(const char* played_message_id);
+    bool BuildJson(char* output, size_t capacity) const;
+    bool MarkSent();
+    bool RequestResend(const char* case_id,
+                       const char* mediation_message_id);
+    bool ApplyAck(const char* case_id, const char* message_id, bool accepted);
+    void AbortPlayback();
+    void OnDisconnected();
+
+    bool active() const { return active_; }
+    bool pending() const { return pending_; }
+    bool needs_send() const { return pending_ && !sent_; }
+
+private:
+    void Clear();
+
+    char case_id_[kIdCapacity] = {};
+    char mediation_message_id_[kIdCapacity] = {};
+    char played_message_id_[kIdCapacity] = {};
+    bool active_ = false;
+    bool end_validated_ = false;
+    bool pending_ = false;
+    bool sent_ = false;
+};
 
 class PlaybackSession {
 public:

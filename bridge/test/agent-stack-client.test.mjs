@@ -208,6 +208,32 @@ test('rejects a turn without exactly one successful assistant terminal event and
   });
 });
 
+test('rejects an excessive Agent Stack event stream with a static error and cancels the response', async () => {
+  let responseClosed;
+  const closed = new Promise((resolve) => { responseClosed = resolve; });
+  let fallbackTimer;
+
+  await withServer((request, response) => {
+    if (request.url !== '/api/sessions/session-1/turns') return response.writeHead(404).end();
+    response.on('close', () => {
+      clearTimeout(fallbackTimer);
+      responseClosed();
+    });
+    response.writeHead(200, {'content-type': 'application/x-ndjson'});
+    response.write(`${'{"event":"tick","payload":{}}\n'.repeat(513)}`);
+    fallbackTimer = setTimeout(() => response.end(), 200);
+  }, async (baseUrl) => {
+    await assert.rejects(
+      () => client(baseUrl).runTextTurn('session-1', 'bounded stream'),
+      {message: 'Agent Stack turn stream exceeded safety limits'}
+    );
+    assert.equal(await Promise.race([
+      closed.then(() => true),
+      delay(100).then(() => false)
+    ]), true);
+  });
+});
+
 test('aborts an in-flight Agent Stack Turn through the caller signal', async () => {
   let requestStarted;
   const started = new Promise((resolve) => { requestStarted = resolve; });

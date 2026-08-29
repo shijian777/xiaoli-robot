@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
+import {get} from 'node:http';
 import * as realFs from 'node:fs/promises';
 import {mkdtemp, readdir, readFile, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
@@ -125,6 +126,21 @@ async function closeClient(ws) {
   });
 }
 
+function httpGet(port, pathname) {
+  return new Promise((resolve, reject) => {
+    const request = get({host: '127.0.0.1', port, path: pathname}, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => resolve({
+        statusCode: response.statusCode,
+        headers: response.headers,
+        body: Buffer.concat(chunks).toString('utf8')
+      }));
+    });
+    request.once('error', reject);
+  });
+}
+
 async function withGateway(run, overrides = {}) {
   const tempDir = await mkdtemp(path.join(tmpdir(), 'xiaoli-gateway-test-'));
   const cases = overrides.caseManager ?? new CaseManager();
@@ -133,7 +149,6 @@ async function withGateway(run, overrides = {}) {
     async transcribe(wavPath, {segmentId}) {
       const parsed = parsePcmWav(await readFile(wavPath));
       assert.equal(parsed.sampleRate, 16000);
-      await rm(wavPath);
       transcripts.push(segmentId);
       return segmentId.startsWith('a') ? 'A 的陈述' : 'B 的陈述';
     }
@@ -157,6 +172,10 @@ async function withGateway(run, overrides = {}) {
     await gateway.shutdown({graceMs: 500});
     await rm(tempDir, {recursive: true, force: true});
   }
+}
+
+async function segmentArtifacts(tempDir) {
+  return (await readdir(tempDir)).filter((name) => /^segment-/i.test(name));
 }
 
 test('rejects the wrong token with 4003 and acknowledges a canonical hello', async () => {
@@ -380,7 +399,7 @@ test('rejects cross-device speech and mediation before segment, file, ASR, or me
     assert.equal((await nextJson(attackerChannel, 'error')).code, 'case_forbidden');
 
     assert.deepEqual(cases.snapshot('owner-case').speakers, {A: [], B: []});
-    assert.deepEqual(await readdir(tempDir), []);
+    assert.deepEqual(await segmentArtifacts(tempDir), []);
     assert.deepEqual(transcripts, []);
     assert.equal(mediatorCalls, 0);
     await closeClient(attacker);
@@ -462,7 +481,7 @@ test('starting a new case aborts old work, forgets case sessions, and removes it
     assert.equal(asrCalls, 1);
     assert.deepEqual(forgotten, ['old-case']);
     assert.throws(() => cases.snapshot('old-case'), /unknown case/);
-    assert.deepEqual(await readdir(tempDir), []);
+    assert.deepEqual(await segmentArtifacts(tempDir), []);
     ws.send(JSON.stringify(control('mediate.request', 'late-old-mediate', {caseId: 'old-case'})));
     assert.equal((await nextJson(channel, 'error')).code, 'case_not_found');
     await closeClient(ws);
@@ -534,10 +553,10 @@ test('reports the stable audio size limit code before accepting overflow', async
     await nextJson(channel, 'ack');
     ws.send(startFrame({messageId: 'limit-start', caseId: 'limit-case', segmentId: 'limit-a', speaker: 'A'}));
     await nextJson(channel, 'ack');
-    for (let sequence = 0; sequence < 30; sequence += 1) {
+    for (let sequence = 0; sequence < 300; sequence += 1) {
       ws.send(streamFrame(FrameKind.STREAM_CHUNK, sequence, Buffer.alloc(64_000)));
     }
-    ws.send(streamFrame(FrameKind.STREAM_CHUNK, 30, Buffer.alloc(2)));
+    ws.send(streamFrame(FrameKind.STREAM_CHUNK, 300, Buffer.alloc(2)));
 
     const error = await nextJson(channel, 'error');
     assert.equal(error.code, 'audio_size_limit_exceeded');
@@ -574,8 +593,10 @@ test('shutdown waits for in-flight STREAM_END routing and blocks its post-stop W
   const fileSystem = {
     ...realFs,
     async rename(...args) {
-      renameStarted.resolve();
-      await releaseRename.promise;
+      if (String(args[1]).endsWith('.wav')) {
+        renameStarted.resolve();
+        await releaseRename.promise;
+      }
       return realFs.rename(...args);
     }
   };
@@ -598,18 +619,18 @@ test('shutdown waits for in-flight STREAM_END routing and blocks its post-stop W
     assert.equal(shutdownSettled, false);
     await settleWithin(shutdown);
     assert.equal(await closed, 1001);
-    assert.deepEqual(await readdir(tempDir), []);
+    assert.deepEqual(await segmentArtifacts(tempDir), []);
     releaseRename.resolve();
     await new Promise((resolve) => setTimeout(resolve, 25));
     assert.equal(asrCalls, 0);
-    assert.deepEqual(await readdir(tempDir), []);
+    assert.deepEqual(await segmentArtifacts(tempDir), []);
   }, {
     asrService: {async transcribe() { asrCalls += 1; return 'must not transcribe'; }},
     gatewayOptions: {fileSystem}
   });
 });
 
-test('shutdown aborts never-resolving ASR, closes clients, and removes its durable WAV within a bound', async () => {
+test('shutdown aborts never-resolving ASR, closes clients, and preserves its durable WAV for restart', async () => {
   const asrStarted = deferred();
   let aborts = 0;
   const asrService = {
@@ -638,11 +659,11 @@ test('shutdown aborts never-resolving ASR, closes clients, and removes its durab
     assert.ok(Date.now() - startedAt < 750);
     assert.equal(aborts, 1);
     assert.equal(await closed, 1001);
-    assert.deepEqual(await readdir(tempDir), []);
+    assert.equal((await segmentArtifacts(tempDir)).filter((name) => name.endsWith('.wav')).length, 1);
   }, {asrService});
 });
 
-test('default cancellation grace covers child termination and retries every owned temp cleanup within five seconds', async () => {
+test('default cancellation grace covers child termination and preserves restartable ASR input within five seconds', async () => {
   const asrStarted = deferred();
   let childSettled = false;
   let wavRemoveAttempts = 0;
@@ -688,8 +709,8 @@ test('default cancellation grace covers child termination and retries every owne
     assert.equal(childSettled, true);
     assert.ok(elapsed >= 2_500, `shutdown returned too early after ${elapsed}ms`);
     assert.ok(elapsed < 5_000, `shutdown exceeded its five-second budget at ${elapsed}ms`);
-    assert.ok(wavRemoveAttempts >= 3);
-    assert.deepEqual(await readdir(tempDir), []);
+    assert.equal(wavRemoveAttempts, 0);
+    assert.equal((await segmentArtifacts(tempDir)).filter((name) => name.endsWith('.wav')).length, 1);
   }, {asrService, gatewayOptions: {fileSystem}});
 });
 
@@ -735,7 +756,7 @@ test('shutdown aborts never-resolving TTS and completes without post-stop playba
     await settleWithin(gateway.shutdown({graceMs: 25, cancelGraceMs: 25}), 750);
     assert.equal(aborts, 1);
     assert.equal(await closed, 1001);
-    assert.deepEqual(await readdir(tempDir), []);
+    assert.deepEqual(await segmentArtifacts(tempDir), []);
   }, {
     mediatorService: {async mediate() { return mediation; }},
     ttsService
@@ -797,7 +818,6 @@ test('an exact speech.start retry after reconnect restores retained progress wit
     async transcribe(wavPath) {
       transcriptions += 1;
       receivedPcm = parsePcmWav(await readFile(wavPath)).pcm;
-      await rm(wavPath);
       return '断线续传完成';
     }
   };
@@ -839,8 +859,10 @@ test('socket close during durable commit does not orphan or fail the committing 
   const fileSystem = {
     ...realFs,
     async rename(...args) {
-      renameStarted.resolve();
-      await releaseRename.promise;
+      if (String(args[1]).endsWith('.wav')) {
+        renameStarted.resolve();
+        await releaseRename.promise;
+      }
       return realFs.rename(...args);
     }
   };
@@ -896,7 +918,7 @@ test('old generation commit completion cannot clear newer recording ownership', 
       const fileSystem = {
         ...realFs,
         async rename(...args) {
-          if (firstRename) {
+          if (firstRename && String(args[1]).endsWith('.wav')) {
             firstRename = false;
             renameStarted.resolve();
             await releaseRename.promise;
@@ -968,7 +990,7 @@ test('a replay socket closed while waiting for commit cannot poison a third exac
   const fileSystem = {
     ...realFs,
     async rename(...args) {
-      if (failRename) {
+      if (failRename && String(args[1]).endsWith('.wav')) {
         failRename = false;
         renameStarted.resolve();
         await releaseRename.promise;
@@ -1071,7 +1093,7 @@ test('retryable WAV persistence failure accepts exact replay and eventually retu
   const fileSystem = {
     ...realFs,
     async rename(...args) {
-      if (failRename) {
+      if (failRename && String(args[1]).endsWith('.wav')) {
         failRename = false;
         throw Object.assign(new Error('injected rename failure'), {code: 'EIO'});
       }
@@ -1203,6 +1225,298 @@ test('rejects mediation until queued transcription has saved both A and B', asyn
     assert.equal(error.code, 'mediation_not_ready');
     assert.equal(error.retryable, true);
     await closeClient(ws);
+  });
+});
+
+test('retries one failed mediation turn on a fresh Agent Stack session', async () => {
+  const cases = new CaseManager();
+  cases.startCase('device-1', 'retry-mediation-case');
+  for (const [segmentId, speaker, transcript] of [
+    ['retry-mediation-a', 'A', 'A 陈述'],
+    ['retry-mediation-b', 'B', 'B 陈述']
+  ]) {
+    cases.startSegment({caseId: 'retry-mediation-case', segmentId, speaker, audio});
+    cases.appendChunk(segmentId, 0, Buffer.from([1, 0]));
+    cases.endSegment(segmentId);
+    cases.saveTranscript(segmentId, transcript);
+  }
+  const mediation = {
+    conflictSummary: '双方有分歧。',
+    aPosition: 'A 的立场。',
+    bPosition: 'B 的立场。',
+    aCanImprove: 'A 可改进。',
+    bCanImprove: 'B 可改进。',
+    commonGround: '存在共同点。',
+    suggestions: ['继续沟通。'],
+    spokenText: '请双方继续沟通。'
+  };
+  const sessions = [];
+  const turns = [];
+  let ttsCalls = 0;
+
+  await withGateway(async ({gateway, url}) => {
+    const ws = await openClient(url);
+    const channel = inbox(ws);
+    await authenticate(ws, channel);
+    ws.send(JSON.stringify(control('case.start', 'retry-mediation-start', {
+      caseId: 'retry-mediation-case'
+    })));
+    await nextJson(channel, 'ack');
+    ws.send(JSON.stringify(control('mediate.request', 'retry-mediation-request', {
+      caseId: 'retry-mediation-case'
+    })));
+    await nextJson(channel, 'ack');
+    await nextJson(channel, 'audio.end');
+    await gateway.waitForIdle();
+
+    assert.deepEqual(sessions, ['session-1', 'session-2']);
+    assert.deepEqual(turns, ['session-1', 'session-2']);
+    assert.equal(ttsCalls, 1);
+    await closeClient(ws);
+  }, {
+    caseManager: cases,
+    createMediatorSession: async () => {
+      const sessionId = `session-${sessions.length + 1}`;
+      sessions.push(sessionId);
+      return sessionId;
+    },
+    mediatorService: {async mediate(_snapshot, sessionId) {
+      turns.push(sessionId);
+      if (turns.length === 1) throw new Error('transient mediation failure');
+      return mediation;
+    }},
+    ttsService: {async synthesize() {
+      ttsCalls += 1;
+      return Buffer.from([1, 0, 2, 0]);
+    }}
+  });
+});
+
+test('bounds automatic mediation retry and a later request starts a third session', async () => {
+  const cases = new CaseManager();
+  cases.startCase('device-1', 'bounded-retry-case');
+  for (const [segmentId, speaker] of [
+    ['bounded-retry-a', 'A'], ['bounded-retry-b', 'B']
+  ]) {
+    cases.startSegment({caseId: 'bounded-retry-case', segmentId, speaker, audio});
+    cases.appendChunk(segmentId, 0, Buffer.from([1, 0]));
+    cases.endSegment(segmentId);
+    cases.saveTranscript(segmentId, `${speaker} 陈述`);
+  }
+  const result = {
+    conflictSummary: '双方有分歧。', aPosition: 'A 的立场。',
+    bPosition: 'B 的立场。', aCanImprove: 'A 可改进。',
+    bCanImprove: 'B 可改进。', commonGround: '存在共同点。',
+    suggestions: ['继续沟通。'], spokenText: '请双方继续沟通。'
+  };
+  const sessions = [];
+  const turns = [];
+  let ttsCalls = 0;
+
+  await withGateway(async ({gateway, url}) => {
+    let ws = await openClient(url);
+    let channel = inbox(ws);
+    await authenticate(ws, channel);
+    ws.send(JSON.stringify(control('case.start', 'bounded-retry-start', {
+      caseId: 'bounded-retry-case'
+    })));
+    await nextJson(channel, 'ack');
+
+    ws.send(JSON.stringify(control('mediate.request', 'bounded-retry-first', {
+      caseId: 'bounded-retry-case'
+    })));
+    await nextJson(channel, 'ack');
+    const failure = await nextJson(channel, 'error');
+    assert.equal(failure.code, 'mediation_failed');
+    await gateway.waitForIdle();
+    assert.deepEqual(sessions, ['session-1', 'session-2']);
+    assert.deepEqual(turns, ['session-1', 'session-2']);
+    assert.equal(ttsCalls, 0);
+
+    await closeClient(ws);
+    ws = await openClient(url);
+    channel = inbox(ws);
+    await authenticate(ws, channel, token, 'device-1');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(sessions, ['session-1', 'session-2']);
+    assert.deepEqual(turns, ['session-1', 'session-2']);
+    assert.equal(ttsCalls, 0);
+
+    ws.send(JSON.stringify(control('mediate.request', 'bounded-retry-second', {
+      caseId: 'bounded-retry-case'
+    })));
+    await nextJson(channel, 'ack');
+    await nextJson(channel, 'audio.end');
+    await gateway.waitForIdle();
+    assert.deepEqual(sessions, ['session-1', 'session-2', 'session-3']);
+    assert.deepEqual(turns, ['session-1', 'session-2', 'session-3']);
+    assert.equal(ttsCalls, 1);
+    await closeClient(ws);
+  }, {
+    caseManager: cases,
+    createMediatorSession: async () => {
+      const sessionId = `session-${sessions.length + 1}`;
+      sessions.push(sessionId);
+      return sessionId;
+    },
+    mediatorService: {async mediate(_snapshot, sessionId) {
+      turns.push(sessionId);
+      if (turns.length <= 2) throw new Error('persistent first-lane failure');
+      return result;
+    }},
+    ttsService: {async synthesize() {
+      ttsCalls += 1;
+      return Buffer.from([1, 0]);
+    }}
+  });
+});
+
+test('a durable replacement request invalidates the old mediation lane before its commit finishes', async () => {
+  const cases = new CaseManager();
+  cases.startCase('device-1', 'lane-case');
+  for (const [segmentId, speaker] of [['lane-a', 'A'], ['lane-b', 'B']]) {
+    cases.startSegment({caseId: 'lane-case', segmentId, speaker, audio});
+    cases.appendChunk(segmentId, 0, Buffer.from([1, 0]));
+    cases.endSegment(segmentId);
+    cases.saveTranscript(segmentId, `${speaker} 陈述`);
+  }
+  const result = {
+    conflictSummary: '双方有分歧。', aPosition: 'A 的立场。',
+    bPosition: 'B 的立场。', aCanImprove: 'A 可改进。',
+    bCanImprove: 'B 可改进。', commonGround: '存在共同点。',
+    suggestions: ['继续沟通。'], spokenText: '请继续沟通。'
+  };
+  const firstAttemptStarted = deferred();
+  const firstAttempt = deferred();
+  const replacementCommitStarted = deferred();
+  const releaseReplacementCommit = deferred();
+  let mediationCalls = 0;
+  let sessionCalls = 0;
+  const stateStore = {
+    async cleanupParts() {},
+    async load() { return null; },
+    async commit(candidate) {
+      if (candidate.devices.some(({pendingMediation}) =>
+        pendingMediation?.messageId === 'lane-replacement')) {
+        replacementCommitStarted.resolve();
+        await releaseReplacementCommit.promise;
+      }
+    }
+  };
+
+  await withGateway(async ({url}) => {
+    let ws;
+    try {
+      ws = await openClient(url);
+      const channel = inbox(ws);
+      await authenticate(ws, channel);
+      ws.send(JSON.stringify(control('case.start', 'lane-case-start', {caseId: 'lane-case'})));
+      await nextJson(channel, 'ack');
+      ws.send(JSON.stringify(control('mediate.request', 'lane-original', {caseId: 'lane-case'})));
+      await nextJson(channel, 'ack');
+      await settleWithin(firstAttemptStarted.promise);
+
+      ws.send(JSON.stringify(control('mediate.request', 'lane-replacement', {caseId: 'lane-case'})));
+      await settleWithin(replacementCommitStarted.promise);
+      firstAttempt.reject(new Error('old lane failed'));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.equal(mediationCalls, 1);
+      assert.equal(sessionCalls, 1);
+
+      releaseReplacementCommit.resolve();
+      assert.equal((await nextJson(channel, 'ack')).messageId, 'lane-replacement');
+      await nextJson(channel, 'audio.end');
+      assert.equal(mediationCalls, 2);
+      assert.equal(sessionCalls, 2);
+      await closeClient(ws);
+    } finally {
+      firstAttempt.reject(new Error('test cleanup'));
+      releaseReplacementCommit.resolve();
+      if (ws) await closeClient(ws).catch(() => {});
+    }
+  }, {
+    caseManager: cases,
+    gatewayOptions: {stateStore},
+    createMediatorSession: async () => `lane-session-${++sessionCalls}`,
+    mediatorService: {async mediate() {
+      mediationCalls += 1;
+      if (mediationCalls === 1) {
+        firstAttemptStarted.resolve();
+        return firstAttempt.promise;
+      }
+      return result;
+    }},
+    ttsService: {async synthesize() { return Buffer.from([1, 0]); }}
+  });
+});
+
+test('a request whose socket closes during its state commit remains pending without invoking mediation', async () => {
+  const cases = new CaseManager();
+  cases.startCase('device-1', 'disconnect-case');
+  for (const [segmentId, speaker] of [['disconnect-a', 'A'], ['disconnect-b', 'B']]) {
+    cases.startSegment({caseId: 'disconnect-case', segmentId, speaker, audio});
+    cases.appendChunk(segmentId, 0, Buffer.from([1, 0]));
+    cases.endSegment(segmentId);
+    cases.saveTranscript(segmentId, `${speaker} 陈述`);
+  }
+  const commitStarted = deferred();
+  const releaseCommit = deferred();
+  let durableSnapshot;
+  let mediationCalls = 0;
+  const stateStore = {
+    async cleanupParts() {},
+    async load() { return null; },
+    async commit(candidate) {
+      durableSnapshot = structuredClone(candidate);
+      if (candidate.devices.some(({pendingMediation}) =>
+        pendingMediation?.messageId === 'disconnect-mediate')) {
+        commitStarted.resolve();
+        await releaseCommit.promise;
+      }
+    }
+  };
+
+  await withGateway(async ({gateway, url}) => {
+    let ws;
+    try {
+      ws = await openClient(url);
+      const channel = inbox(ws);
+      await authenticate(ws, channel);
+      ws.send(JSON.stringify(control('case.start', 'disconnect-case-start', {
+        caseId: 'disconnect-case'
+      })));
+      await nextJson(channel, 'ack');
+      ws.send(JSON.stringify(control('mediate.request', 'disconnect-mediate', {
+        caseId: 'disconnect-case'
+      })));
+      await settleWithin(commitStarted.promise);
+
+      const closed = new Promise((resolve) => ws.once('close', resolve));
+      ws.terminate();
+      await settleWithin(closed);
+      releaseCommit.resolve();
+      assert.equal(await gateway.waitForIdle({timeoutMs: 500}), true);
+
+      assert.equal(mediationCalls, 0);
+      assert.equal(durableSnapshot.devices[0].pendingMediation.messageId, 'disconnect-mediate');
+    } finally {
+      releaseCommit.resolve();
+      if (ws) await closeClient(ws).catch(() => {});
+    }
+  }, {
+    caseManager: cases,
+    gatewayOptions: {stateStore},
+    mediatorService: {async mediate() {
+      mediationCalls += 1;
+      return {
+        conflictSummary: '双方有分歧。', aPosition: 'A 的立场。',
+        bPosition: 'B 的立场。', aCanImprove: 'A 可改进。',
+        bCanImprove: 'B 可改进。', commonGround: '存在共同点。',
+        suggestions: ['继续沟通。'], spokenText: '请继续沟通。'
+      };
+    }},
+    ttsService: {async synthesize() { return Buffer.from([1, 0]); }}
   });
 });
 
@@ -1365,7 +1679,6 @@ test('serializes ASR, replays the original segment ACK, and streams canonical TT
       asrCalls.push(segmentId);
       if (segmentId === 'a-1') await firstBlocked;
       await readFile(wavPath);
-      await rm(wavPath);
       active -= 1;
       return segmentId === 'a-1' ? 'A 的陈述' : 'B 的陈述';
     }
@@ -1577,6 +1890,95 @@ test('runs Bridge and the fake device through a local mock Agent Stack vertical 
   }
   assert.equal(serviceStopped, true);
   assert.equal(bonjourDestroyed, true);
+});
+
+test('GET /healthz returns a local JSON response while unrelated HTTP routes remain rejected', async () => {
+  let asrCalls = 0;
+  let mediatorCalls = 0;
+  let ttsCalls = 0;
+  await withGateway(async ({gateway}) => {
+    const address = gateway.address();
+    const health = await httpGet(address.port, '/healthz');
+    assert.equal(health.statusCode, 200);
+    assert.equal(health.headers['content-type'], 'application/json; charset=utf-8');
+    assert.deepEqual(JSON.parse(health.body), {status: 'ok'});
+    assert.equal((await httpGet(address.port, '/not-health')).statusCode, 404);
+  }, {
+    asrService: {async transcribe() { asrCalls += 1; }},
+    mediatorService: {async mediate() { mediatorCalls += 1; }},
+    ttsService: {async synthesize() { ttsCalls += 1; }}
+  });
+  assert.deepEqual({asrCalls, mediatorCalls, ttsCalls}, {asrCalls: 0, mediatorCalls: 0, ttsCalls: 0});
+});
+
+test('startBridge uses configured Xfyun RTASR before Agent Stack audio turns', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'xiaoli-xfyun-vertical-test-'));
+  const mock = await startMockAgentStack();
+  const outputPath = path.join(directory, 'xfyun-device-result.wav');
+  const voice = Buffer.from([1, 0, 2, 0, 3, 0, 4, 0]);
+  const transcripts = ['A 的讯飞转写', 'B 的讯飞转写'];
+  const receivedPcm = [];
+  const bonjour = {
+    publish() { return {stop(callback) { callback?.(); }}; },
+    destroy(callback) { callback?.(); }
+  };
+  let bridge;
+  try {
+    bridge = await startBridge({
+      config: {
+        baseUrl: mock.baseUrl,
+        uak: 'local-mock-uak',
+        projectId: 'mock-project',
+        asrAgentId: 'asr-agent',
+        mediatorAgentId: 'mediator-agent',
+        deviceToken: token,
+        host: '127.0.0.1',
+        port: 0,
+        sampleRate: 16000,
+        bits: 16,
+        channels: 1,
+        pythonBin: 'python',
+        whisperModel: 'small',
+        tempDir: directory,
+        xfyunRtasr: {appId: 'test-app-id', apiKey: 'test-api-key-not-real'}
+      },
+      rtasrClient: {
+        async transcribe(pcm) {
+          receivedPcm.push(Buffer.from(pcm));
+          return transcripts[receivedPcm.length - 1];
+        }
+      },
+      ttsService: {async synthesize(text) {
+        assert.equal(text, mock.mediation.spokenText);
+        return voice;
+      }},
+      bonjourFactory: () => bonjour,
+      logger: {info() {}, warn() {}, error() {}}
+    });
+
+    const result = await runFakeDevice({
+      url: `ws://127.0.0.1:${bridge.address.port}/device`,
+      token,
+      outputPath
+    });
+
+    assert.equal(result.bytes, voice.length);
+    assert.equal(receivedPcm.length, 2);
+    assert.ok(receivedPcm.every((pcm) => pcm.length > 0 && pcm.length % 2 === 0));
+    assert.deepEqual(mock.calls.sessions, ['mediator-agent']);
+    assert.deepEqual(mock.calls.turns, ['mediator']);
+    assert.equal(mock.calls.mediationPayloads.length, 1);
+    assert.equal(mock.calls.mediationPayloads[0], JSON.stringify({
+      caseId: JSON.parse(mock.calls.mediationPayloads[0]).caseId,
+      A: [{index: 1, text: transcripts[0]}],
+      B: [{index: 1, text: transcripts[1]}],
+      requirements: {neutral: true, noWinner: true, language: 'zh-CN'}
+    }));
+  } finally {
+    await bridge?.shutdown();
+    await mock.close();
+    await rm(directory, {recursive: true, force: true});
+  }
 });
 
 test('fake device preserves an early transcript event while waiting for the next ACK', async () => {

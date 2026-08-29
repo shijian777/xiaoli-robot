@@ -6,8 +6,11 @@
 #include <type_traits>
 #include <vector>
 
+#include "agent_link.h"
 #include "bridge_message.h"
 #include "config.h"
+#include "esp_http_server.h"
+#include "esp_websocket_client.h"
 #include "mediation_state.h"
 #include "mediation_runtime.h"
 #include "pending_audio_store.h"
@@ -17,9 +20,39 @@
 #include "wifi_transport_utils.h"
 #include "wifi_wire.h"
 
-TEST_CASE("Bridge endpoint accepts the local MVP WebSocket targets", "[wifi_provision]") {
+TEST_CASE("Empty compiled WiFi fields select complete NVS provisioning settings",
+          "[wifi_provision]") {
+    const agent_wifi_config_t compiled = {
+        .ssid = "",
+        .password = "",
+        .endpoint = "",
+        .token = "",
+    };
+    al_prov_settings_t stored = {};
+    std::snprintf(stored.ssid, sizeof(stored.ssid), "%s", "Room WiFi");
+    std::snprintf(stored.password, sizeof(stored.password), "%s", "stored-password");
+    std::snprintf(stored.endpoint, sizeof(stored.endpoint), "%s",
+                  "wss://bridge.example.com/device");
+    std::snprintf(stored.device_token, sizeof(stored.device_token), "%s",
+                  "stored-device-token");
+    al_prov_settings_t effective = {};
+
+    TEST_ASSERT_TRUE(xiaoli::wifi::BuildEffectiveProvisioningSettings(
+        &compiled, stored, effective));
+    TEST_ASSERT_EQUAL_STRING(stored.ssid, effective.ssid);
+    TEST_ASSERT_EQUAL_STRING(stored.password, effective.password);
+    TEST_ASSERT_EQUAL_STRING(stored.endpoint, effective.endpoint);
+    TEST_ASSERT_EQUAL_STRING(stored.device_token, effective.device_token);
+}
+
+TEST_CASE("Bridge endpoint accepts public WSS and local development targets", "[wifi_provision]") {
+    TEST_ASSERT_TRUE(al_wifi_endpoint_valid("wss://bridge.example.com/device"));
+    TEST_ASSERT_TRUE(al_wifi_endpoint_valid("wss://Bridge.Example.com:443/device"));
     TEST_ASSERT_TRUE(al_wifi_endpoint_valid("ws://192.168.1.8:8788/device"));
     TEST_ASSERT_TRUE(al_wifi_endpoint_valid("ws://10.0.0.9/device"));
+    TEST_ASSERT_TRUE(al_wifi_endpoint_valid("ws://10.0.0.1/device"));
+    TEST_ASSERT_TRUE(al_wifi_endpoint_valid("ws://172.16.0.1/device"));
+    TEST_ASSERT_TRUE(al_wifi_endpoint_valid("ws://192.168.1.1/device"));
     TEST_ASSERT_TRUE(al_wifi_endpoint_valid("ws://xiaoli-bridge.local:8788/device"));
 }
 
@@ -35,6 +68,18 @@ TEST_CASE("Bridge endpoint rejects unsafe or ambiguous URLs", "[wifi_provision]"
     TEST_ASSERT_FALSE(al_wifi_endpoint_valid("ws://192.168.1.8:8788/device#x"));
     TEST_ASSERT_FALSE(al_wifi_endpoint_valid("ws://8.8.8.8:8788/device"));
     TEST_ASSERT_FALSE(al_wifi_endpoint_valid("ws://bridge.example.com:8788/device"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("ws://010.0.0.1/device"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("ws://0172.16.0.1/device"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("ws://192.168.001.1/device"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("wss://bridge/device"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("wss://bridge..example.com/device"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("wss://-bridge.example.com/device"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("wss://bridge-.example.com/device"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("wss://xiaoli-bridge.local/device"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("wss://bridge.example.com/device/"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("wss://user@bridge.example.com/device"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("wss://bridge.example.com/device?x=1"));
+    TEST_ASSERT_FALSE(al_wifi_endpoint_valid("wss://bridge.example.com/device#x"));
 }
 
 TEST_CASE("Bridge endpoint enforces its fixed storage boundary", "[wifi_provision]") {
@@ -62,14 +107,14 @@ TEST_CASE("Device token must be non-empty and fit fixed storage", "[wifi_provisi
 
 TEST_CASE("Provisioning form decodes one complete settings value", "[wifi_provision]") {
     const char body[] =
-        "ssid=Room+WiFi&password=p%40ss&endpoint=ws%3A%2F%2F192.168.1.8%3A8788%2Fdevice"
+        "ssid=Room+WiFi&password=p%40ss&endpoint=wss%3A%2F%2Fbridge.example.com%2Fdevice"
         "&device_token=demo%2Dtoken";
     al_prov_settings_t settings = {};
 
     TEST_ASSERT_TRUE(al_wifi_parse_provision_body(body, strlen(body), &settings));
     TEST_ASSERT_EQUAL_STRING("Room WiFi", settings.ssid);
     TEST_ASSERT_EQUAL_STRING("p@ss", settings.password);
-    TEST_ASSERT_EQUAL_STRING("ws://192.168.1.8:8788/device", settings.endpoint);
+    TEST_ASSERT_EQUAL_STRING("wss://bridge.example.com/device", settings.endpoint);
     TEST_ASSERT_EQUAL_STRING("demo-token", settings.device_token);
 }
 
@@ -90,6 +135,18 @@ TEST_CASE("Provisioning form rejects malformed ambiguous and oversized bodies", 
     TEST_ASSERT_FALSE(al_wifi_parse_provision_body(duplicate, strlen(duplicate), &settings));
     TEST_ASSERT_FALSE(al_wifi_parse_provision_body(malformed_unknown, strlen(malformed_unknown), &settings));
     TEST_ASSERT_FALSE(al_wifi_parse_provision_body(oversized.data(), oversized.size(), &settings));
+}
+
+TEST_CASE("Provisioning HTTP reserves sockets for captive DNS and WiFi transport",
+          "[wifi_provision]") {
+    const httpd_config_t config = al_wifi_prov_httpd_config();
+
+    TEST_ASSERT_EQUAL_INT(4, config.max_open_sockets);
+    TEST_ASSERT_TRUE(config.lru_purge_enable);
+    TEST_ASSERT_LESS_OR_EQUAL_INT(
+        CONFIG_LWIP_MAX_SOCKETS,
+        config.max_open_sockets + 3 /* HTTP server internals */
+            + 1 /* captive DNS */ + 2 /* SNTP + WebSocket */);
 }
 
 TEST_CASE("XL stream chunk encoding is byte exact", "[xiaoli_wire]") {
@@ -338,6 +395,9 @@ TEST_CASE("WiFi queue reserves eight FIFO slots for control traffic", "[wifi_tra
     TEST_ASSERT_EQUAL_UINT32(33, policy.queued_items());
     TEST_ASSERT_EQUAL_UINT32(32, policy.queued_audio_items());
     TEST_ASSERT_EQUAL_UINT32(200, xiaoli::wifi::kReservedAdmissionWaitMs);
+    TEST_ASSERT_EQUAL_UINT32(10, xiaoli::wifi::kAudioLockWaitMs);
+    TEST_ASSERT_LESS_THAN_UINT32(xiaoli::kTailFlushRetryBudgetMs,
+                                 xiaoli::wifi::kAudioLockWaitMs);
 }
 
 TEST_CASE("WiFi queue byte cap accounts and releases owning payloads", "[wifi_transport]") {
@@ -1151,6 +1211,32 @@ xiaoli::DurableAck Durable(const char* case_id, const char* segment_id,
     return ack;
 }
 
+struct FailingPendingAudioAllocator {
+    static inline uint8_t first_buffer[16] = {};
+    static inline size_t allocation_calls = 0;
+    static inline size_t release_calls = 0;
+    static inline size_t last_requested_bytes = 0;
+
+    static void Reset() {
+        std::memset(first_buffer, 0, sizeof(first_buffer));
+        allocation_calls = 0;
+        release_calls = 0;
+        last_requested_bytes = 0;
+    }
+
+    static void* Allocate(size_t bytes, uint32_t) {
+        ++allocation_calls;
+        last_requested_bytes = bytes;
+        return allocation_calls == 1 ? first_buffer : nullptr;
+    }
+
+    static void Release(void* ptr) {
+        if (ptr == first_buffer) {
+            ++release_calls;
+        }
+    }
+};
+
 }  // namespace
 
 static_assert(BUTTON_PERSON_A_PIN == GPIO_NUM_40);
@@ -1159,6 +1245,40 @@ static_assert(BUTTON_BOOT_PIN == GPIO_NUM_0);
 static_assert(AUDIO_PA_EN == GPIO_NUM_3);
 static_assert(AUDIO_I2S_DIN == GPIO_NUM_12);
 static_assert(HAPTIC_PIN == GPIO_NUM_1);
+
+TEST_CASE("Production audio budget supports 75 seconds with two pending slots",
+          "[pending_audio][capacity]") {
+    TEST_ASSERT_TRUE(xiaoli::kDeferCaptureUploadUntilStop);
+    TEST_ASSERT_EQUAL_UINT32(75, xiaoli::kMaxRecordingSeconds);
+    TEST_ASSERT_EQUAL_UINT32(2'400'000, xiaoli::kMaxPcmBytes);
+    TEST_ASSERT_EQUAL_UINT32(4'800'000, xiaoli::kCaptureStoreBytes);
+    TEST_ASSERT_EQUAL_UINT32(1'920'001, xiaoli::kPlaybackStorageBytes);
+    TEST_ASSERT_EQUAL_UINT32(6'720'001, xiaoli::kAudioPsramPeakBytes);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(
+        1'600'000, xiaoli::kAudioPsramHeadroomBytes);
+    TEST_ASSERT_EQUAL_UINT32(640, xiaoli::kPcmCaptureFrameBytes);
+    TEST_ASSERT_EQUAL_UINT32(0,
+        xiaoli::kMaxPcmBytes % xiaoli::kPcmCaptureFrameBytes);
+}
+
+TEST_CASE("Production pending audio allocation failure is fail closed",
+          "[pending_audio][capacity]") {
+    FailingPendingAudioAllocator::Reset();
+    xiaoli::PendingAudioStore store;
+    const xiaoli::PendingAudioMemoryOps memory{
+        &FailingPendingAudioAllocator::Allocate,
+        &FailingPendingAudioAllocator::Release,
+    };
+
+    TEST_ASSERT_FALSE(store.InitProduction(memory));
+    TEST_ASSERT_FALSE(store.initialized());
+    TEST_ASSERT_FALSE(store.HasFreeSlot());
+    TEST_ASSERT_EQUAL_UINT32(2, FailingPendingAudioAllocator::allocation_calls);
+    TEST_ASSERT_EQUAL_UINT32(1, FailingPendingAudioAllocator::release_calls);
+    TEST_ASSERT_EQUAL_UINT32(
+        xiaoli::kMaxPcmBytes,
+        FailingPendingAudioAllocator::last_requested_bytes);
+}
 
 TEST_CASE("Pending audio accepts its exact capacity and atomically rejects overflow",
           "[pending_audio]") {
@@ -1409,25 +1529,203 @@ TEST_CASE("Business IDs are boot-epoch unique and require committed storage",
     TEST_ASSERT_FALSE(failed.NextCase(case_one, sizeof(case_one)));
 }
 
-TEST_CASE("Replay cursor retries the same 640 byte frame without advancing",
+TEST_CASE("Replay cursor retries the same 100 ms upload frame without advancing",
           "[mediation_runtime]") {
     xiaoli::ReplayFrameCursor cursor;
-    cursor.Reset(1300);
+    cursor.Reset(6500);
     TEST_ASSERT_EQUAL_UINT32(0, cursor.offset());
     TEST_ASSERT_EQUAL_UINT16(0, cursor.sequence());
-    TEST_ASSERT_EQUAL_UINT32(640, cursor.CurrentBytes());
+    TEST_ASSERT_EQUAL_UINT32(3200, cursor.CurrentBytes());
     cursor.OnTimeout();
     TEST_ASSERT_EQUAL_UINT32(0, cursor.offset());
     TEST_ASSERT_EQUAL_UINT16(0, cursor.sequence());
     cursor.CommitSuccess();
-    TEST_ASSERT_EQUAL_UINT32(640, cursor.offset());
+    TEST_ASSERT_EQUAL_UINT32(3200, cursor.offset());
     TEST_ASSERT_EQUAL_UINT16(1, cursor.sequence());
-    TEST_ASSERT_EQUAL_UINT32(640, cursor.CurrentBytes());
+    TEST_ASSERT_EQUAL_UINT32(3200, cursor.CurrentBytes());
     cursor.CommitSuccess();
-    TEST_ASSERT_EQUAL_UINT32(20, cursor.CurrentBytes());
+    TEST_ASSERT_EQUAL_UINT32(100, cursor.CurrentBytes());
     cursor.CommitSuccess();
     TEST_ASSERT_TRUE(cursor.done());
     TEST_ASSERT_EQUAL_UINT16(3, cursor.sequence());
+}
+
+TEST_CASE("Live PCM batch contains five ordered 20 ms capture frames",
+          "[mediation_runtime]") {
+    static xiaoli::PcmUploadBatch batch;
+    static uint8_t frame[640];
+    batch.Reset();
+    memset(frame, 0, sizeof(frame));
+
+    for (uint8_t index = 0; index < 5; ++index) {
+        memset(frame, index + 1, sizeof(frame));
+        TEST_ASSERT_TRUE(batch.AppendCaptureFrame(frame, sizeof(frame)));
+    }
+
+    TEST_ASSERT_TRUE(batch.full());
+    TEST_ASSERT_EQUAL_UINT32(3200, batch.bytes());
+    for (size_t index = 0; index < 5; ++index) {
+        memset(frame, static_cast<int>(index + 1), sizeof(frame));
+        TEST_ASSERT_EQUAL_UINT8_ARRAY(frame, batch.data() + index * 640,
+                                      sizeof(frame));
+    }
+    TEST_ASSERT_FALSE(batch.AppendCaptureFrame(frame, sizeof(frame)));
+    TEST_ASSERT_EQUAL_UINT32(3200, batch.bytes());
+}
+
+TEST_CASE("Live PCM batch exposes a final partial upload without padding",
+          "[mediation_runtime]") {
+    static xiaoli::PcmUploadBatch batch;
+    static uint8_t first[640];
+    static uint8_t second[640];
+    batch.Reset();
+    memset(first, 0, sizeof(first));
+    memset(second, 0, sizeof(second));
+    memset(first, 0x11, sizeof(first));
+    memset(second, 0x22, sizeof(second));
+
+    TEST_ASSERT_TRUE(batch.AppendCaptureFrame(first, sizeof(first)));
+    TEST_ASSERT_TRUE(batch.AppendCaptureFrame(second, sizeof(second)));
+
+    TEST_ASSERT_FALSE(batch.full());
+    TEST_ASSERT_EQUAL_UINT32(1280, batch.bytes());
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(first, batch.data(), sizeof(first));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(second, batch.data() + sizeof(first),
+                                  sizeof(second));
+    batch.CommitSent();
+    TEST_ASSERT_EQUAL_UINT32(0, batch.bytes());
+}
+
+TEST_CASE("Stop-time PCM tail survives transient WiFi queue saturation",
+          "[mediation_runtime]") {
+    static xiaoli::PcmUploadBatch batch;
+    static uint8_t frame[640];
+    batch.Reset();
+    memset(frame, 0x5a, sizeof(frame));
+    TEST_ASSERT_TRUE(batch.AppendCaptureFrame(frame, sizeof(frame)));
+
+    TEST_ASSERT_EQUAL(
+        static_cast<int>(xiaoli::TailFlushAction::kRetry),
+        static_cast<int>(batch.HandleTailPushResult(ESP_ERR_TIMEOUT, true, 0)));
+    TEST_ASSERT_EQUAL_UINT32(sizeof(frame), batch.bytes());
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(frame, batch.data(), sizeof(frame));
+
+    TEST_ASSERT_EQUAL(
+        static_cast<int>(xiaoli::TailFlushAction::kDone),
+        static_cast<int>(batch.HandleTailPushResult(ESP_OK, true, 10)));
+    TEST_ASSERT_EQUAL_UINT32(0, batch.bytes());
+}
+
+TEST_CASE("Stop-time PCM tail fails closed when retry is unsafe",
+          "[mediation_runtime]") {
+    static xiaoli::PcmUploadBatch batch;
+    static uint8_t frame[640];
+    batch.Reset();
+    memset(frame, 0x6b, sizeof(frame));
+    TEST_ASSERT_TRUE(batch.AppendCaptureFrame(frame, sizeof(frame)));
+
+    TEST_ASSERT_EQUAL(
+        static_cast<int>(xiaoli::TailFlushAction::kFail),
+        static_cast<int>(batch.HandleTailPushResult(ESP_ERR_TIMEOUT, false, 0)));
+    TEST_ASSERT_EQUAL(
+        static_cast<int>(xiaoli::TailFlushAction::kFail),
+        static_cast<int>(batch.HandleTailPushResult(ESP_ERR_INVALID_STATE, true, 0)));
+    TEST_ASSERT_EQUAL(
+        static_cast<int>(xiaoli::TailFlushAction::kFail),
+        static_cast<int>(batch.HandleTailPushResult(
+            ESP_ERR_TIMEOUT, true, xiaoli::kTailFlushRetryBudgetMs)));
+    TEST_ASSERT_EQUAL_UINT32(sizeof(frame), batch.bytes());
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(frame, batch.data(), sizeof(frame));
+}
+
+TEST_CASE("Live PCM batch reset and invalid input never retain stale bytes",
+          "[mediation_runtime]") {
+    static xiaoli::PcmUploadBatch batch;
+    static uint8_t frame[640];
+    batch.Reset();
+    memset(frame, 0, sizeof(frame));
+    memset(frame, 0x33, sizeof(frame));
+    TEST_ASSERT_TRUE(batch.AppendCaptureFrame(frame, sizeof(frame)));
+
+    TEST_ASSERT_FALSE(batch.AppendCaptureFrame(nullptr, sizeof(frame)));
+    TEST_ASSERT_FALSE(batch.AppendCaptureFrame(frame, sizeof(frame) - 1));
+    TEST_ASSERT_EQUAL_UINT32(640, batch.bytes());
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(frame, batch.data(), sizeof(frame));
+
+    batch.Reset();
+    TEST_ASSERT_EQUAL_UINT32(0, batch.bytes());
+    memset(frame, 0x44, sizeof(frame));
+    TEST_ASSERT_TRUE(batch.AppendCaptureFrame(frame, sizeof(frame)));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(frame, batch.data(), sizeof(frame));
+}
+
+TEST_CASE("WiFi public WSS resolution preserves the original TLS hostname", "[wifi_transport]") {
+    std::string queried;
+    std::string resolved;
+    TEST_ASSERT_EQUAL(ESP_OK, xiaoli::wifi::ResolveEndpoint(
+        "wss://Bridge.Example.com:443/device", &TestResolve, &queried, resolved));
+    TEST_ASSERT_TRUE(queried.empty());
+    TEST_ASSERT_EQUAL_STRING("wss://Bridge.Example.com:443/device", resolved.c_str());
+}
+
+TEST_CASE("WiFi WSS config uses the CA bundle and keeps hostname checks enabled",
+          "[wifi_transport]") {
+    esp_websocket_client_config_t secure = {};
+    TEST_ASSERT_EQUAL(ESP_OK, xiaoli::wifi::ConfigureWebSocketSecurity(
+        "wss://bridge.example.com/device", secure));
+    TEST_ASSERT_NOT_NULL(secure.crt_bundle_attach);
+    TEST_ASSERT_FALSE(secure.skip_cert_common_name_check);
+
+    esp_websocket_client_config_t development = {};
+    TEST_ASSERT_EQUAL(ESP_OK, xiaoli::wifi::ConfigureWebSocketSecurity(
+        "ws://192.168.1.8:8788/device", development));
+    TEST_ASSERT_NULL(development.crt_bundle_attach);
+    TEST_ASSERT_FALSE(development.skip_cert_common_name_check);
+}
+
+TEST_CASE("Only public WSS endpoints wait for a trustworthy system clock",
+          "[wifi_transport]") {
+    TEST_ASSERT_TRUE(xiaoli::wifi::EndpointRequiresTrustedTime(
+        "wss://bridge.example.com/device"));
+    TEST_ASSERT_FALSE(xiaoli::wifi::EndpointRequiresTrustedTime(
+        "ws://192.168.1.8:8788/device"));
+    TEST_ASSERT_FALSE(xiaoli::wifi::EndpointRequiresTrustedTime(
+        "ws://xiaoli-bridge.local:8788/device"));
+    TEST_ASSERT_FALSE(xiaoli::wifi::EndpointRequiresTrustedTime("not-an-endpoint"));
+}
+
+TEST_CASE("TLS clock rejects the reset epoch until SNTP supplies modern time",
+          "[wifi_transport]") {
+    TEST_ASSERT_FALSE(xiaoli::wifi::IsTrustedTlsTime(0));
+    TEST_ASSERT_FALSE(xiaoli::wifi::IsTrustedTlsTime(1704067199));
+    TEST_ASSERT_TRUE(xiaoli::wifi::IsTrustedTlsTime(1704067200));
+    TEST_ASSERT_TRUE(xiaoli::wifi::IsTrustedTlsTime(1787875200));
+}
+
+TEST_CASE("An already trustworthy clock skips a new WSS synchronization wait",
+          "[wifi_transport]") {
+    TEST_ASSERT_TRUE(xiaoli::wifi::EndpointNeedsTimeSync(
+        "wss://bridge.example.com/device", 0));
+    TEST_ASSERT_FALSE(xiaoli::wifi::EndpointNeedsTimeSync(
+        "wss://bridge.example.com/device", 1787875200));
+    TEST_ASSERT_FALSE(xiaoli::wifi::EndpointNeedsTimeSync(
+        "ws://192.168.1.8:8788/device", 0));
+}
+
+TEST_CASE("Replay batches one second of PCM into ten WebSocket uploads",
+          "[mediation_runtime]") {
+    xiaoli::ReplayFrameCursor cursor;
+    cursor.Reset(32000);
+
+    uint16_t uploads = 0;
+    while (!cursor.done()) {
+        TEST_ASSERT_EQUAL_UINT32(3200, cursor.CurrentBytes());
+        cursor.CommitSuccess();
+        ++uploads;
+    }
+
+    TEST_ASSERT_EQUAL_UINT16(10, uploads);
+    TEST_ASSERT_EQUAL_UINT32(32000, cursor.offset());
 }
 
 TEST_CASE("Connection replay ledger suppresses immediate resend until reconnect",
@@ -1663,6 +1961,104 @@ TEST_CASE("Bridge parser distinguishes harmless state transcript and start ACK",
             reinterpret_cast<const uint8_t*>(state), strlen(state), &message)));
     TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeMessageType::kState),
                             static_cast<uint8_t>(message.type));
+}
+
+TEST_CASE("Bridge parser binds audio start and end to one mediation identity",
+          "[bridge_message]") {
+    xiaoli::BridgeMessage message{};
+    const char start[] =
+        "{\"v\":1,\"type\":\"audio.start\",\"caseId\":\"case\","
+        "\"mediationMessageId\":\"mediate-7\",\"audio\":{"
+        "\"sampleRate\":16000,\"bits\":16,\"channels\":1},\"bytes\":640}";
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeParseResult::kOk),
+        static_cast<uint8_t>(xiaoli::ParseBridgeMessage(
+            reinterpret_cast<const uint8_t*>(start), strlen(start), &message)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeMessageType::kAudioStart),
+                            static_cast<uint8_t>(message.type));
+    TEST_ASSERT_EQUAL_STRING("mediate-7", message.mediation_message_id);
+
+    const char end[] =
+        "{\"v\":1,\"type\":\"audio.end\",\"caseId\":\"case\","
+        "\"mediationMessageId\":\"mediate-7\",\"bytes\":640,"
+        "\"lastSequence\":0,\"complete\":true}";
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeParseResult::kOk),
+        static_cast<uint8_t>(xiaoli::ParseBridgeMessage(
+            reinterpret_cast<const uint8_t*>(end), strlen(end), &message)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeMessageType::kAudioEnd),
+                            static_cast<uint8_t>(message.type));
+    TEST_ASSERT_EQUAL_STRING("mediate-7", message.mediation_message_id);
+
+    const char missing[] =
+        "{\"v\":1,\"type\":\"audio.end\",\"caseId\":\"case\","
+        "\"bytes\":640,\"lastSequence\":0,\"complete\":true}";
+    const char wrong_type[] =
+        "{\"v\":1,\"type\":\"audio.start\",\"caseId\":\"case\","
+        "\"mediationMessageId\":9,\"audio\":{"
+        "\"sampleRate\":16000,\"bits\":16,\"channels\":1},\"bytes\":640}";
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeParseResult::kInvalid),
+        static_cast<uint8_t>(xiaoli::ParseBridgeMessage(
+            reinterpret_cast<const uint8_t*>(missing), strlen(missing), &message)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(xiaoli::BridgeParseResult::kInvalid),
+        static_cast<uint8_t>(xiaoli::ParseBridgeMessage(
+            reinterpret_cast<const uint8_t*>(wrong_type), strlen(wrong_type), &message)));
+}
+
+TEST_CASE("Played ACK waits for validated end and drain then survives reconnect",
+          "[mediation_runtime]") {
+    xiaoli::PlaybackAckTracker ack;
+    char json[xiaoli::kPlaybackPlayedJsonCapacity] = {};
+    TEST_ASSERT_TRUE(ack.Begin("case", "mediate-7"));
+    TEST_ASSERT_FALSE(ack.BuildJson(json, sizeof(json)));
+    TEST_ASSERT_FALSE(ack.MarkDrained("played-9"));
+    TEST_ASSERT_FALSE(ack.AcceptEnd("other", "mediate-7"));
+    TEST_ASSERT_FALSE(ack.AcceptEnd("case", "mediate-old"));
+    TEST_ASSERT_TRUE(ack.AcceptEnd("case", "mediate-7"));
+    TEST_ASSERT_TRUE(ack.MarkDrained("played-9"));
+    TEST_ASSERT_TRUE(ack.pending());
+    TEST_ASSERT_TRUE(ack.needs_send());
+    TEST_ASSERT_TRUE(ack.BuildJson(json, sizeof(json)));
+    TEST_ASSERT_EQUAL_STRING(
+        "{\"v\":1,\"type\":\"audio.played\",\"messageId\":\"played-9\","
+        "\"caseId\":\"case\",\"mediationMessageId\":\"mediate-7\"}", json);
+    TEST_ASSERT_TRUE(ack.MarkSent());
+    TEST_ASSERT_FALSE(ack.needs_send());
+    ack.AbortPlayback();
+    TEST_ASSERT_TRUE(ack.pending());
+    TEST_ASSERT_FALSE(ack.RequestResend("other", "mediate-7"));
+    TEST_ASSERT_FALSE(ack.RequestResend("case", "mediate-old"));
+    TEST_ASSERT_TRUE(ack.RequestResend("case", "mediate-7"));
+    TEST_ASSERT_TRUE(ack.needs_send());
+    TEST_ASSERT_TRUE(ack.MarkSent());
+
+    ack.OnDisconnected();
+    TEST_ASSERT_TRUE(ack.pending());
+    TEST_ASSERT_TRUE(ack.needs_send());
+    char replay[xiaoli::kPlaybackPlayedJsonCapacity] = {};
+    TEST_ASSERT_TRUE(ack.BuildJson(replay, sizeof(replay)));
+    TEST_ASSERT_EQUAL_STRING(json, replay);
+    TEST_ASSERT_FALSE(ack.ApplyAck("other", "played-9", true));
+    TEST_ASSERT_FALSE(ack.ApplyAck("case", "wrong", true));
+    TEST_ASSERT_FALSE(ack.ApplyAck("case", "played-9", false));
+    TEST_ASSERT_TRUE(ack.pending());
+    TEST_ASSERT_TRUE(ack.ApplyAck("case", "played-9", true));
+    TEST_ASSERT_FALSE(ack.pending());
+    TEST_ASSERT_FALSE(ack.BuildJson(json, sizeof(json)));
+}
+
+TEST_CASE("Failed or interrupted playback never creates audio played",
+          "[mediation_runtime]") {
+    xiaoli::PlaybackAckTracker ack;
+    TEST_ASSERT_TRUE(ack.Begin("case", "mediate-1"));
+    TEST_ASSERT_TRUE(ack.AcceptEnd("case", "mediate-1"));
+    ack.AbortPlayback();
+    TEST_ASSERT_FALSE(ack.MarkDrained("played-1"));
+    TEST_ASSERT_FALSE(ack.pending());
+
+    TEST_ASSERT_TRUE(ack.Begin("case", "mediate-2"));
+    ack.OnDisconnected();
+    TEST_ASSERT_FALSE(ack.AcceptEnd("case", "mediate-2"));
+    TEST_ASSERT_FALSE(ack.MarkDrained("played-2"));
+    TEST_ASSERT_FALSE(ack.pending());
 }
 
 TEST_CASE("Playback completion waits for validated end metadata and local drain",

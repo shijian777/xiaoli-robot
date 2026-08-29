@@ -1,5 +1,6 @@
 .env.local
 tmp/
+state/
 *.log
 __pycache__/
 node_modules/

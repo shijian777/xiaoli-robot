@@ -85,11 +85,51 @@ test('validates type-specific device messages', () => {
   assert.equal(validateDeviceMessage({v: 1, type: 'case.start', messageId: 'case-1', caseId: 'case-1'}), true);
   assert.equal(validateDeviceMessage({v: 1, type: 'mediate.request', messageId: 'request-1', caseId: 'case-1'}), true);
   assert.equal(validateDeviceMessage({
+    v: 1, type: 'audio.played', messageId: 'played-1', caseId: 'case-1',
+    mediationMessageId: 'request-1'
+  }), true);
+  assert.equal(validateDeviceMessage({
+    v: 1, type: 'audio.played', messageId: 'played-1', caseId: 'case-1'
+  }), false);
+  assert.equal(validateDeviceMessage({
     v: 1, type: 'speech.end', messageId: 'end-1', caseId: 'case-1', segmentId: 'segment-1',
     bytes: 3200, lastSequence: 3, complete: true
   }), true);
   assert.equal(validateDeviceMessage({v: 1, type: 'unknown', messageId: 'x'}), false);
   assert.equal(validateDeviceMessage({v: 1, type: 'case.start', messageId: 'x'}), false);
+});
+
+test('accepts 71-byte firmware identifiers and rejects every 72-byte identifier', () => {
+  const max = 'i'.repeat(71);
+  const oversized = 'i'.repeat(72);
+  const hello = {
+    v: 1, type: 'hello', messageId: max, deviceId: max,
+    firmwareVersion: max, token: 'device-token', capabilities: ['audio']
+  };
+  const caseStart = {v: 1, type: 'case.start', messageId: max, caseId: max};
+  const speechStart = {
+    v: 1, type: 'speech.start', messageId: max, caseId: max,
+    segmentId: max, speaker: 'A', audio: {sampleRate: 16000, bits: 16, channels: 1}
+  };
+  const audioPlayed = {
+    v: 1, type: 'audio.played', messageId: max, caseId: max,
+    mediationMessageId: max
+  };
+
+  for (const message of [hello, caseStart, speechStart, audioPlayed]) {
+    assert.equal(validateDeviceMessage(message), true);
+  }
+  for (const message of [
+    {...hello, messageId: oversized},
+    {...hello, deviceId: oversized},
+    {...hello, firmwareVersion: oversized},
+    {...caseStart, caseId: oversized},
+    {...speechStart, segmentId: oversized},
+    {...audioPlayed, mediationMessageId: oversized}
+  ]) {
+    assert.equal(validateDeviceMessage(message), false);
+  }
+  assert.equal(validateDeviceMessage({...caseStart, caseId: '案'.repeat(24)}), false);
 });
 
 test('validates mediation results with all fields and a non-empty suggestion', () => {
@@ -107,5 +147,7 @@ test('validates mediation results with all fields and a non-empty suggestion', (
   assert.equal(validateMediatorResult({...valid, suggestions: []}), false);
   assert.equal(validateMediatorResult({...valid, suggestions: ['']}), false);
   assert.equal(validateMediatorResult({...valid, spokenText: ''}), false);
+  assert.equal(validateMediatorResult({...valid, spokenText: '中'.repeat(100)}), true);
+  assert.equal(validateMediatorResult({...valid, spokenText: '中'.repeat(101)}), false);
   assert.equal(validateMediatorResult({...valid, extra: true}), false);
 });

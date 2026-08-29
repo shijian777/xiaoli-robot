@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "esp_err.h"
+#include "esp_http_server.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,6 +56,9 @@ bool al_wifi_device_token_valid(const char* token);
 
 /** @brief Strictly parse one URL-encoded provisioning POST body. */
 bool al_wifi_parse_provision_body(const char* body, size_t body_len, al_prov_settings_t* settings);
+
+/** @brief Build the captive-portal HTTP server configuration with socket headroom. */
+httpd_config_t al_wifi_prov_httpd_config(void);
 
 /**
  * @brief Start the captive portal (DNS redirect + HTTP config server).

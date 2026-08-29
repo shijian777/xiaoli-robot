@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <ctime>
 #include <cstring>
 #include <cstdio>
 #include <new>
@@ -31,6 +32,7 @@
 #include "esp_random.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_event.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
@@ -65,6 +67,8 @@ constexpr uint32_t kProvTeardownMs  = 4000;   // linger on the portal after succ
 constexpr uint32_t kBridgeRetryMaxMs = 30000;
 constexpr uint32_t kHelloAckTimeoutMs = 5000;
 constexpr uint32_t kWorkerPollMs = 100;
+constexpr uint32_t kTimeSyncBudgetMs = 12000;
+constexpr uint32_t kTimeSyncWaitSliceMs = 250;
 constexpr size_t kRxItemCapacity = 8;
 constexpr size_t kCallbackItemCapacity = 24;
 
@@ -155,6 +159,9 @@ uint32_t s_boot_nonce = 0;
 uint32_t s_client_generation = 0;
 uint32_t s_bridge_retry_ms = kReconnectBaseMs;
 bool s_mdns_owned = false;
+enum class SntpOwnership : uint8_t { kNone, kOwned, kExternal };
+SntpOwnership s_sntp_ownership = SntpOwnership::kNone;
+bool s_sntp_synced = false;
 std::mutex s_lifecycle_mtx;
 std::string s_mac12;
 std::string s_device_id;
@@ -209,25 +216,10 @@ bool SaveSettings() {
     return r == ESP_OK;
 }
 
-bool CopyPreferred(char* dst, size_t capacity, const char* explicit_value, const char* stored_value) {
-    const char* src = (explicit_value && explicit_value[0]) ? explicit_value : stored_value;
-    if (!src) src = "";
-    const size_t len = strnlen(src, capacity);
-    if (len >= capacity) { dst[0] = '\0'; return false; }
-    memcpy(dst, src, len + 1);
-    return true;
-}
-
 bool BuildEffectiveSettings(al_prov_settings_t& settings) {
     al_prov_settings_t stored = {};
     LoadStoredSettings(stored);
-    const bool sizes_ok =
-        CopyPreferred(settings.ssid, sizeof settings.ssid, s_cfg ? s_cfg->ssid : nullptr, stored.ssid) &&
-        CopyPreferred(settings.password, sizeof settings.password, s_cfg ? s_cfg->password : nullptr, stored.password) &&
-        CopyPreferred(settings.endpoint, sizeof settings.endpoint, s_cfg ? s_cfg->endpoint : nullptr, stored.endpoint) &&
-        CopyPreferred(settings.device_token, sizeof settings.device_token, s_cfg ? s_cfg->token : nullptr, stored.device_token);
-    return sizes_ok && settings.ssid[0] && al_wifi_endpoint_valid(settings.endpoint) &&
-           al_wifi_device_token_valid(settings.device_token);
+    return xiaoli::wifi::BuildEffectiveProvisioningSettings(s_cfg, stored, settings);
 }
 
 //  Helpers 
@@ -286,7 +278,9 @@ void TeardownProvCb(void*) {
 
 class TxLockGuard {
 public:
-    TxLockGuard() : locked_(s_tx_lock && xSemaphoreTake(s_tx_lock, portMAX_DELAY) == pdTRUE) {}
+    explicit TxLockGuard(TickType_t wait_ticks = portMAX_DELAY)
+        : locked_(s_tx_lock &&
+                  xSemaphoreTake(s_tx_lock, wait_ticks) == pdTRUE) {}
     ~TxLockGuard() { if (locked_) xSemaphoreGive(s_tx_lock); }
     bool locked() const { return locked_; }
 private:
@@ -596,9 +590,30 @@ void WebSocketEvent(void*, esp_event_base_t, int32_t id, void* data) {
     case WEBSOCKET_EVENT_DATA:
         OnWsData(*event);
         break;
+    case WEBSOCKET_EVENT_ERROR: {
+        const auto& error = event->error_handle;
+        ESP_LOGW(TAG,
+                 "Bridge WebSocket error: type=%d tls=0x%x stack=%d verify=0x%x http=%d socket=%d close=%d",
+                 static_cast<int>(error.error_type),
+                 static_cast<unsigned>(error.esp_tls_last_esp_err),
+                 error.esp_tls_stack_err,
+                 static_cast<unsigned>(error.esp_tls_cert_verify_flags),
+                 error.esp_ws_handshake_status_code,
+                 error.esp_transport_sock_errno,
+                 event->close_status_code);
+        MarkConnectionUnusable();
+        break;
+    }
     case WEBSOCKET_EVENT_DISCONNECTED:
+        ESP_LOGW(TAG, "Bridge WebSocket disconnected: type=%d http=%d socket=%d close=%d",
+                 static_cast<int>(event->error_handle.error_type),
+                 event->error_handle.esp_ws_handshake_status_code,
+                 event->error_handle.esp_transport_sock_errno,
+                 event->close_status_code);
+        MarkConnectionUnusable();
+        break;
     case WEBSOCKET_EVENT_CLOSED:
-    case WEBSOCKET_EVENT_ERROR:
+        ESP_LOGW(TAG, "Bridge WebSocket closed: status=%d", event->close_status_code);
         MarkConnectionUnusable();
         break;
     default:
@@ -626,6 +641,90 @@ esp_err_t ResolveConfiguredEndpoint(std::string& resolved) {
     }
     return xiaoli::wifi::ResolveEndpointWithMdnsOwnership(
         endpoint.c_str(), &MdnsResolve, &MdnsInit, nullptr, s_mdns_owned, resolved);
+}
+
+bool SystemClockReadyForTls() {
+    return xiaoli::wifi::IsTrustedTlsTime(static_cast<int64_t>(time(nullptr)));
+}
+
+esp_err_t EnsureTrustedTimeForEndpoint(const char* endpoint) {
+    if (!xiaoli::wifi::EndpointRequiresTrustedTime(endpoint)) return ESP_OK;
+    // A trustworthy clock can outlive the component that set it (RTC,
+    // settimeofday, or an external SNTP service). Do not require a fresh SNTP
+    // semaphore event when TLS can already validate the certificate dates.
+    if (SystemClockReadyForTls()) {
+        s_sntp_synced = true;
+        return ESP_OK;
+    }
+
+    if (s_sntp_ownership == SntpOwnership::kNone) {
+        esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+        const esp_err_t init_result = esp_netif_sntp_init(&config);
+        if (init_result == ESP_OK) {
+            s_sntp_ownership = SntpOwnership::kOwned;
+            ESP_LOGI(TAG, "synchronizing system clock before secure Bridge connection");
+        } else if (init_result == ESP_ERR_INVALID_STATE) {
+            // Another component owns the singleton SNTP service. We may observe
+            // its clock, but must never deinitialize it during transport shutdown.
+            s_sntp_ownership = SntpOwnership::kExternal;
+        } else {
+            ESP_LOGW(TAG, "SNTP initialization failed: %s", esp_err_to_name(init_result));
+            return init_result;
+        }
+    }
+
+    uint32_t waited_ms = 0;
+    if (s_sntp_ownership == SntpOwnership::kExternal) {
+        // Do not consume another component's synchronization semaphore. Polling
+        // the shared system clock is sufficient and leaves its waiter untouched.
+        while (waited_ms < kTimeSyncBudgetMs && !s_stopping.load() && s_got_ip.load()) {
+            if (SystemClockReadyForTls()) {
+                s_sntp_synced = true;
+                return ESP_OK;
+            }
+            vTaskDelay(pdMS_TO_TICKS(kTimeSyncWaitSliceMs));
+            waited_ms += kTimeSyncWaitSliceMs;
+        }
+        if (s_stopping.load() || !s_got_ip.load()) {
+            s_sntp_ownership = SntpOwnership::kNone;
+            return ESP_ERR_INVALID_STATE;
+        }
+        // The external owner may have stopped its singleton in the meantime.
+        // Re-probe ownership on the next Bridge retry instead of getting stuck.
+        s_sntp_ownership = SntpOwnership::kNone;
+        ESP_LOGW(TAG, "external SNTP clock wait timed out; secure Bridge connection deferred");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    while (waited_ms < kTimeSyncBudgetMs && !s_stopping.load() && s_got_ip.load()) {
+        const esp_err_t wait_result =
+            esp_netif_sntp_sync_wait(pdMS_TO_TICKS(kTimeSyncWaitSliceMs));
+        waited_ms += kTimeSyncWaitSliceMs;
+        if (wait_result == ESP_OK && SystemClockReadyForTls()) {
+            s_sntp_synced = true;
+            ESP_LOGI(TAG, "system clock ready for secure Bridge connection");
+            return ESP_OK;
+        }
+        if (wait_result != ESP_ERR_TIMEOUT && wait_result != ESP_ERR_NOT_FINISHED &&
+            wait_result != ESP_OK) {
+            if (wait_result == ESP_ERR_INVALID_STATE) {
+                // Re-probe on the next retry; another component may have replaced
+                // the singleton after our initialization.
+                s_sntp_ownership = SntpOwnership::kNone;
+            }
+            ESP_LOGW(TAG, "SNTP synchronization failed: %s", esp_err_to_name(wait_result));
+            return wait_result;
+        }
+    }
+    if (s_stopping.load() || !s_got_ip.load()) return ESP_ERR_INVALID_STATE;
+    ESP_LOGW(TAG, "SNTP synchronization timed out; secure Bridge connection deferred");
+    return ESP_ERR_TIMEOUT;
+}
+
+void ReleaseOwnedSntp() {
+    if (s_sntp_ownership == SntpOwnership::kOwned) esp_netif_sntp_deinit();
+    s_sntp_ownership = SntpOwnership::kNone;
+    s_sntp_synced = false;
 }
 
 bool BuildIdentity() {
@@ -678,6 +777,8 @@ esp_err_t CreateWebSocketClient() {
         ESP_LOGW(TAG, "Bridge resolution failed: %s", esp_err_to_name(result));
         return result;
     }
+    result = EnsureTrustedTimeForEndpoint(uri.c_str());
+    if (result != ESP_OK) return result;
     ++s_client_generation;
     s_hello_message_id.clear();
     esp_websocket_client_config_t config = {};
@@ -690,6 +791,8 @@ esp_err_t CreateWebSocketClient() {
     config.buffer_size = 4096;
     config.ping_interval_sec = 10;
     config.pingpong_timeout_sec = 20;
+    result = xiaoli::wifi::ConfigureWebSocketSecurity(uri.c_str(), config);
+    if (result != ESP_OK) return result;
     s_ws_client = esp_websocket_client_init(&config);
     if (s_ws_client == nullptr) return ESP_ERR_NO_MEM;
     result = esp_websocket_register_events(
@@ -1157,6 +1260,7 @@ void wifi_stop(void* /*impl*/) {
         mdns_free();
         s_mdns_owned = false;
     }
+    ReleaseOwnedSntp();
     al_wifi_prov_stop();
     s_want_connect = false;
     if (s_started) { esp_wifi_disconnect(); esp_wifi_stop(); s_started = false; }
@@ -1211,8 +1315,11 @@ esp_err_t wifi_send_stream(void* /*impl*/, agent_stream_t type,
     PublicCallGuard call;
     if (!call.entered()) return ESP_ERR_INVALID_STATE;
     if (!s_accepting.load()) return ESP_ERR_INVALID_STATE;
-    TxLockGuard lock;
-    if (!lock.locked() || !s_accepting.load()) return ESP_ERR_INVALID_STATE;
+    TxLockGuard lock(pdMS_TO_TICKS(xiaoli::wifi::kAudioLockWaitMs));
+    if (!lock.locked()) {
+        return s_accepting.load() ? ESP_ERR_TIMEOUT : ESP_ERR_INVALID_STATE;
+    }
+    if (!s_accepting.load()) return ESP_ERR_INVALID_STATE;
     std::vector<uint8_t> wire;
     esp_err_t result = s_uplink.PrepareChunk(type, data, len, wire);
     if (result != ESP_OK) return result;

@@ -1,0 +1,44 @@
+[Unit]
+Description=Xiaoli Wi-Fi Mediation Bridge
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=xiaoli
+Group=xiaoli
+WorkingDirectory=/opt/xiaoli-bridge
+EnvironmentFile=/etc/xiaoli-bridge/bridge.env
+# Force production-only network and temporary-file constraints even if an older
+# preserved environment file contains broader development settings.
+Environment=BRIDGE_HOST=127.0.0.1
+Environment=BRIDGE_MDNS_ENABLED=false
+Environment=BRIDGE_TEMP_DIR=/var/lib/xiaoli-bridge/tmp
+Environment=BRIDGE_STATE_DIR=/var/lib/xiaoli-bridge/state
+# Keep Node and espeak-ng temporary WAV output inside the sole writable path.
+Environment=TMPDIR=/var/lib/xiaoli-bridge/tmp
+ExecStart=/usr/bin/env BRIDGE_HOST=127.0.0.1 BRIDGE_MDNS_ENABLED=false BRIDGE_TEMP_DIR=/var/lib/xiaoli-bridge/tmp BRIDGE_STATE_DIR=/var/lib/xiaoli-bridge/state TMPDIR=/var/lib/xiaoli-bridge/tmp /opt/node/bin/node /opt/xiaoli-bridge/src/server.mjs
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+UMask=0077
+
+# Keep ephemeral audio and durable case state in separate writable directories.
+NoNewPrivileges=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/xiaoli-bridge/tmp /var/lib/xiaoli-bridge/state
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

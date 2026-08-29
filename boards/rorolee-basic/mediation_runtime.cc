@@ -30,6 +30,37 @@ bool ValidPlaybackStart(const char* case_id, uint32_t expected_bytes,
 
 }  // namespace
 
+bool PcmUploadBatch::AppendCaptureFrame(const uint8_t* pcm, size_t bytes) {
+    if (pcm == nullptr || bytes != kPcmCaptureFrameBytes || full()) {
+        return false;
+    }
+    std::memcpy(data_ + bytes_, pcm, bytes);
+    bytes_ += bytes;
+    return true;
+}
+
+TailFlushAction PcmUploadBatch::HandleTailPushResult(esp_err_t result,
+                                                      bool link_ready,
+                                                      uint64_t elapsed_ms) {
+    if (result == ESP_OK) {
+        CommitSent();
+        return TailFlushAction::kDone;
+    }
+    if (result == ESP_ERR_TIMEOUT && link_ready &&
+        elapsed_ms < kTailFlushRetryBudgetMs) {
+        return TailFlushAction::kRetry;
+    }
+    return TailFlushAction::kFail;
+}
+
+void PcmUploadBatch::CommitSent() {
+    bytes_ = 0;
+}
+
+void PcmUploadBatch::Reset() {
+    bytes_ = 0;
+}
+
 AsrEndFailureAction EndFailureActionFor(bool complete) {
     return complete ? AsrEndFailureAction::kRestartLink
                     : AsrEndFailureAction::kRetryIncompleteEnd;
@@ -290,7 +321,7 @@ size_t ReplayFrameCursor::CurrentBytes() const {
     if (done()) {
         return 0;
     }
-    return std::min(kPcmFrameBytes, total_bytes_ - offset_);
+    return std::min(kPcmUploadBatchBytes, total_bytes_ - offset_);
 }
 
 void ReplayFrameCursor::CommitSuccess() {
@@ -475,6 +506,129 @@ uint32_t ClampHapticDuration(uint32_t duration_ms) {
         return 20;
     }
     return std::min<uint32_t>(duration_ms, 3000);
+}
+
+bool PlaybackAckTracker::Begin(const char* case_id,
+                               const char* mediation_message_id) {
+    if (active_ || pending_ || !ValidId(case_id) ||
+        !ValidId(mediation_message_id)) {
+        return false;
+    }
+    std::snprintf(case_id_, sizeof(case_id_), "%s", case_id);
+    std::snprintf(mediation_message_id_, sizeof(mediation_message_id_), "%s",
+                  mediation_message_id);
+    played_message_id_[0] = '\0';
+    active_ = true;
+    end_validated_ = false;
+    sent_ = false;
+    return true;
+}
+
+bool PlaybackAckTracker::AcceptEnd(const char* case_id,
+                                   const char* mediation_message_id) {
+    if (!active_ || end_validated_ || !ValidId(case_id) ||
+        !ValidId(mediation_message_id) ||
+        std::strncmp(case_id_, case_id, sizeof(case_id_)) != 0 ||
+        std::strncmp(mediation_message_id_, mediation_message_id,
+                     sizeof(mediation_message_id_)) != 0) {
+        return false;
+    }
+    end_validated_ = true;
+    return true;
+}
+
+bool PlaybackAckTracker::MarkDrained(const char* played_message_id) {
+    if (!active_ || !end_validated_ || pending_ ||
+        !ValidId(played_message_id)) {
+        return false;
+    }
+    std::snprintf(played_message_id_, sizeof(played_message_id_), "%s",
+                  played_message_id);
+    active_ = false;
+    end_validated_ = false;
+    pending_ = true;
+    sent_ = false;
+    return true;
+}
+
+bool PlaybackAckTracker::BuildJson(char* output, size_t capacity) const {
+    if (output == nullptr || capacity == 0) {
+        return false;
+    }
+    output[0] = '\0';
+    if (!pending_ || !ValidId(case_id_) ||
+        !ValidId(mediation_message_id_) || !ValidId(played_message_id_)) {
+        return false;
+    }
+    const int written = std::snprintf(
+        output, capacity,
+        "{\"v\":1,\"type\":\"audio.played\",\"messageId\":\"%s\","
+        "\"caseId\":\"%s\",\"mediationMessageId\":\"%s\"}",
+        played_message_id_, case_id_, mediation_message_id_);
+    if (!FitsResult(written, capacity)) {
+        output[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+bool PlaybackAckTracker::MarkSent() {
+    if (!pending_ || sent_) {
+        return false;
+    }
+    sent_ = true;
+    return true;
+}
+
+bool PlaybackAckTracker::RequestResend(
+        const char* case_id, const char* mediation_message_id) {
+    if (!pending_ || !ValidId(case_id) || !ValidId(mediation_message_id) ||
+        std::strncmp(case_id_, case_id, sizeof(case_id_)) != 0 ||
+        std::strncmp(mediation_message_id_, mediation_message_id,
+                     sizeof(mediation_message_id_)) != 0) {
+        return false;
+    }
+    sent_ = false;
+    return true;
+}
+
+bool PlaybackAckTracker::ApplyAck(const char* case_id, const char* message_id,
+                                  bool accepted) {
+    if (!pending_ || !accepted || !ValidId(case_id) || !ValidId(message_id) ||
+        std::strncmp(case_id_, case_id, sizeof(case_id_)) != 0 ||
+        std::strncmp(played_message_id_, message_id,
+                     sizeof(played_message_id_)) != 0) {
+        return false;
+    }
+    Clear();
+    return true;
+}
+
+void PlaybackAckTracker::AbortPlayback() {
+    if (!active_) {
+        return;
+    }
+    Clear();
+}
+
+void PlaybackAckTracker::OnDisconnected() {
+    if (active_) {
+        Clear();
+        return;
+    }
+    if (pending_) {
+        sent_ = false;
+    }
+}
+
+void PlaybackAckTracker::Clear() {
+    case_id_[0] = '\0';
+    mediation_message_id_[0] = '\0';
+    played_message_id_[0] = '\0';
+    active_ = false;
+    end_validated_ = false;
+    pending_ = false;
+    sent_ = false;
 }
 
 bool PlaybackSession::Begin(const char* case_id, uint32_t case_generation,

@@ -11,6 +11,7 @@
 // downstream users can restyle/translate the pages without touching C. The firmware only injects the
 // scanned network list at the {{SSIDS}} marker; language switching is pure CSS inside the page.
 #include "wifi_provision.h"
+#include "wifi_endpoint.h"
 
 #include <cstring>
 #include <cstdio>
@@ -411,6 +412,17 @@ void DnsTask(void*) {
 }  // namespace
 
 // ── Public API ───────────────────────────────────────────────────────────────────────────
+extern "C" httpd_config_t al_wifi_prov_httpd_config(void) {
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.stack_size = 8192;              // handlers render/serve pages + build JSON
+    cfg.max_uri_handlers = 6;
+    // lwIP has 10 sockets on this target. Reserve 3 for HTTPD internals, 1 for
+    // captive DNS, and 2 for WiFi/bridge overlap while provisioning completes.
+    cfg.max_open_sockets = 4;
+    cfg.lru_purge_enable = true;
+    return cfg;
+}
+
 extern "C" esp_err_t al_wifi_prov_start(const char* ap_ssid, al_prov_settings_cb_t on_settings) {
     if (s_httpd) return ESP_OK;                          // already running
     s_on_settings = on_settings;
@@ -439,10 +451,7 @@ extern "C" esp_err_t al_wifi_prov_start(const char* ap_ssid, al_prov_settings_cb
     }
 
     // HTTP server.
-    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.stack_size      = 8192;                          // handlers render/serve pages + build JSON
-    cfg.max_uri_handlers = 6;
-    cfg.lru_purge_enable = true;
+    httpd_config_t cfg = al_wifi_prov_httpd_config();
     if (httpd_start(&s_httpd, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "failed to start HTTP server");
         s_dns_run = false;
@@ -487,63 +496,9 @@ extern "C" void al_wifi_prov_stop(void) {
 extern "C" bool al_wifi_prov_active(void) { return s_httpd != nullptr; }
 
 extern "C" bool al_wifi_endpoint_valid(const char* endpoint) {
-    if (!endpoint) return false;
-    const size_t len = strnlen(endpoint, AL_PROV_ENDPOINT_CAPACITY);
-    if (len == 0 || len >= AL_PROV_ENDPOINT_CAPACITY) return false;
-    constexpr const char kPrefix[] = "ws://";
-    if (len <= sizeof(kPrefix) - 1 || strncmp(endpoint, kPrefix, sizeof(kPrefix) - 1) != 0) return false;
-    for (size_t i = 0; i < len; ++i) {
-        const unsigned char c = static_cast<unsigned char>(endpoint[i]);
-        if (c <= 0x20 || c >= 0x7f || c == '@' || c == '?' || c == '#' || c == '%') return false;
-    }
-
-    const char* authority = endpoint + sizeof(kPrefix) - 1;
-    const char* path = strchr(authority, '/');
-    if (!path || strcmp(path, "/device") != 0 || path == authority) return false;
-    const char* host_end = path;
-    const char* colon = static_cast<const char*>(memchr(authority, ':', path - authority));
-    if (colon) {
-        if (colon == authority || colon + 1 == path) return false;
-        unsigned port = 0;
-        for (const char* p = colon + 1; p < path; ++p) {
-            if (!isdigit(static_cast<unsigned char>(*p))) return false;
-            port = port * 10u + static_cast<unsigned>(*p - '0');
-            if (port > 65535u) return false;
-        }
-        if (port == 0) return false;
-        host_end = colon;
-    }
-
-    const size_t host_len = static_cast<size_t>(host_end - authority);
-    if (host_len == 0 || host_len > 253) return false;
-    char host[254];
-    memcpy(host, authority, host_len);
-    host[host_len] = '\0';
-
-    unsigned octets[4] = {};
-    char tail = '\0';
-    if (sscanf(host, "%u.%u.%u.%u%c", &octets[0], &octets[1], &octets[2], &octets[3], &tail) == 4) {
-        for (unsigned octet : octets) if (octet > 255) return false;
-        return octets[0] == 10 ||
-               (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31) ||
-               (octets[0] == 192 && octets[1] == 168);
-    }
-
-    constexpr const char kLocalSuffix[] = ".local";
-    if (host_len <= sizeof(kLocalSuffix) - 1 ||
-        strcmp(host + host_len - (sizeof(kLocalSuffix) - 1), kLocalSuffix) != 0) return false;
-    bool label_start = true;
-    for (size_t i = 0; i < host_len; ++i) {
-        const unsigned char c = static_cast<unsigned char>(host[i]);
-        if (c == '.') {
-            if (label_start || host[i - 1] == '-') return false;
-            label_start = true;
-        } else {
-            if (!(isalnum(c) || c == '-') || (label_start && c == '-')) return false;
-            label_start = false;
-        }
-    }
-    return !label_start && host[host_len - 1] != '-';
+    static_assert(AL_PROV_ENDPOINT_CAPACITY == xiaoli::wifi::kEndpointCapacity);
+    xiaoli::wifi::ParsedEndpoint parsed;
+    return xiaoli::wifi::ParseEndpoint(endpoint, parsed);
 }
 
 extern "C" bool al_wifi_device_token_valid(const char* token) {

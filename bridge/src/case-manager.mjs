@@ -1,9 +1,14 @@
 import { assertApprovedPcmFormat } from './audio/wav.mjs';
+import {assertProtocolIdentifier} from './protocol/limits.mjs';
 
 const ACTIVE_STATES = new Set(['receiving', 'queued', 'transcribing']);
 const TERMINAL_STATES = new Set(['saved', 'failed']);
-export const MAX_PCM_BYTES_PER_SEGMENT = 1_920_000;
+export const MAX_PCM_BYTES_PER_SEGMENT = 19_200_000;
 export const MAX_SEGMENTS_PER_CASE = 64;
+export const MAX_SEGMENT_TOMBSTONES = 4096;
+export const MAX_RETAINED_CASES = 128;
+export const MAX_TRANSCRIPT_CHARACTERS = 32_000;
+export const MAX_FAILURE_CHARACTERS = 256;
 
 export class CaseResourceLimitError extends Error {
   constructor(code, message) {
@@ -14,10 +19,15 @@ export class CaseResourceLimitError extends Error {
 }
 
 export class CaseManager {
-  #segmentBindings = new Map();
+  #segmentTombstones = new Map();
   #currentCases = new Map();
+  #segmentTombstoneLimit;
 
-  constructor() {
+  constructor({segmentTombstoneLimit = MAX_SEGMENT_TOMBSTONES} = {}) {
+    if (!Number.isInteger(segmentTombstoneLimit) || segmentTombstoneLimit < 1) {
+      throw new RangeError('segmentTombstoneLimit must be a positive integer');
+    }
+    this.#segmentTombstoneLimit = segmentTombstoneLimit;
     this.cases = new Map();
     this.segments = new Map();
   }
@@ -53,7 +63,7 @@ export class CaseManager {
 
   startSegment(meta) {
     const normalized = normalizeMeta(meta);
-    const binding = this.#segmentBindings.get(normalized.segmentId);
+    const binding = this.#segmentTombstones.get(normalized.segmentId);
     if (binding && !sameMeta(binding, normalized)) {
       throw new Error(`segment ${normalized.segmentId} conflicts with existing metadata`);
     }
@@ -93,7 +103,6 @@ export class CaseManager {
       failure: null
     };
     this.segments.set(segment.segmentId, segment);
-    this.#segmentBindings.set(segment.segmentId, normalized);
     caseRecord.speakers[segment.speaker].push(segment.segmentId);
     return snapshotSegment(segment);
   }
@@ -117,7 +126,7 @@ export class CaseManager {
       throw new Error(`segment ${segmentId} is not receiving audio`);
     }
     if (segment.receivedBytes + pcm.length > MAX_PCM_BYTES_PER_SEGMENT) {
-      throw new CaseResourceLimitError('audio_size_limit_exceeded', 'Recording audio exceeds the 60-second limit');
+      throw new CaseResourceLimitError('audio_size_limit_exceeded', 'Recording audio exceeds the 10-minute limit');
     }
 
     const expected = segment.chunks.size;
@@ -136,6 +145,17 @@ export class CaseManager {
       segment.state = 'queued';
     }
     return completedSegment(segment);
+  }
+
+  copyReceivingAudio(segmentId) {
+    const segment = this.#requireSegment(segmentId);
+    if (segment.state !== 'receiving') {
+      throw new Error(`segment ${segmentId} is not receiving audio`);
+    }
+    return {
+      ...snapshotSegment(segment),
+      pcm: assemblePcm(segment.chunks)
+    };
   }
 
   releaseAudio(segmentId) {
@@ -162,6 +182,9 @@ export class CaseManager {
     if (typeof transcript !== 'string') {
       throw new TypeError('transcript must be a string');
     }
+    if (transcript.length > MAX_TRANSCRIPT_CHARACTERS) {
+      throw new RangeError(`transcript exceeds the ${MAX_TRANSCRIPT_CHARACTERS}-character limit`);
+    }
     if (segment.state === 'saved') {
       if (segment.transcript !== transcript) {
         throw new Error(`segment ${segmentId} conflicts with existing transcript`);
@@ -182,6 +205,9 @@ export class CaseManager {
     if (typeof failure !== 'string' || failure.length === 0) {
       throw new TypeError('failure must be a non-empty string');
     }
+    if (failure.length > MAX_FAILURE_CHARACTERS) {
+      throw new RangeError(`failure exceeds the ${MAX_FAILURE_CHARACTERS}-character limit`);
+    }
     if (TERMINAL_STATES.has(segment.state)) {
       if (segment.state !== 'failed' || segment.failure !== failure) {
         throw new Error(`segment ${segmentId} cannot change terminal state`);
@@ -196,6 +222,36 @@ export class CaseManager {
 
   snapshot(caseId) {
     return snapshotCase(this.#requireCase(caseId), this.segments);
+  }
+
+  exportState() {
+    return {
+      version: 1,
+      currentCases: [...this.#currentCases],
+      cases: [...this.cases.values()].map((record) => ({
+        deviceId: record.deviceId,
+        caseId: record.caseId,
+        speakers: {A: [...record.speakers.A], B: [...record.speakers.B]}
+      })),
+      segments: [...this.segments.values()].map((record) => ({
+        ...snapshotSegment(record),
+        audioReleased: record.audioReleased === true
+      })),
+      segmentTombstones: [...this.#segmentTombstones.values()].map((binding) => ({
+        caseId: binding.caseId,
+        segmentId: binding.segmentId,
+        speaker: binding.speaker,
+        audio: {...binding.audio}
+      }))
+    };
+  }
+
+  restoreState(state) {
+    const restored = validateRestoredState(state, this.#segmentTombstoneLimit);
+    this.cases = restored.cases;
+    this.segments = restored.segments;
+    this.#currentCases = restored.currentCases;
+    this.#segmentTombstones = restored.segmentTombstones;
   }
 
   #requireCase(caseId) {
@@ -221,12 +277,130 @@ export class CaseManager {
     if (!caseRecord) return;
     for (const segmentId of [...caseRecord.speakers.A, ...caseRecord.speakers.B]) {
       const segment = this.segments.get(segmentId);
-      if (segment) releaseSegmentAudio(segment);
+      if (segment) {
+        releaseSegmentAudio(segment);
+        this.#rememberSegmentTombstone(segment);
+      }
       this.segments.delete(segmentId);
     }
     this.cases.delete(caseId);
     if (this.#currentCases.get(caseRecord.deviceId) === caseId) this.#currentCases.delete(caseRecord.deviceId);
   }
+
+  #rememberSegmentTombstone(meta) {
+    const binding = normalizeMeta(meta);
+    this.#segmentTombstones.delete(binding.segmentId);
+    this.#segmentTombstones.set(binding.segmentId, binding);
+    while (this.#segmentTombstones.size > this.#segmentTombstoneLimit) {
+      this.#segmentTombstones.delete(this.#segmentTombstones.keys().next().value);
+    }
+  }
+}
+
+function validateRestoredState(state, tombstoneLimit) {
+  if (!state || typeof state !== 'object' || state.version !== 1 ||
+      !Array.isArray(state.currentCases) || !Array.isArray(state.cases) ||
+      !Array.isArray(state.segments) || !Array.isArray(state.segmentTombstones)) {
+    throw new Error('CaseManager restore state is invalid');
+  }
+  if (state.currentCases.length > MAX_RETAINED_CASES ||
+      state.cases.length > MAX_RETAINED_CASES ||
+      state.segments.length > MAX_RETAINED_CASES * MAX_SEGMENTS_PER_CASE ||
+      state.segmentTombstones.length > tombstoneLimit) {
+    throw new Error('CaseManager restore state exceeds its resource limits');
+  }
+
+  const cases = new Map();
+  for (const candidate of state.cases) {
+    assertIdentifier(candidate?.deviceId, 'deviceId');
+    assertIdentifier(candidate?.caseId, 'caseId');
+    if (cases.has(candidate.caseId) || !candidate.speakers ||
+        !Array.isArray(candidate.speakers.A) || !Array.isArray(candidate.speakers.B)) {
+      throw new Error('CaseManager restore case is invalid');
+    }
+    const speakers = {A: [...candidate.speakers.A], B: [...candidate.speakers.B]};
+    for (const segmentId of [...speakers.A, ...speakers.B]) assertIdentifier(segmentId, 'segmentId');
+    if (new Set([...speakers.A, ...speakers.B]).size !== speakers.A.length + speakers.B.length ||
+        speakers.A.length + speakers.B.length > MAX_SEGMENTS_PER_CASE) {
+      throw new Error('CaseManager restore case segment list is invalid');
+    }
+    cases.set(candidate.caseId, {deviceId: candidate.deviceId, caseId: candidate.caseId, speakers});
+  }
+
+  const segments = new Map();
+  for (const candidate of state.segments) {
+    const meta = normalizeMeta(candidate);
+    if (segments.has(meta.segmentId)) throw new Error('CaseManager restore segment is duplicated');
+    const caseRecord = cases.get(meta.caseId);
+    const listed = caseRecord?.speakers[meta.speaker]?.includes(meta.segmentId);
+    if (!listed) throw new Error('CaseManager restore segment has no matching case binding');
+    const allowedState = new Set(['receiving', 'queued', 'transcribing', 'saved', 'failed']);
+    if (!allowedState.has(candidate.state)) throw new Error('CaseManager restore segment state is invalid');
+    let stateName = candidate.state;
+    let transcript = candidate.transcript ?? null;
+    let failure = candidate.failure ?? null;
+    if (stateName === 'receiving') {
+      stateName = 'failed';
+      transcript = null;
+      failure = 'Recording was interrupted before durable completion';
+    }
+    if (transcript !== null && (typeof transcript !== 'string' ||
+        transcript.length > MAX_TRANSCRIPT_CHARACTERS)) {
+      throw new Error('CaseManager restore saved transcript is invalid');
+    }
+    if (stateName === 'saved' ? typeof transcript !== 'string' : transcript !== null) {
+      throw new Error('CaseManager restore saved transcript is invalid');
+    }
+    if (failure !== null && (typeof failure !== 'string' || failure.length === 0 ||
+        failure.length > MAX_FAILURE_CHARACTERS)) {
+      throw new Error('CaseManager restore failure is invalid');
+    }
+    if (stateName === 'failed' ? typeof failure !== 'string' : failure !== null) {
+      throw new Error('CaseManager restore failure is invalid');
+    }
+    if ((stateName === 'queued' || stateName === 'transcribing') && transcript !== null) {
+      throw new Error('CaseManager restore pending transcript is invalid');
+    }
+    segments.set(meta.segmentId, {
+      ...meta,
+      chunks: new Map(),
+      receivedBytes: 0,
+      state: stateName,
+      pcm: null,
+      audioReleased: true,
+      transcript,
+      failure
+    });
+  }
+
+  for (const record of cases.values()) {
+    for (const segmentId of [...record.speakers.A, ...record.speakers.B]) {
+      if (!segments.has(segmentId)) throw new Error('CaseManager restore case references an unknown segment');
+    }
+  }
+
+  const currentCases = new Map();
+  for (const pair of state.currentCases) {
+    if (!Array.isArray(pair) || pair.length !== 2) throw new Error('CaseManager restore current case is invalid');
+    const [deviceId, caseId] = pair;
+    assertIdentifier(deviceId, 'deviceId');
+    assertIdentifier(caseId, 'caseId');
+    const caseRecord = cases.get(caseId);
+    if (!caseRecord || caseRecord.deviceId !== deviceId || currentCases.has(deviceId)) {
+      throw new Error('CaseManager restore current case binding is invalid');
+    }
+    currentCases.set(deviceId, caseId);
+  }
+
+  const segmentTombstones = new Map();
+  for (const candidate of state.segmentTombstones) {
+    const binding = normalizeMeta(candidate);
+    const live = segments.get(binding.segmentId);
+    if (live && !sameMeta(live, binding)) throw new Error('CaseManager restore tombstone conflicts with a live segment');
+    segmentTombstones.delete(binding.segmentId);
+    segmentTombstones.set(binding.segmentId, binding);
+  }
+  return {cases, segments, currentCases, segmentTombstones};
 }
 
 function normalizeMeta(meta) {
@@ -260,9 +434,7 @@ function sameMeta(segment, meta) {
 }
 
 function assertIdentifier(value, name) {
-  if (typeof value !== 'string' || value.trim().length === 0) {
-    throw new TypeError(`${name} must be a non-empty string`);
-  }
+  assertProtocolIdentifier(value, name);
 }
 
 function assertSequence(sequence) {

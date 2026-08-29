@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#14213d">
+  <meta name="color-scheme" content="light">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>小理 · 设备管理</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
+
+  <header class="app-header">
+    <div>
+      <p class="eyebrow">小理天秤官</p>
+      <h1>设备管理</h1>
+    </div>
+    <button id="reconfigure-button" class="button button-quiet" type="button" hidden>退出 / 重新配置</button>
+  </header>
+
+  <main id="main-content" class="page-shell">
+    <section id="token-panel" class="panel setup-panel" aria-labelledby="token-heading">
+      <div class="panel-heading">
+        <p class="step-label">安全连接</p>
+        <h2 id="token-heading">连接管理后台</h2>
+        <p>请输入服务器设置的管理员令牌。令牌只保存在本机，不会显示在页面中。</p>
+      </div>
+
+      <form id="token-form" class="stack-form" novalidate>
+        <label for="admin-token">管理员令牌</label>
+        <input id="admin-token" name="admin-token" type="password" autocomplete="current-password" autocapitalize="none" spellcheck="false" required>
+        <p id="token-error" class="form-message error-message" role="alert" aria-live="polite"></p>
+        <button class="button button-primary" type="submit">连接设备</button>
+        <button id="clear-token-button" class="button button-quiet" type="button">清除本机令牌</button>
+      </form>
+
+      <a id="apk-download" class="download-link" href="/downloads/xiaoli-control.apk" download>下载最新版 Android APK</a>
+    </section>
+
+    <section id="dashboard" class="dashboard" aria-label="设备控制台" hidden>
+      <section class="status-overview" aria-labelledby="overview-heading">
+        <div class="section-title-row">
+          <div>
+            <p class="step-label">实时状态</p>
+            <h2 id="overview-heading">系统概况</h2>
+          </div>
+          <button id="refresh-button" class="button button-secondary" type="button">立即刷新</button>
+        </div>
+
+        <div class="metric-grid">
+          <article class="metric-card">
+            <span>服务器</span>
+            <strong id="server-status">正在连接</strong>
+          </article>
+          <article class="metric-card">
+            <span>服务器时间</span>
+            <strong id="server-time">—</strong>
+          </article>
+          <article class="metric-card">
+            <span>在线设备</span>
+            <strong id="device-count">0</strong>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel devices-panel" aria-labelledby="devices-heading">
+        <div class="panel-heading compact-heading">
+          <p class="step-label">案件与发言</p>
+          <h2 id="devices-heading">调解设备</h2>
+        </div>
+        <p id="empty-devices" class="empty-state" hidden>暂时没有已注册设备。</p>
+        <div id="device-list" class="device-list" role="list"></div>
+      </section>
+
+      <section class="panel voice-panel" aria-labelledby="voice-heading">
+        <div class="panel-heading compact-heading">
+          <p class="step-label">播放设置</p>
+          <h2 id="voice-heading">小理的声音</h2>
+          <p>调节后将用于下一次调解结果播放。</p>
+        </div>
+
+        <form id="voice-form" class="voice-form" novalidate>
+          <div class="field-group voice-name-field">
+            <label for="voice">讯飞音色代码</label>
+            <input id="voice" name="voice" type="text" maxlength="64" pattern="[A-Za-z0-9_-]+" autocomplete="off" autocapitalize="none" spellcheck="false" required>
+          </div>
+
+          <div class="range-field">
+            <div class="range-label">
+              <label for="speed">语速</label>
+              <output id="speed-output" for="speed">50</output>
+            </div>
+            <input id="speed" name="speed" type="range" min="0" max="100" step="1" value="50">
+          </div>
+
+          <div class="range-field">
+            <div class="range-label">
+              <label for="volume">音量</label>
+              <output id="volume-output" for="volume">50</output>
+            </div>
+            <input id="volume" name="volume" type="range" min="0" max="100" step="1" value="50">
+          </div>
+
+          <div class="range-field">
+            <div class="range-label">
+              <label for="pitch">音调</label>
+              <output id="pitch-output" for="pitch">50</output>
+            </div>
+            <input id="pitch" name="pitch" type="range" min="0" max="100" step="1" value="50">
+          </div>
+
+          <p id="voice-message" class="form-message" role="status" aria-live="polite"></p>
+          <button id="save-voice-button" class="button button-primary" type="submit">保存声音设置</button>
+        </form>
+      </section>
+    </section>
+
+    <p id="activity-status" class="activity-status" role="status" aria-live="polite"></p>
+  </main>
+
+  <footer class="app-footer">
+    <span>硬件按键仍是 A / B 录音的唯一入口</span>
+    <a href="/downloads/xiaoli-control.apk" download>下载 APK</a>
+  </footer>
+</body>
+</html>

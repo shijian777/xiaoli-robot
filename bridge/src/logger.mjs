@@ -1,4 +1,4 @@
-const SECRET_KEY = /key|token|password|authorization|uak/i;
+const SECRET_KEY = /key|secret|token|password|authorization|uak/i;
 const REDACTED = '[REDACTED]';
 
 function redact(value, seen = new WeakMap(), redactStrings = false) {

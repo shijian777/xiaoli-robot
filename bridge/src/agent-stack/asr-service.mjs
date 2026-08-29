@@ -3,6 +3,7 @@ import {constants as fsConstants} from 'node:fs';
 import path from 'node:path';
 import Ajv from 'ajv';
 import {AsrUnavailableError} from './client.mjs';
+import {parsePcmWav} from '../audio/wav.mjs';
 
 const transcriptSchema = {
   type: 'object',
@@ -19,34 +20,42 @@ const CLEANUP_RETRY_DELAY_MS = 50;
 const CLEANUP_ATTEMPTS = 3;
 
 /**
- * Transcribes Bridge-owned WAV files and removes them after the final result.
+ * Transcribes a Bridge-owned WAV file. The caller retains lifecycle ownership
+ * so a durable job can retry the same input after cancellation or restart.
  */
 export class AsrService {
   #client;
   #asrAgentId;
   #tempDir;
   #whisper;
+  #rtasr;
   #removeFile;
   #sessions = new Map();
 
-  constructor({client, asrAgentId, tempDir, whisper, removeFile = fs.rm} = {}) {
-    if (!client || typeof client.createSession !== 'function' || typeof client.runAudioTurn !== 'function') {
-      throw new TypeError('AsrService requires an Agent Stack client');
-    }
-    if (typeof asrAgentId !== 'string' || asrAgentId.trim() === '') {
-      throw new TypeError('asrAgentId must be a non-empty string');
-    }
+  constructor({client, asrAgentId, tempDir, whisper, rtasr, removeFile = fs.rm} = {}) {
     if (typeof tempDir !== 'string' || tempDir.trim() === '') {
       throw new TypeError('tempDir must be a non-empty string');
     }
-    if (whisper && typeof whisper.transcribe !== 'function') {
-      throw new TypeError('whisper must provide transcribe()');
+    if (rtasr && typeof rtasr.transcribe !== 'function') {
+      throw new TypeError('rtasr must provide transcribe()');
+    }
+    if (!rtasr) {
+      if (!client || typeof client.createSession !== 'function' || typeof client.runAudioTurn !== 'function') {
+        throw new TypeError('AsrService requires an Agent Stack client when Xfyun is not configured');
+      }
+      if (typeof asrAgentId !== 'string' || asrAgentId.trim() === '') {
+        throw new TypeError('asrAgentId must be a non-empty string when Xfyun is not configured');
+      }
+      if (whisper && typeof whisper.transcribe !== 'function') {
+        throw new TypeError('whisper must provide transcribe()');
+      }
     }
     if (typeof removeFile !== 'function') throw new TypeError('removeFile must be a function');
     this.#client = client;
     this.#asrAgentId = asrAgentId;
     this.#tempDir = path.resolve(tempDir);
     this.#whisper = whisper;
+    this.#rtasr = rtasr;
     this.#removeFile = removeFile;
   }
 
@@ -58,6 +67,13 @@ export class AsrService {
 
     try {
       const wav = await bridgeWav.handle.readFile();
+      if (this.#rtasr) {
+        const transcript = await this.#rtasr.transcribe(parsePcmWav(wav).pcm, {signal});
+        if (typeof transcript !== 'string' || transcript.trim() === '') {
+          throw new Error('Xfyun RTASR returned an empty transcript');
+        }
+        return transcript.trim();
+      }
       const sessionId = await this.#sessionFor(caseId, signal);
       try {
         const turn = await this.#client.runAudioTurn(sessionId, wav, `${segmentId}.wav`, {signal});
@@ -80,11 +96,7 @@ export class AsrService {
         throw error;
       }
     } finally {
-      try {
-        await bridgeWav.handle.close();
-      } finally {
-        await removeBridgeWav(bridgeWav);
-      }
+      await bridgeWav.handle.close();
     }
   }
 
@@ -146,23 +158,6 @@ async function openBridgeWav(wavPath, tempDir) {
     await handle?.close();
     throw error;
   }
-}
-
-async function removeBridgeWav({path: wavPath, tempDir, realTempDir}) {
-  if (!isContainedBy(tempDir, wavPath)) {
-    throw new Error('ASR cleanup refused a path outside tempDir');
-  }
-  let realParent;
-  try {
-    realParent = await fs.realpath(path.dirname(wavPath));
-  } catch (error) {
-    if (error?.code === 'ENOENT') return;
-    throw error;
-  }
-  if (!isContainedByOrEqual(realTempDir, realParent)) {
-    throw new Error('ASR cleanup refused a path outside tempDir');
-  }
-  await fs.rm(wavPath, {force: true});
 }
 
 async function stageFallbackWav(wav, bridgeWav) {
@@ -250,10 +245,6 @@ async function assertUnchangedTempDir(tempDir, realTempDir) {
 function isContainedBy(parent, candidate) {
   const relative = path.relative(parent, candidate);
   return relative !== '' && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative);
-}
-
-function isContainedByOrEqual(parent, candidate) {
-  return parent === candidate || isContainedBy(parent, candidate);
 }
 
 function isLikelyWindowsFileLock(error) {

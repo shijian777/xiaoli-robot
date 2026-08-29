@@ -8,7 +8,23 @@
 namespace xiaoli {
 
 inline constexpr size_t kPendingSlotCount = 2;
-inline constexpr size_t kMaxPcmBytes = 1'920'000;
+inline constexpr size_t kPcmBytesPerSecond = 16'000 * sizeof(int16_t);
+inline constexpr size_t kMaxRecordingSeconds = 75;
+inline constexpr size_t kMaxPcmBytes =
+    kPcmBytesPerSecond * kMaxRecordingSeconds;
+inline constexpr size_t kCaptureStoreBytes =
+    kPendingSlotCount * kMaxPcmBytes;
+inline constexpr size_t kPlaybackPcmBytes = 1'920'000;
+inline constexpr size_t kPlaybackStorageBytes = kPlaybackPcmBytes + 1;
+inline constexpr size_t kBoardPsramBytes = 8 * 1024 * 1024;
+inline constexpr size_t kAudioPsramPeakBytes =
+    kCaptureStoreBytes + kPlaybackStorageBytes;
+inline constexpr size_t kAudioPsramHeadroomBytes =
+    kBoardPsramBytes - kAudioPsramPeakBytes;
+inline constexpr size_t kMinimumNonAudioPsramHeadroomBytes = 1'600'000;
+static_assert(kAudioPsramPeakBytes <= kBoardPsramBytes);
+static_assert(kAudioPsramHeadroomBytes >=
+              kMinimumNonAudioPsramHeadroomBytes);
 inline constexpr size_t kIdCapacity = 72;
 inline constexpr size_t kStartJsonCapacity = 384;
 
@@ -62,6 +78,14 @@ struct AckResult {
     uint32_t bytes = 0;
 };
 
+struct PendingAudioMemoryOps {
+    using Allocate = void* (*)(size_t bytes, uint32_t capabilities);
+    using Release = void (*)(void* memory);
+
+    Allocate allocate = nullptr;
+    Release release = nullptr;
+};
+
 class PendingAudioStore {
 public:
     PendingAudioStore() = default;
@@ -70,6 +94,7 @@ public:
     PendingAudioStore& operator=(const PendingAudioStore&) = delete;
 
     bool InitProduction();
+    bool InitProduction(PendingAudioMemoryOps memory);
     bool InitWithBuffers(uint8_t* first, uint8_t* second, size_t capacity);
 
     StoreResult Begin(const PendingSegmentMeta& meta, SlotId* slot);
@@ -109,6 +134,7 @@ private:
     uint64_t next_ordinal_ = 1;
     bool initialized_ = false;
     bool owns_buffers_ = false;
+    PendingAudioMemoryOps::Release release_owned_ = nullptr;
 };
 
 }  // namespace xiaoli

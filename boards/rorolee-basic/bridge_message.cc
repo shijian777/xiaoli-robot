@@ -133,6 +133,8 @@ bool ParseAudioStart(const cJSON* root, BridgeMessage* out) {
     uint32_t bits = 0;
     uint32_t channels = 0;
     if (!CopyRequiredString(root, "caseId", out->case_id) ||
+        !CopyRequiredString(root, "mediationMessageId",
+                            out->mediation_message_id) ||
         !OptionalUint32(root, "bytes", &out->has_bytes, &out->bytes) ||
         !out->has_bytes || !cJSON_IsObject(audio) ||
         !NumberInRange(Field(audio, "sampleRate"), UINT32_MAX,
@@ -150,6 +152,8 @@ bool ParseAudioEnd(const cJSON* root, BridgeMessage* out) {
     out->type = BridgeMessageType::kAudioEnd;
     uint32_t last_sequence = 0;
     if (!CopyRequiredString(root, "caseId", out->case_id) ||
+        !CopyRequiredString(root, "mediationMessageId",
+                            out->mediation_message_id) ||
         !OptionalUint32(root, "bytes", &out->has_bytes, &out->bytes) ||
         !out->has_bytes ||
         !NumberInRange(Field(root, "lastSequence"), UINT16_MAX,

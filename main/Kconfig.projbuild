@@ -39,17 +39,19 @@ endchoice
 if AGENT_LINK_TRANSPORT_WIFI
 
 config AGENT_LINK_WIFI_ENDPOINT
-    string "Local Bridge WebSocket endpoint"
-    default "ws://xiaoli-bridge.local:8788/device"
+    string "Bridge WebSocket endpoint"
+    default ""
     help
-        Local-network Bridge endpoint. The MVP accepts ws:// private IPv4
-        addresses and .local hostnames with the exact /device path.
+        Optional product-build override for the Bridge endpoint. Leave empty
+        in production so captive-portal provisioning supplies the endpoint.
+        Public deployments use wss://; local development may use ws:// with a
+        private IPv4 address or .local hostname. The path must be /device.
 
 config AGENT_LINK_WIFI_DEVICE_TOKEN
     string "Device authentication token"
     default ""
     help
-        Shared token used only between this device and the local Bridge.
+        Shared token used only between this device and its Bridge.
         Leave empty to require captive-portal provisioning. Never enter an
         Agent Stack UAK, account password, or other cloud credential here.
 

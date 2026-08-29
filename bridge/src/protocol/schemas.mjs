@@ -1,12 +1,21 @@
 import Ajv from 'ajv';
+import {MAX_PROTOCOL_IDENTIFIER_BYTES} from './limits.mjs';
 
 const nonEmptyString = {type: 'string', minLength: 1, pattern: '\\S'};
-const identifier = nonEmptyString;
+const identifier = {
+  type: 'string',
+  minLength: 1,
+  maxLength: MAX_PROTOCOL_IDENTIFIER_BYTES,
+  pattern: '^[!-~]+$'
+};
+const credential = {...nonEmptyString, maxLength: 512};
 
 const common = {
   v: {const: 1},
   messageId: identifier
 };
+
+export const MAX_SPOKEN_TEXT_CHARACTERS = 100;
 
 const deviceMessageSchemas = [
   {
@@ -16,7 +25,7 @@ const deviceMessageSchemas = [
       type: {const: 'hello'},
       deviceId: identifier,
       firmwareVersion: identifier,
-      token: identifier,
+      token: credential,
       capabilities: {anyOf: [{type: 'array'}, {type: 'object'}]}
     },
     required: ['v', 'type', 'messageId', 'deviceId', 'firmwareVersion', 'token', 'capabilities'],
@@ -77,6 +86,17 @@ const deviceMessageSchemas = [
     },
     required: ['v', 'type', 'messageId', 'caseId'],
     additionalProperties: false
+  },
+  {
+    type: 'object',
+    properties: {
+      ...common,
+      type: {const: 'audio.played'},
+      caseId: identifier,
+      mediationMessageId: identifier
+    },
+    required: ['v', 'type', 'messageId', 'caseId', 'mediationMessageId'],
+    additionalProperties: false
   }
 ];
 
@@ -98,7 +118,7 @@ export const mediatorResultSchema = {
       minItems: 1,
       items: nonEmptyString
     },
-    spokenText: {...nonEmptyString, maxLength: 700}
+    spokenText: {...nonEmptyString, maxLength: MAX_SPOKEN_TEXT_CHARACTERS}
   },
   required: [
     'conflictSummary',

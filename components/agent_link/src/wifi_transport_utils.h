@@ -9,6 +9,8 @@
 
 #include "agent_link_transport.h"
 #include "esp_err.h"
+#include "esp_websocket_client.h"
+#include "wifi_provision.h"
 
 namespace xiaoli::wifi {
 
@@ -16,6 +18,7 @@ constexpr size_t kTxItemCapacity = 40;
 constexpr size_t kAudioItemCapacity = 32;
 constexpr size_t kTxByteCapacity = 96 * 1024;
 constexpr uint32_t kReservedAdmissionWaitMs = 200;
+constexpr uint32_t kAudioLockWaitMs = 10;
 constexpr size_t kTextMessageCapacity = UINT16_MAX;
 constexpr size_t kBinaryMessageCapacity = 8 + UINT16_MAX;
 constexpr size_t kVoiceChunkCapacity = 4096;
@@ -33,6 +36,10 @@ bool BuildHelloJson(const HelloIdentity& identity, std::string& json,
 bool IsMatchingHelloAck(const uint8_t* data, size_t len,
                         const std::string& message_id,
                         const std::string& device_id);
+bool BuildEffectiveProvisioningSettings(
+    const struct agent_wifi_config_s* compiled,
+    const al_prov_settings_t& stored,
+    al_prov_settings_t& effective);
 
 struct OutboundMessage {
     bool text = false;
@@ -161,6 +168,11 @@ using EndpointResolver = esp_err_t (*)(const char* host, uint32_t timeout_ms,
                                        uint32_t* ipv4_be, void* context);
 using EndpointInitializer = esp_err_t (*)(void* context);
 
+esp_err_t ConfigureWebSocketSecurity(const char* endpoint,
+                                     esp_websocket_client_config_t& config);
+bool EndpointRequiresTrustedTime(const char* endpoint);
+bool IsTrustedTlsTime(int64_t unix_seconds);
+bool EndpointNeedsTimeSync(const char* endpoint, int64_t unix_seconds);
 esp_err_t ResolveEndpoint(const char* endpoint, EndpointResolver resolver,
                           void* context, std::string& resolved);
 esp_err_t ResolveEndpointWithMdnsOwnership(const char* endpoint,

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">小理控制台</string>
+    <string name="bridge_url_dialog_title">配置 Bridge</string>
+    <string name="bridge_url_dialog_message">请输入 Bridge 的 HTTPS 地址。应用将只打开该站点的 /mobile/ 页面。</string>
+    <string name="bridge_url_hint">https://xiaoli.136-110-78-96.sslip.io</string>
+    <string name="bridge_url_default">https://xiaoli.136-110-78-96.sslip.io</string>
+    <string name="save_configuration">保存</string>
+    <string name="invalid_bridge_url">请输入有效的 HTTPS Bridge 地址</string>
+    <string name="blocked_navigation">已阻止跳转到其他站点</string>
+    <string name="network_error">无法连接 Bridge。点此重试。</string>
+    <string name="menu_clear_configuration">清除配置</string>
+    <string name="clear_configuration_title">清除配置？</string>
+    <string name="clear_configuration_message">这会删除 Bridge 地址及此应用保存的站点数据。</string>
+    <string name="clear_configuration_confirm">清除</string>
+</resources>

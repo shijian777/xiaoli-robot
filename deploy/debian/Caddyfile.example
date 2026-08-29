@@ -1,0 +1,9 @@
+# Replace bridge.example.com with a DNS name that already resolves to this host
+# before putting this file into service. Caddy obtains and renews TLS certificates
+# automatically; TCP ports 80 and 443 must be publicly reachable for HTTP-01.
+bridge.example.com {
+	encode zstd gzip
+
+	# Caddy automatically supports WebSocket upgrades for /device.
+	reverse_proxy 127.0.0.1:8788
+}
