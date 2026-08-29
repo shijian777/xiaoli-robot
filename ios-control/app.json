@@ -1,0 +1,33 @@
+{
+  "expo": {
+    "name": "小理控制台",
+    "slug": "xiaoli-control",
+    "owner": "guiguan",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "platforms": [
+      "ios"
+    ],
+    "icon": "./assets/xiaoli-balance-icon.png",
+    "scheme": "xiaolicontrol",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "bundleIdentifier": "cn.xiaoli.control",
+      "buildNumber": "1",
+      "supportsTablet": false,
+      "config": {
+        "usesNonExemptEncryption": false
+      },
+      "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": false
+        }
+      }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "3a54ed81-e562-4a3f-8ce3-540b16e3ede3"
+      }
+    }
+  }
+}

@@ -1,0 +1,14 @@
+.git/
+.expo/
+node_modules/
+dist/
+coverage/
+tests/
+*.log
+*.p8
+*.p12
+*.pem
+*.mobileprovision
+.env*.local
+/ios/
+/android/

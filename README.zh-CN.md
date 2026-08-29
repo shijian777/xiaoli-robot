@@ -151,6 +151,13 @@ boards/my-board/
 
 目前只实现了 BLE（NimBLE）传输，所以目标芯片需要带片上 BLE 射频：ESP32、ESP32-S3、ESP32-C3、ESP32-C6、ESP32-H2 等。没有原生射频的芯片（ESP32-S2、ESP32-P4）要等 WiFi 或 USB 后端，那部分目前只有骨架（`transport_wifi.cpp`），尚未实现。芯片间的差异全部收在 `boards/<板>/` 里；换芯片就是 `idf.py set-target <chip>` 再选对应的板。
 
+## 手机控制台
+
+Bridge 的响应式管理页面位于 `bridge/public/mobile/`。`android-control/` 是加载该
+页面的 Android WebView 壳；[`ios-control/`](ios-control/README.md) 是行为等价的
+Expo iPhone 版本，使用 React Native WebView，并保留相同的 HTTPS 同源限制、失败
+重试和本机数据清除行为。
+
 ## 目录结构
 
 ```
