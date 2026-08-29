@@ -151,6 +151,14 @@ Then register it in two places: add a `BOARD_TYPE_MY_BOARD` choice in `main/Kcon
 
 The only transport implemented so far is BLE (NimBLE), so the target needs an on-chip BLE radio: ESP32, ESP32-S3, ESP32-C3, ESP32-C6, ESP32-H2, and similar. Parts without a native radio (ESP32-S2, ESP32-P4) will depend on the WiFi or USB backend, which is scaffolded (`transport_wifi.cpp`) but not implemented. Per-chip differences live entirely under `boards/<board>/`; changing chip is `idf.py set-target <chip>` plus selecting the matching board.
 
+## Mobile console
+
+The Bridge serves its responsive management page from `bridge/public/mobile/`.
+`android-control/` is the Android WebView shell for that page, and
+[`ios-control/`](ios-control/README.md) is the behavior-equivalent Expo iPhone
+version built with React Native WebView. Both enforce the same HTTPS same-origin
+navigation policy, retry behavior, and local-data clearing flow.
+
 ## Repository layout
 
 ```
