@@ -1,4 +1,10 @@
-# agent_link
+# 小理（xiaoli）智能机器人
+
+本项目包含小理机器人的设备固件、语音服务 Bridge、Android/iOS 手机控制台和部署文件。核心使用流程是实体按键区分 A/B 发言、录音转写、生成沟通建议并播放中文语音。
+
+完整项目与文件功能导航见 [项目首页](README.md)，服务启动见 [Bridge 说明](bridge/README.md)。以下为底层 Agent Link SDK 文档；具体功能是否可用取决于硬件适配和服务配置。
+
+## Agent Link SDK
 
 [English](README.md) | **简体中文**
 

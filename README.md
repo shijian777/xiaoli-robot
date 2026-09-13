@@ -1,4 +1,22 @@
-# agent_link
+# 小理（xiaoli）智能机器人
+
+小理是一套语音交互与双方沟通辅助机器人项目，包含 ESP32 设备固件、语音服务 Bridge、手机控制台和部署文件。双方通过实体按键分别录音，服务按 A/B 整理转写，调用配置的 Agent 生成沟通建议，再合成中文语音交给设备播放。
+
+| 目录 | 功能 |
+| --- | --- |
+| `main/`、`boards/` | 设备启动、开发板适配、按键、麦克风、屏幕与扬声器 |
+| `components/agent_link/` | 设备通信 SDK、能力声明和音频/控制协议 |
+| `bridge/` | 设备 WebSocket 接入、A/B 语音转写、Agent 请求、中文语音合成及手机管理网页 |
+| `android-control/` | Android 手机控制台，连接 Bridge 管理页面 |
+| `ios-control/` | Expo iOS 控制台，加载配置的 HTTPS Bridge 页面 |
+| `deploy/debian/` | Debian 服务部署说明与文件 |
+| `docs/`、`test_apps/` | 设计、协议、调试和设备状态测试资料 |
+
+运行依赖适配的实体开发板、Bridge 与已配置的语音/Agent 服务；手机壳应用和 SDK 文件齐全不代表已完成当前设备的整机验收。具体启动方式见 [Bridge 说明](bridge/README.md)、[iOS 说明](ios-control/README.md) 和 [Debian 部署](deploy/debian/README.md)。
+
+以下保留底层 Agent Link SDK 的技术说明，便于继续开发。
+
+## Agent Link SDK
 
 **English** | [简体中文](README.zh-CN.md)
 
